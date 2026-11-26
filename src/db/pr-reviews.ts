@@ -66,6 +66,10 @@ export interface LoopPr extends RevisionPr {
   mergeCommentUrl: string | null;
   mergeCommentAttempts: number;
   mergeCommentError: string | null;
+  /** What blocked the merge of `mergeSha` (merge_state blocked); null otherwise, and for a block recorded before codes were kept on the row. */
+  mergeCode: MergeBlockCode | null;
+  /** When a merge blocked on its checks was last looked at again (listResumableMerges). */
+  mergeCheckedAt: string | null;
   /** The CI step (repositories.<repo>.ciFix) for the head `ciSha`; null when it was not looked at yet. */
   ciState: CiState | null;
   ciSha: string | null;
@@ -81,6 +85,11 @@ export interface LoopPr extends RevisionPr {
   ciCommentId: number | null;
   ciCommentUrl: string | null;
   ciCommentAttempts: number;
+  /** The head whose failed jobs the CI step re-ran once automatically, when, which checks, and the files their logs named (docs/ci-fix.md, "One re-run"). */
+  ciRerunSha: string | null;
+  ciRerunAt: string | null;
+  ciRerunChecks: string[];
+  ciRerunFiles: string[];
   /** The suggestion step (repositories.<repo>.review.suggestions) for the head `suggestSha`; null when it was not looked at yet. */
   suggestState: SuggestState | null;
   suggestSha: string | null;
@@ -112,6 +121,8 @@ interface LoopPrRow extends RevisionPrRow {
   merge_comment_url: string | null;
   merge_comment_attempts: number;
   merge_comment_error: string | null;
+  merge_code?: string | null;
+  merge_checked_at?: string | null;
   ci_state: CiState | null;
   ci_sha: string | null;
   ci_reason: string | null;
@@ -125,6 +136,10 @@ interface LoopPrRow extends RevisionPrRow {
   ci_comment_id: number | null;
   ci_comment_url: string | null;
   ci_comment_attempts: number;
+  ci_rerun_sha?: string | null;
+  ci_rerun_at?: string | null;
+  ci_rerun_checks?: string | null;
+  ci_rerun_files?: string | null;
   suggest_state: SuggestState | null;
   suggest_sha: string | null;
   suggest_reason: string | null;
@@ -132,6 +147,17 @@ interface LoopPrRow extends RevisionPrRow {
   suggest_attempts: number | null;
   suggest_issue_number: number | null;
   suggest_issue_url: string | null;
+}
+
+/** A JSON array of strings from a column; empty for anything else. */
+function stringList(json: string | null | undefined): string[] {
+  if (!json) return [];
+  try {
+    const v: unknown = JSON.parse(json);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
 }
 
 function rowToLoopPr(r: LoopPrRow): LoopPr {
@@ -156,6 +182,8 @@ function rowToLoopPr(r: LoopPrRow): LoopPr {
     mergeCommentUrl: r.merge_comment_url,
     mergeCommentAttempts: r.merge_comment_attempts,
     mergeCommentError: r.merge_comment_error,
+    mergeCode: (r.merge_code as MergeBlockCode | null | undefined) ?? null,
+    mergeCheckedAt: r.merge_checked_at ?? null,
     ciState: r.ci_state,
     ciSha: r.ci_sha,
     ciReason: r.ci_reason,
@@ -169,6 +197,10 @@ function rowToLoopPr(r: LoopPrRow): LoopPr {
     ciCommentId: r.ci_comment_id,
     ciCommentUrl: r.ci_comment_url,
     ciCommentAttempts: r.ci_comment_attempts,
+    ciRerunSha: r.ci_rerun_sha ?? null,
+    ciRerunAt: r.ci_rerun_at ?? null,
+    ciRerunChecks: stringList(r.ci_rerun_checks),
+    ciRerunFiles: stringList(r.ci_rerun_files),
     suggestState: r.suggest_state ?? null,
     suggestSha: r.suggest_sha ?? null,
     suggestReason: r.suggest_reason ?? null,
@@ -747,7 +779,7 @@ export function listMergeCandidates(db: Db, repoId: number, opts: { requireCi?: 
  */
 export function startMergeFor(db: Db, repoId: number, prNumber: number, sha: string, now?: () => number): void {
   db.prepare(
-    `UPDATE revision_prs SET merge_sha = ?, merge_state = NULL, merge_reason = NULL, merge_wait_started_at = NULL, merge_attempts = 0,
+    `UPDATE revision_prs SET merge_sha = ?, merge_state = NULL, merge_reason = NULL, merge_code = NULL, merge_checked_at = NULL, merge_wait_started_at = NULL, merge_attempts = 0,
             merge_comment_id = NULL, merge_comment_url = NULL, merge_comment_attempts = 0, merge_comment_error = NULL, updated_at = ?
      WHERE repo_id = ? AND pr_number = ? AND (merge_sha IS NULL OR merge_sha != ?)`,
   ).run(sha, nowIso(now), repoId, prNumber, sha);
@@ -794,9 +826,60 @@ function applyMergeStep(db: Db, repoId: number, prNumber: number, sha: string, s
         .run(at, s.mergeCommitSha, at, repoId, prNumber, sha).changes;
       break;
     case 'blocked':
-      changes = db.prepare(`UPDATE revision_prs SET merge_state = 'blocked', merge_reason = ?, updated_at = ? WHERE ${where}`).run(s.reason, at, repoId, prNumber, sha).changes;
+      changes = db
+        .prepare(`UPDATE revision_prs SET merge_state = 'blocked', merge_reason = ?, merge_code = ?, merge_checked_at = ?, updated_at = ? WHERE ${where}`)
+        .run(s.reason, s.code, at, at, repoId, prNumber, sha).changes;
       break;
   }
+  return Number(changes) > 0;
+}
+
+/**
+ * Merge blocks that are about the checks of the head (a check failed, could not be read, or did
+ * not pass in time): a re-run that passes on the same head lifts them, with no new commit.
+ */
+export const RESUMABLE_MERGE_CODES: readonly MergeBlockCode[] = ['checks-failed', 'checks-unreadable', 'wait-timeout'];
+
+/**
+ * Open PRs whose merge of their current head was blocked on its checks (RESUMABLE_MERGE_CODES),
+ * with the same conditions as listMergeCandidates otherwise: the merge step looks at them again,
+ * and merges when the checks pass now (after a re-run by Updraft or by a person). Not pending work
+ * of a run (src/worker/scope.ts): nothing has to stay up for them.
+ */
+export function listResumableMerges(db: Db, repoId: number, opts: { requireCi?: boolean; requireSuggestions?: boolean } = {}): LoopPr[] {
+  const ci = `${opts.requireCi ? "AND ci_sha = head_sha AND ci_state = 'passed'" : ''} ${opts.requireSuggestions ? SUGGESTIONS_SETTLED : ''}`;
+  const codes = RESUMABLE_MERGE_CODES.map((c) => `'${c}'`).join(', ');
+  return (
+    db
+      .prepare(
+        `SELECT * FROM revision_prs
+         WHERE repo_id = ? AND state = 'open' AND verdict = 'ready-to-merge' AND head_sha IS NOT NULL AND verdict_sha = head_sha ${ci}
+           AND merge_sha = head_sha AND merge_state = 'blocked' AND merge_code IN (${codes})
+         ORDER BY pr_number`,
+      )
+      .all(repoId) as unknown as LoopPrRow[]
+  ).map(rowToLoopPr);
+}
+
+/** A blocked merge of `sha` looked at again and still not possible: when, so the next look waits. */
+export function touchBlockedMerge(db: Db, repoId: number, prNumber: number, sha: string, now?: () => number): void {
+  const at = nowIso(now);
+  db.prepare("UPDATE revision_prs SET merge_checked_at = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND merge_sha = ? AND merge_state = 'blocked'").run(at, at, repoId, prNumber, sha);
+}
+
+/**
+ * Lift a merge block of `sha` that was about its checks, now that they pass: the merge columns
+ * are as before the block (its comment stays on record, so it is not posted again). Returns
+ * whether it changed the row.
+ */
+export function reopenBlockedMerge(db: Db, repoId: number, prNumber: number, sha: string, now?: () => number): boolean {
+  const codes = RESUMABLE_MERGE_CODES.map((c) => `'${c}'`).join(', ');
+  const changes = db
+    .prepare(
+      `UPDATE revision_prs SET merge_state = NULL, merge_reason = NULL, merge_code = NULL, merge_wait_started_at = NULL, merge_attempts = 0, updated_at = ?
+       WHERE repo_id = ? AND pr_number = ? AND merge_sha = ? AND merge_state = 'blocked' AND merge_code IN (${codes})`,
+    )
+    .run(nowIso(now), repoId, prNumber, sha).changes;
   return Number(changes) > 0;
 }
 
@@ -841,7 +924,9 @@ export function recordMergeNotice(
 
 /**
  * Open PRs whose newest verdict is ready-to-merge for their current head and whose CI step has
- * not settled for that head: not looked at, or waiting for checks.
+ * not settled for that head: not looked at, or waiting for checks. And those stopped for a person
+ * on that head: their checks are read again (less often), and a pass there, after a re-run by a
+ * person, carries on as a pass would have (src/publish/ci.ts).
  */
 export function listCiCandidates(db: Db, repoId: number, opts: { requireSuggestions?: boolean } = {}): LoopPr[] {
   // With the suggestion step on, the checks of a head are read once its suggestions are settled.
@@ -850,7 +935,7 @@ export function listCiCandidates(db: Db, repoId: number, opts: { requireSuggesti
       .prepare(
         `SELECT * FROM revision_prs
          WHERE repo_id = ? AND state = 'open' AND verdict = 'ready-to-merge' AND head_sha IS NOT NULL AND verdict_sha = head_sha
-           AND (ci_sha IS NULL OR ci_sha != head_sha OR ci_state IS NULL OR ci_state = 'waiting') ${opts.requireSuggestions ? SUGGESTIONS_SETTLED : ''}
+           AND (ci_sha IS NULL OR ci_sha != head_sha OR ci_state IS NULL OR ci_state IN ('waiting', 'blocked')) ${opts.requireSuggestions ? SUGGESTIONS_SETTLED : ''}
          ORDER BY pr_number`,
       )
       .all(repoId) as unknown as LoopPrRow[]
@@ -910,6 +995,49 @@ export function setCiState(db: Db, repoId: number, prNumber: number, sha: string
         .run(s.reason, at, s.signature ?? null, at, repoId, prNumber, sha).changes;
       break;
   }
+  return Number(changes) > 0;
+}
+
+/**
+ * Record the one automatic re-run of the failed jobs of `sha` (docs/ci-fix.md, "One re-run"),
+ * before it is asked for: the head waits for its checks again, from now. Changes nothing when the
+ * CI columns are not about `sha` or not waiting, or when `sha` was re-run before. Returns whether
+ * it changed the row: only then may the re-run be asked for, so a head is re-run at most once.
+ */
+export function recordCiRerun(
+  db: Db,
+  repoId: number,
+  prNumber: number,
+  sha: string,
+  r: { reason: string; checks: readonly string[]; files: readonly string[] },
+  now?: () => number,
+): boolean {
+  const at = nowIso(now);
+  const changes = db
+    .prepare(
+      `UPDATE revision_prs SET ci_rerun_sha = ?, ci_rerun_at = ?, ci_rerun_checks = ?, ci_rerun_files = ?,
+              ci_state = 'waiting', ci_reason = ?, ci_wait_started_at = ?, ci_checked_at = ?, updated_at = ?
+       WHERE repo_id = ? AND pr_number = ? AND ci_sha = ? AND (ci_state IS NULL OR ci_state = 'waiting') AND (ci_rerun_sha IS NULL OR ci_rerun_sha != ?)`,
+    )
+    .run(sha, at, JSON.stringify(r.checks), JSON.stringify(r.files), r.reason, at, at, at, repoId, prNumber, sha, sha).changes;
+  return Number(changes) > 0;
+}
+
+/** A head stopped for a person whose checks were read again and still do not pass: when, so the next read waits. */
+export function touchBlockedCi(db: Db, repoId: number, prNumber: number, sha: string, now?: () => number): void {
+  const at = nowIso(now);
+  db.prepare("UPDATE revision_prs SET ci_checked_at = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND ci_sha = ? AND ci_state = 'blocked'").run(at, at, repoId, prNumber, sha);
+}
+
+/**
+ * A head stopped for a person whose checks pass now, on the same head (a person, or Updraft,
+ * re-ran them): it carries on as a pass. Returns whether it changed the row.
+ */
+export function resumeBlockedCi(db: Db, repoId: number, prNumber: number, sha: string, reason: string, now?: () => number): boolean {
+  const at = nowIso(now);
+  const changes = db
+    .prepare("UPDATE revision_prs SET ci_state = 'passed', ci_reason = ?, ci_checked_at = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND ci_sha = ? AND ci_state = 'blocked'")
+    .run(reason, at, at, repoId, prNumber, sha).changes;
   return Number(changes) > 0;
 }
 
@@ -1159,6 +1287,10 @@ export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: b
     if (pr.mergeSha === pr.headSha) {
       if (pr.mergeState === 'waiting') return { stage: 'merging', detail: `waiting since ${pr.mergeWaitStartedAt ?? '?'}: ${pr.mergeReason ?? 'checks are pending'}` };
       if (pr.mergeState === 'merging') return { stage: 'merging', detail: `the merge of ${head} was requested` };
+      if (pr.mergeState === 'blocked' && pr.mergeCode === 'checks-failed') {
+        // Not ready to merge: a check failed. A pass on the same head (a re-run) carries the merge on.
+        return { stage: 'needs-human', detail: `${head} was found ready, but it is blocked by a failing check: ${pr.mergeReason ?? 'a check did not pass'}` };
+      }
       if (pr.mergeState === 'blocked') return { stage: 'ready-to-merge', detail: `${head} is ready; not merged by Updraft: ${pr.mergeReason ?? 'blocked'}` };
     }
     return { stage: 'ready-to-merge', detail: `${head} was found ready to merge` };

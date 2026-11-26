@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { createRequire } from 'node:module';
 import type { EventEnvelope, Job, JobStatus, Run, RunOutcome, RunSummary } from '../types.js';
-import { backfillMetrics } from './metrics.js';
+import { backfillMetrics, mergeReasonCodeSql } from './metrics.js';
 
 export type Db = DatabaseSyncType;
 
@@ -25,7 +25,10 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
+
+/** The schema version that added the CI step's one re-run per head and the merge block's code (docs/ci-fix.md, "One re-run"). */
+export const RERUN_SCHEMA_VERSION = 22;
 
 /** The schema version that added the suggestion step (review.suggestions, docs/review-loop.md "Suggestions"). */
 export const SUGGESTIONS_SCHEMA_VERSION = 21;
@@ -691,7 +694,30 @@ const MIGRATIONS: Record<number, Migration> = {
     const findings = have('review_findings');
     for (const [name, decl] of SETTLED_COLUMNS) if (!findings.has(name)) db.exec(`ALTER TABLE review_findings ADD COLUMN ${name} ${decl}`);
   },
+  // The CI step's one automatic re-run per head (docs/ci-fix.md, "One re-run"): the head whose
+  // failed jobs were re-run, when, which checks and which files their logs named. And the code of
+  // a merge block, so that a block on the checks can be picked up again when they pass on the
+  // same head; blocks recorded before have it read from their reason. Each column only if missing.
+  22: (db) => {
+    const prs = new Set((db.prepare('PRAGMA table_info(revision_prs)').all() as { name: string }[]).map((c) => c.name));
+    for (const [name, decl] of RERUN_COLUMNS) if (!prs.has(name)) db.exec(`ALTER TABLE revision_prs ADD COLUMN ${name} ${decl}`);
+    db.exec(`UPDATE revision_prs SET merge_code = ${mergeReasonCodeSql('merge_reason')} WHERE merge_state = 'blocked' AND merge_code IS NULL`);
+  },
 };
+
+/** Migration 22's columns of revision_prs. */
+const RERUN_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  // the head whose failed jobs the CI step re-ran, once (never again for that head)
+  ['ci_rerun_sha', 'TEXT'],
+  ['ci_rerun_at', 'TEXT'],
+  // JSON arrays: the checks re-run, and the files their logs named (none of them in the diff)
+  ['ci_rerun_checks', 'TEXT'],
+  ['ci_rerun_files', 'TEXT'],
+  // the MergeBlockCode of merge_state 'blocked'
+  ['merge_code', 'TEXT'],
+  // when a merge blocked on its checks was last looked at again
+  ['merge_checked_at', 'TEXT'],
+];
 
 /** Migration 21's columns of revision_prs. */
 const SUGGESTION_COLUMNS: ReadonlyArray<readonly [string, string]> = [

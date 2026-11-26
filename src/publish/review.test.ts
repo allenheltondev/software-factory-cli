@@ -22,7 +22,7 @@ import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { reviewOf, revisionOf, type AcceptanceSnapshot, type Job, type ReviewResult, type ReviewVerdict, type RunSummary } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { postFailureComment } from './failure-comment.js';
-import { evaluateAutoMerges, mergeBlockedMarker, outstandingChangeRequests, postMergeNotices } from './merge.js';
+import { evaluateAutoMerges, mergeBlockedMarker, MERGE_RECHECK_MS, outstandingChangeRequests, postMergeNotices } from './merge.js';
 import { publishRun, type PublishDeps } from './publish.js';
 import { createReviewLoopPublisher, postReview, reviewMarker } from './review.js';
 import { findingsOfRun, getFinding, recordCheck, recordResolution } from '../db/review-findings.js';
@@ -1227,26 +1227,51 @@ describe('auto-merge', () => {
     expect(raced.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: expect.stringMatching(/GitHub refused the merge \(409\)/) });
   });
 
-  it('is blocked by a failing check, records why, comments once and never tries again for that head', async () => {
+  it('is blocked by a failing check, records why, comments once, and merges that head once its checks pass after a re-run', async () => {
     const s = await ready();
     s.gh.checks = { total: 2, failing: ['ci / test'], pending: [], succeeded: [], complete: true };
     await s.mergeStep();
     expect(s.gh.merges).toEqual([]);
-    expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeReason: `1 check(s) of ${H1.slice(0, 12)} did not pass: ci / test` });
+    expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeCode: 'checks-failed', mergeReason: `1 check(s) of ${H1.slice(0, 12)} did not pass: ci / test` });
     expect(s.gh.writes).toEqual([`comment #${PR}`]);
     const comment = s.gh.comments.at(-1)!.body;
-    expect(comment).toContain('did not merge it');
+    expect(comment).toMatch(/^\*\*Blocked by a failing check:\*\* Updraft did not merge commit `111111111111`/);
     expect(comment).toContain('```text\n1 check(s) of 111111111111 did not pass: ci / test\n```');
     expect(comment).toContain(mergeBlockedMarker(H1));
-    expect(s.stage()).toMatchObject({ stage: 'ready-to-merge', detail: expect.stringMatching(/not merged by Updraft: 1 check/) });
+    // Never "ready to merge" or "merge it yourself" while a check fails.
+    expect(comment).not.toMatch(/ready to merge|merge it yourself/i);
+    expect(s.stage()).toMatchObject({ stage: 'needs-human', detail: expect.stringMatching(/blocked by a failing check: 1 check/) });
 
-    // The check is fixed later: still a person's call for this head.
-    s.gh.checks = { total: 2, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
+    // Still failing when looked at again: nothing more is said.
+    s.tick(MERGE_RECHECK_MS);
+    await s.mergeStep();
+    expect(s.gh.writes).toEqual([`comment #${PR}`]);
+
+    // Someone re-ran it on the same head and it passed. Within MERGE_RECHECK_MS nothing is asked;
+    // after it, the merge goes ahead with no new commit, and the blocked note is not posted again.
+    s.gh.checks = { total: 2, failing: [], pending: [], succeeded: ['ci / build', 'ci / test'], complete: true };
     s.gh.calls.length = 0;
     await s.mergeStep();
+    expect(s.gh.calls).toEqual([]);
+    expect(s.gh.merges).toEqual([]);
+    s.tick(MERGE_RECHECK_MS);
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+    expect(s.pr()).toMatchObject({ mergeState: 'merged' });
+    expect(s.gh.writes).toEqual([`comment #${PR}`, `merge #${PR} squash at ${H1}`]);
+  });
+
+  it('never picks up a block that is not about the checks, such as a change request', async () => {
+    const s = await ready();
+    s.gh.checks = { total: 1, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
+    s.gh.pull = { ...s.gh.pull!, draft: true };
+    await s.mergeStep();
+    expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeCode: 'draft' });
+    s.gh.pull = { ...s.gh.pull!, draft: false };
+    s.tick(MERGE_RECHECK_MS);
+    s.gh.calls.length = 0;
     await s.mergeStep();
     expect(s.gh.calls).toEqual([]);
-    expect(s.gh.writes).toEqual([`comment #${PR}`]);
     expect(s.gh.merges).toEqual([]);
   });
 

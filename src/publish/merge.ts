@@ -16,18 +16,25 @@
 // Then one `PUT .../merge` with the head's SHA and the configured method: GitHub refuses it if
 // anything was pushed since, and applies branch protection itself. A gate that fails, a wait
 // that runs out or a refused merge is final for that head: the reason is recorded, one comment
-// says so, and the PR stays ready for a person. Nothing is forced, bypassed or retried, and no
-// branch is deleted.
+// says so, and the PR stays with a person. Nothing is forced, bypassed or retried, and no branch
+// is deleted. The one exception is a block on the checks of the head (a check failed, could not
+// be read, or did not pass in time): its gates are evaluated again, every MERGE_RECHECK_MS or when
+// asked to (a check event), and when they all hold now, after a re-run on that same head, the
+// merge goes ahead as it would have the first time. Its comment is not posted again.
 import { allowedActorsFor, autoMergeMethod, ciSettings, DEFAULT_AUTO_MERGE_WAIT_MINUTES, suggestionsActive, workflowId, type MergeMethod, type RepositoryConfig } from '../config/schema.js';
 import {
   codeRunForHead,
   getLoopPr,
   listMergeCandidates,
   listPendingMergeNotices,
+  listResumableMerges,
   observeHead,
   recordMergeNotice,
+  reopenBlockedMerge,
+  RESUMABLE_MERGE_CODES,
   setMergeState,
   startMergeFor,
+  touchBlockedMerge,
   type LoopPr,
 } from '../db/pr-reviews.js';
 import { getRun, ownEntry } from '../db/queue.js';
@@ -49,6 +56,8 @@ type MergeDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'sc
 export const MAX_MERGE_ATTEMPTS = 3;
 /** Attempts to post the comment that says why a PR was not merged. */
 export const MAX_NOTICE_ATTEMPTS = 5;
+/** How often the polling worker looks again at a merge blocked on the checks of its head. A check event does not wait for this. */
+export const MERGE_RECHECK_MS = 5 * 60_000;
 const MAX_NAMES = 8;
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -65,7 +74,21 @@ export function mergeBlockedMarker(sha: string): string {
   return `<!-- updraft-merge-blocked: ${sha} -->`;
 }
 
-export function renderMergeBlockedNotice(o: { sha: string; method: MergeMethod; reason: string; repoFullName: string }): string {
+export function renderMergeBlockedNotice(o: { sha: string; method: MergeMethod; reason: string; repoFullName: string; code?: MergeBlockCode | null }): string {
+  if (o.code === 'checks-failed') {
+    // Not ready to merge: a check failed. Name it, and what lifts the block.
+    return [
+      `**Blocked by a failing check:** Updraft did not merge commit ${code(short(o.sha))} (${code(`repositories.${o.repoFullName}.autoMerge: ${o.method}`)}), because a check of it did not pass.`,
+      '',
+      '**Why it is blocked**',
+      '',
+      fenced(cap(o.reason, 2_000)),
+      '',
+      'Fix the check or push a commit (a new commit gets a new review). If the failure is unrelated to this change, re-run it on GitHub: once the checks pass on this commit, Updraft merges it.',
+      '',
+      mergeBlockedMarker(o.sha),
+    ].join('\n');
+  }
   return [
     `Updraft's reviewer found commit ${code(short(o.sha))} ready to merge, but Updraft did not merge it (${code(`repositories.${o.repoFullName}.autoMerge: ${o.method}`)}).`,
     '',
@@ -83,7 +106,15 @@ export function renderMergeBlockedNotice(o: { sha: string; method: MergeMethod; 
  * Quiet notifications: the same notice as one or two plain sentences, with what to do and, when
  * hosted, the console link.
  */
-export function renderQuietMergeBlockedNotice(o: { sha: string; prNumber: number; reason: string; link?: string | null }): string {
+export function renderQuietMergeBlockedNotice(o: { sha: string; prNumber: number; reason: string; link?: string | null; code?: MergeBlockCode | null }): string {
+  if (o.code === 'checks-failed') {
+    return [
+      `**Blocked by a failing check:** Updraft did not merge PR #${o.prNumber} at ${code(short(o.sha))}: ${inline(cap(o.reason, 500))}. ` +
+        `Fix the check or push a commit; if it is unrelated, re-run it on GitHub, and Updraft merges once the checks pass on this commit.${o.link ? ` [View this work in Updraft](${o.link})` : ''}`,
+      '',
+      mergeBlockedMarker(o.sha),
+    ].join('\n');
+  }
   return [
     `Updraft did not merge PR #${o.prNumber} at ${code(short(o.sha))}: ${inline(cap(o.reason, 500))}. ` +
       `Please merge it yourself once it is ready; a new commit on the branch gets a new review.${o.link ? ` [View this work in Updraft](${o.link})` : ''}`,
@@ -203,8 +234,12 @@ async function gates(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, pr: 
   return { action: 'merge' };
 }
 
-/** Take the auto-merge step for one PR. Never throws. */
-export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, candidate: LoopPr): Promise<void> {
+/**
+ * Take the auto-merge step for one PR. A merge blocked on the checks of its head is looked at
+ * again (every MERGE_RECHECK_MS, or now with `force`) and goes ahead when every gate holds now.
+ * Never throws.
+ */
+export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: RepositoryConfig, candidate: LoopPr, opts: { force?: boolean } = {}): Promise<void> {
   const { db, api } = deps;
   const now = deps.now ?? Date.now;
   const method = autoMergeMethod(deps.config, cfg);
@@ -215,8 +250,13 @@ export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: Rep
     startMergeFor(db, candidate.repoId, candidate.prNumber, sha, now);
     const pr = getLoopPr(db, candidate.repoId, candidate.prNumber);
     if (!pr || pr.state !== 'open' || pr.verdict !== 'ready-to-merge' || pr.verdictSha !== sha || pr.headSha !== sha) return;
-    if (pr.mergeState === 'merged' || pr.mergeState === 'blocked') return;
+    if (pr.mergeState === 'merged') return;
+    // A block on the checks of this head: looked at again, and lifted only if every gate holds now.
+    let resuming = pr.mergeState === 'blocked' && pr.mergeCode !== null && RESUMABLE_MERGE_CODES.includes(pr.mergeCode);
+    if (pr.mergeState === 'blocked' && !resuming) return;
+    if (resuming && !opts.force && pr.mergeCheckedAt && now() - Date.parse(pr.mergeCheckedAt) < MERGE_RECHECK_MS) return;
     const blocked = (code: MergeBlockCode, reason: string) => {
+      if (resuming) return touchBlockedMerge(db, pr.repoId, pr.prNumber, sha, now);
       if (setMergeState(db, pr.repoId, pr.prNumber, sha, { state: 'blocked', reason, code }, now)) log.warn('not merged; left for a person', { reason });
     };
 
@@ -233,6 +273,17 @@ export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: Rep
     }
     if (gate.action === 'none') return;
     if (gate.action === 'block') return blocked(gate.code, gate.reason);
+    if (resuming && gate.action === 'wait') {
+      // Still blocked (a re-run may be on its way): looked at again later, nothing said.
+      touchBlockedMerge(db, pr.repoId, pr.prNumber, sha, now);
+      return;
+    }
+    if (resuming) {
+      if (!reopenBlockedMerge(db, pr.repoId, pr.prNumber, sha, now)) return;
+      // From here on, as a merge that was never blocked: a refusal now is a block of its own.
+      resuming = false;
+      log.info('the checks pass now on a head whose merge was blocked on them; merging', { was: pr.mergeReason });
+    }
     if (gate.action === 'wait') {
       const waitMinutes = cfg.autoMergeWaitMinutes ?? DEFAULT_AUTO_MERGE_WAIT_MINUTES;
       const since = pr.mergeWaitStartedAt ? Date.parse(pr.mergeWaitStartedAt) : now();
@@ -271,20 +322,28 @@ export async function evaluateAutoMerge(deps: MergeDeps, repo: RepoRef, cfg: Rep
   }
 }
 
-/** The auto-merge step for every repository that has it on. Never throws. */
-export async function evaluateAutoMerges(deps: MergeDeps, signal?: AbortSignal): Promise<void> {
+/**
+ * The auto-merge step for every repository that has it on, including merges blocked on the checks
+ * of their head (looked at again). `only`: this pull request (a check event named it), and its
+ * blocked merge looked at now. Never throws.
+ */
+export async function evaluateAutoMerges(deps: MergeDeps, signal?: AbortSignal, opts: { only?: { repoId: number; prNumber: number } } = {}): Promise<void> {
   for (const [fullName, cfg] of Object.entries(deps.config.repositories)) {
     if (!autoMergeMethod(deps.config, cfg)) continue;
+    if (opts.only && opts.only.repoId !== cfg.id) continue;
     let candidates: LoopPr[];
     try {
-      candidates = listMergeCandidates(deps.db, cfg.id, { requireCi: ciSettings(deps.config, cfg) !== null, requireSuggestions: suggestionsActive(deps.config, cfg) }).filter((pr) => deps.scope?.pr(pr.repoId, pr.prNumber) ?? true);
+      const o = { requireCi: ciSettings(deps.config, cfg) !== null, requireSuggestions: suggestionsActive(deps.config, cfg) };
+      candidates = [...listMergeCandidates(deps.db, cfg.id, o), ...listResumableMerges(deps.db, cfg.id, o)].filter(
+        (pr) => (deps.scope?.pr(pr.repoId, pr.prNumber) ?? true) && (!opts.only || opts.only.prNumber === pr.prNumber),
+      );
     } catch (err) {
       deps.log.error('could not list pull requests to merge', { repo: fullName, error: message(err) });
       continue;
     }
     for (const pr of candidates) {
       if (signal?.aborted) return;
-      await evaluateAutoMerge(deps, { id: cfg.id, fullName }, cfg, pr);
+      await evaluateAutoMerge(deps, { id: cfg.id, fullName }, cfg, pr, { force: opts.only !== undefined });
     }
   }
 }
@@ -321,13 +380,18 @@ export async function postMergeNotices(deps: MergeDeps, signal?: AbortSignal): P
           repoRef,
           pr.prNumber,
           quiet
-            ? renderQuietMergeBlockedNotice({ sha, prNumber: pr.prNumber, reason, link: consoleWorkflowUrl(deps.console, pr.repoId, pr.issueNumber) })
-            : renderMergeBlockedNotice({ sha, method, reason, repoFullName: found.fullName }),
+            ? renderQuietMergeBlockedNotice({ sha, prNumber: pr.prNumber, reason, link: consoleWorkflowUrl(deps.console, pr.repoId, pr.issueNumber), code: pr.mergeCode })
+            : renderMergeBlockedNotice({ sha, method, reason, repoFullName: found.fullName, code: pr.mergeCode }),
         ));
       if (quiet) {
+        // "Ready for a person to merge" only when nothing but a person stands in the way: never while a check fails.
+        const status =
+          pr.mergeCode === 'checks-failed'
+            ? { title: 'Blocked by a failing check', text: `Updraft did not merge PR #${pr.prNumber}: ${inline(cap(reason, 300))}. Updraft merges it once the checks pass on this commit (see the PR).` }
+            : { title: 'Waiting for a person', text: `PR #${pr.prNumber} is ready for a person to merge; Updraft did not merge it (see the PR).` };
         await noteStatus(
           { api: deps.api, log: deps.log },
-          { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, stage: STATUS_STAGE.person, sha, latest: pr.headSha === sha, at: (deps.now ?? Date.now)(), title: 'Waiting for a person', text: `PR #${pr.prNumber} is ready for a person to merge; Updraft did not merge it (see the PR).` },
+          { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, stage: STATUS_STAGE.person, sha, latest: pr.headSha === sha, at: (deps.now ?? Date.now)(), ...status },
         );
       }
       recordMergeNotice(deps.db, pr.repoId, pr.prNumber, sha, { commentId: posted.id, commentUrl: posted.htmlUrl }, deps.now);

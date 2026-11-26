@@ -21,8 +21,8 @@ import { queuedRevisionProblem } from '../poller/reviews.js';
 import { decideWebhook } from '../poller/webhook.js';
 import { revisionOf, reviewOf, type Job, type ReviewVerdict, type RunSummary } from '../types.js';
 import { silentLogger } from '../util/log.js';
-import { ciNoticeMarker, CI_POLL_MS, CI_REGISTER_GRACE_MS, evaluateCiAll, failureSignature, judgeChecks, logExcerpt, postCiNotices, redactCi } from './ci.js';
-import { evaluateAutoMerges } from './merge.js';
+import { ciNoticeMarker, CI_POLL_MS, CI_REGISTER_GRACE_MS, decideRerun, evaluateCiAll, failureSignature, inDiff, judgeChecks, logExcerpt, matrixKey, namedFiles, postCiNotices, redactCi } from './ci.js';
+import { evaluateAutoMerges, mergeBlockedMarker, postMergeNotices } from './merge.js';
 import type { PublishDeps } from './publish.js';
 import { renderStatusComment, STATUS_STAGE } from './status-marker.js';
 import { createReviewLoopPublisher, postReview } from './review.js';
@@ -213,8 +213,9 @@ describe('the CI step with quiet notifications', () => {
     expect(await s.ci()).toMatchObject([{ status: 'blocked' }]);
     await s.ci(true);
     expect(s.ciComments()).toHaveLength(1);
-    expect(s.ciComments()[0]!.body).toMatch(/^Updraft stopped working on the checks of PR #\d+ at `[0-9a-f]{12}` and needs a person: /);
-    expect(s.ciComments()[0]!.body).toContain('Please fix the checks or push a commit');
+    expect(s.ciComments()[0]!.body).toMatch(/^\*\*Blocked by a failing check:\*\* `build` did not pass on `[0-9a-f]{12}` of PR #\d+: \d check\(s\) of [0-9a-f]{12} did not pass for a reason a code change cannot fix: build \(cancelled\)/);
+    expect(s.ciComments()[0]!.body).toContain('Fix the check or push a commit');
+    expect(s.ciComments()[0]!.body).not.toMatch(/ready to merge|merge it yourself/i);
   });
 });
 
@@ -418,10 +419,18 @@ describe('the CI step after a clean review', () => {
     expect(s.queued()).toEqual([]);
     expect(s.stage()).toMatchObject({ stage: 'needs-human' });
     expect(s.ciComments()).toHaveLength(1);
-    expect(s.ciComments()[0]!.body).toMatch(/its checks need a person/);
-    // Final for that head.
+    expect(s.ciComments()[0]!.body).toMatch(/^\*\*Updraft · CI · `[0-9a-f]{12}`\*\*\n\n\*\*Blocked by a failing check:\*\* `deploy-gate`, `e2e` did not pass on commit /m);
+    expect(s.ciComments()[0]!.body).not.toMatch(/ready to merge|merge it yourself/i);
+    // Final for that head, unless its checks pass there: a check event reads them, and nothing more happens.
     s.gh.calls.length = 0;
-    await s.ci(true);
+    const writes = s.gh.writes.length;
+    expect(await s.ci(true)).toMatchObject([{ status: 'blocked' }]);
+    expect(s.gh.calls).toEqual(['getPullRequest', `getCommitChecks ${H1}`]);
+    expect(s.gh.writes.length).toBe(writes);
+    expect(s.queued()).toEqual([]);
+    // The polling worker reads them again only every CI_BLOCKED_POLL_MS.
+    s.gh.calls.length = 0;
+    await s.ci();
     expect(s.gh.calls).toEqual([]);
   });
 
@@ -659,5 +668,331 @@ describe('check and status webhooks', () => {
     expect(
       await decideWebhook({ api: off.gh.api, config: off.config, log: silentLogger, db: off.db }, { eventName: 'check_suite', payload: { action: 'completed', repository, check_suite: { pull_requests: [{ number: PR }] } } }),
     ).toMatchObject({ dispatch: false, reason: 'review-loop-off' });
+  });
+});
+
+describe('one re-run for a failure that cannot be the change\'s (docs/ci-fix.md, "One re-run")', () => {
+  const RUN_ID = 900;
+  /** A leg of a GitHub Actions matrix job: its check run is a job of workflow run RUN_ID. */
+  const leg = (name: string, conclusion: string | null, id: number, runId = RUN_ID): CheckDetail =>
+    run(name, conclusion, id, { url: `https://github.com/${FULL}/actions/runs/${runId}/job/${id}`, workflowRunId: runId });
+  const FLAKY = {
+    annotations: [],
+    logTail: [
+      '2026-11-18T12:00:00.0000000Z > vitest run',
+      '2026-11-18T12:00:05.0000000Z  FAIL  src\\commands\\logs.test.ts > updraft logs > follows the newest run',
+      '2026-11-18T12:00:05.0000000Z AssertionError: expected 1 to be 2',
+      '2026-11-18T12:00:05.0000000Z  ❯ src/commands/logs.test.ts:88:21',
+      '2026-11-18T12:00:06.0000000Z ##[error]Process completed with exit code 1.',
+    ].join('\n'),
+    problems: [],
+  };
+  const OUTSIDE = [{ path: 'cloud/server/src/app.ts', status: 'modified', patch: null }];
+  const matrix = (windows22: string | null, windowsId = 2) =>
+    checksOf([leg('ubuntu-latest / node 22', 'success', 1), leg('windows-latest / node 22', windows22, windowsId), leg('windows-latest / node 24', 'success', 3)]);
+  const statusComment = async (s: ReturnType<typeof setup>) => {
+    const c = await s.gh.api.createIssueComment({ id: REPO_ID, fullName: FULL }, ISSUE, renderStatusComment({ title: 'PR opened', text: `PR #${PR} opened`, mark: { key: 'job_x', stage: STATUS_STAGE.published, pr: PR } }));
+    return () => s.gh.comments.find((x) => x.id === c.id)!.body;
+  };
+
+  for (const notifications of ['quiet', 'verbose'] as const) {
+    it(`re-runs a flaky matrix leg once, and merges on its pass with no human step and no comment (${notifications})`, async () => {
+      const s = setup({ autoMerge: 'squash', notifications });
+      const status = await statusComment(s);
+      s.gh.files = OUTSIDE;
+      s.gh.checks = matrix('failure');
+      s.gh.diagnostics[2] = FLAKY;
+      await s.review('ready-to-merge');
+
+      expect(await s.ci()).toMatchObject([{ status: 'waiting', reason: expect.stringMatching(/re-ran the failed jobs once/) }]);
+      expect(s.gh.reruns).toEqual([RUN_ID]);
+      expect(s.queued()).toEqual([]);
+      // On record, per head: the timeline (`updraft status`, the run-event loop summary) and, quietly, the status comment.
+      expect(s.pr()).toMatchObject({ ciRerunSha: H1, ciRerunAt: expect.any(String), ciRerunChecks: ['windows-latest / node 22'], ciRerunFiles: ['src/commands/logs.test.ts'] });
+      expect(s.stage()).toMatchObject({ stage: 'waiting-for-ci', detail: expect.stringMatching(/re-ran the failed jobs once .*passed on another leg of its matrix \(ubuntu-latest \/ node 22\)/) });
+      if (notifications === 'quiet') expect(status()).toContain('**Updraft · Re-running a failed check**');
+
+      // The re-run is under way, then passes.
+      s.gh.checks = matrix(null, 4);
+      expect(await s.ci(true)).toMatchObject([{ status: 'waiting' }]);
+      s.gh.checks = matrix('success', 4);
+      expect(await s.ci(true)).toMatchObject([{ status: 'passed' }]);
+      await evaluateAutoMerges(s.deps);
+      expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+      expect(s.gh.reruns).toEqual([RUN_ID]);
+      // Nothing posted on the pull request; quietly, the status comment says it merged.
+      expect(s.gh.comments.filter((c) => c.issue === PR)).toEqual([]);
+      if (notifications === 'quiet') expect(status()).toContain('**Updraft · Merged**');
+    });
+  }
+
+  it('re-runs a failure whose log names only test files outside the diff, with no matrix leg to compare', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    s.gh.checks = checksOf([leg('test', 'failure', 2), leg('lint', 'success', 3)]);
+    s.gh.diagnostics[2] = FLAKY;
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'waiting', reason: expect.stringMatching(/failed in src\/commands\/logs\.test\.ts, which this pull request does not touch/) }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+  });
+
+  it('never re-runs a failure inside the diff: it goes to the CI fix', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = [...OUTSIDE, { path: 'src/commands/logs.test.ts', status: 'modified', patch: null }];
+    s.gh.checks = matrix('failure');
+    s.gh.diagnostics[2] = FLAKY;
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'fixing' }]);
+    expect(s.gh.reruns).toEqual([]);
+    expect(s.pr()).toMatchObject({ ciRerunSha: null, ciState: 'fixing' });
+    expect(s.queued()).toHaveLength(1);
+    expect(s.gh.writes).not.toContain(`rerun ${RUN_ID}`);
+  });
+
+  it('never re-runs when nothing shows the failure is not the change\'s, or the diff or the log cannot be read', async () => {
+    // No matrix leg passed, and the log names no test file.
+    const a = setup();
+    a.gh.files = OUTSIDE;
+    a.gh.checks = checksOf([leg('build', 'failure', 2)]);
+    a.gh.diagnostics[2] = { annotations: [], logTail: 'error TS2345: Argument of type string\n##[error]Process completed with exit code 2.', problems: [] };
+    await a.review('ready-to-merge');
+    expect(await a.ci()).toMatchObject([{ status: 'fixing' }]);
+    expect(a.gh.reruns).toEqual([]);
+
+    // The diff could not be read.
+    const b = setup();
+    b.gh.files = OUTSIDE;
+    b.gh.listPullRequestFiles = async () => {
+      throw new GitHubError('GET /pulls/100/files failed: 403', 403);
+    };
+    b.gh.checks = matrix('failure');
+    b.gh.diagnostics[2] = FLAKY;
+    await b.review('ready-to-merge');
+    expect(await b.ci()).toMatchObject([{ status: 'fixing' }]);
+    expect(b.gh.reruns).toEqual([]);
+
+    // Nothing of the failed job could be read.
+    const c = setup();
+    c.gh.files = OUTSIDE;
+    c.gh.checks = matrix('failure');
+    await c.review('ready-to-merge');
+    expect(await c.ci()).toMatchObject([{ status: 'fixing' }]);
+    expect(c.gh.reruns).toEqual([]);
+  });
+
+  it('re-runs at most once per head: a second failure goes to the CI fix', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    s.gh.checks = matrix('failure');
+    s.gh.diagnostics[2] = FLAKY;
+    await s.review('ready-to-merge');
+    await s.ci();
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+    s.gh.checks = matrix('failure', 4);
+    s.gh.diagnostics[4] = FLAKY;
+    expect(await s.ci(true)).toMatchObject([{ status: 'fixing' }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+    expect(s.queued()).toHaveLength(1);
+  });
+
+  it('asks for the re-run once even when GitHub refuses it, and then handles the failure as usual', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    s.gh.checks = matrix('failure');
+    s.gh.diagnostics[2] = FLAKY;
+    s.gh.failNext.rerunFailedJobs = new GitHubError('POST /actions/runs/900/rerun-failed-jobs failed: 403', 403);
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'fixing' }]);
+    expect(s.gh.calls.filter((c) => c.startsWith('rerunFailedJobs'))).toEqual([`rerunFailedJobs ${RUN_ID}`]);
+    expect(s.pr()).toMatchObject({ ciRerunSha: H1 });
+  });
+
+  it('reads the attempt it re-ran, still listed right after the re-run, as pending, not as the re-run failing', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    const failedAt = new Date(s.now() - 60_000).toISOString();
+    const stale = () => checksOf([leg('ubuntu-latest / node 22', 'success', 1), { ...leg('windows-latest / node 22', 'failure', 2), completedAt: failedAt }, leg('windows-latest / node 24', 'success', 3)]);
+    s.gh.checks = stale();
+    s.gh.diagnostics[2] = FLAKY;
+    await s.review('ready-to-merge');
+    await s.ci();
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+
+    // A webhook right after: GitHub has not created the new attempt yet.
+    s.tick(5_000);
+    expect(await s.ci(true)).toMatchObject([{ status: 'waiting', reason: expect.stringMatching(/waiting for the re-run of windows-latest \/ node 22/) }]);
+    expect(s.queued()).toEqual([]);
+
+    // The new attempt passes: merged as if it had passed the first time.
+    s.gh.checks = matrix('success', 4);
+    expect(await s.ci(true)).toMatchObject([{ status: 'passed' }]);
+    await evaluateAutoMerges(s.deps);
+    expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+  });
+
+  it('stops waiting for a re-run that never shows up, and handles the failure as usual', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    const failedAt = new Date(s.now() - 60_000).toISOString();
+    s.gh.checks = checksOf([leg('ubuntu-latest / node 22', 'success', 1), { ...leg('windows-latest / node 22', 'failure', 2), completedAt: failedAt }, leg('windows-latest / node 24', 'success', 3)]);
+    s.gh.diagnostics[2] = FLAKY;
+    await s.review('ready-to-merge');
+    await s.ci();
+    s.tick(CI_REGISTER_GRACE_MS + 1_000);
+    expect(await s.ci(true)).toMatchObject([{ status: 'fixing' }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+  });
+
+  it('waits for the part of a re-run GitHub accepted when it refuses the rest', async () => {
+    const s = setup({ autoMerge: 'squash' });
+    s.gh.files = OUTSIDE;
+    const OTHER_RUN = 901;
+    s.gh.checks = checksOf([leg('test', 'failure', 2), leg('e2e', 'failure', 5, OTHER_RUN), leg('lint', 'success', 3)]);
+    s.gh.diagnostics[2] = FLAKY;
+    s.gh.diagnostics[5] = FLAKY;
+    const original = s.gh.rerunFailedJobs.bind(s.gh);
+    s.gh.rerunFailedJobs = async (repo, id) => {
+      if (id === OTHER_RUN) throw new GitHubError(`POST /actions/runs/${id}/rerun-failed-jobs failed: 403`, 403);
+      return original(repo, id);
+    };
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'waiting', reason: expect.stringMatching(/re-ran workflow run\(s\) 900 but refused 901/) }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+    expect(s.queued()).toEqual([]);
+    expect(s.pr()).toMatchObject({ ciRerunSha: H1, ciState: 'waiting' });
+
+    // The re-run's attempt fails again, with the refused run's failure still there: the CI fix, as usual.
+    s.gh.checks = checksOf([leg('test', 'failure', 6), leg('e2e', 'failure', 5, OTHER_RUN), leg('lint', 'success', 3)]);
+    s.gh.diagnostics[6] = FLAKY;
+    expect(await s.ci(true)).toMatchObject([{ status: 'fixing' }]);
+    expect(s.gh.reruns).toEqual([RUN_ID]);
+  });
+
+  for (const notifications of ['quiet', 'verbose'] as const) {
+    it(`stops, after the re-run failed too, naming the check and why, never "ready to merge"; a re-run that passes later merges it (${notifications})`, async () => {
+      const s = setup({ autoMerge: 'squash', notifications, revise: false });
+      const status = await statusComment(s);
+      s.gh.files = OUTSIDE;
+      s.gh.checks = matrix('failure');
+      s.gh.diagnostics[2] = FLAKY;
+      await s.review('ready-to-merge');
+      await s.ci();
+      expect(s.gh.reruns).toEqual([RUN_ID]);
+      s.gh.checks = matrix('failure', 4);
+      s.gh.diagnostics[4] = FLAKY;
+      expect(await s.ci(true)).toMatchObject([
+        {
+          status: 'blocked',
+          reason: expect.stringMatching(
+            /windows-latest \/ node 22 failed twice, before and after Updraft re-ran it in src\/commands\/logs\.test\.ts, which this pull request does not touch\. It looks unrelated to the change: re-run it or fix it on main, and Updraft merges once the checks pass on this commit$/,
+          ),
+        },
+      ]);
+      expect(s.gh.reruns).toEqual([RUN_ID]);
+      const [notice] = s.ciComments();
+      expect(notice).toBeDefined();
+      expect(notice!.body).toContain('**Blocked by a failing check:** `windows-latest / node 22` did not pass');
+      expect(notice!.body).toContain('which this pull request does not touch');
+      for (const body of [notice!.body, status()]) expect(body).not.toMatch(/ready to merge|ready for a person to merge|merge it yourself/i);
+      if (notifications === 'quiet') expect(status()).toContain('**Updraft · Blocked by a failing check**');
+      expect(s.stage()).toMatchObject({ stage: 'needs-human' });
+
+      // A person re-runs it on GitHub; the green check suite picks the merge up on the same head,
+      // with the earlier notice for that commit on record and nothing posted again.
+      s.gh.checks = matrix('success', 5);
+      const comments = s.gh.comments.length;
+      expect(await s.ci(true)).toMatchObject([{ status: 'passed' }]);
+      await evaluateAutoMerges(s.deps);
+      expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+      expect(s.gh.comments.length).toBe(comments);
+      expect(s.gh.reruns).toEqual([RUN_ID]);
+      if (notifications === 'quiet') expect(status()).toContain('**Updraft · Merged**');
+    });
+  }
+});
+
+describe('a merge blocked by a failing check, without the CI step', () => {
+  for (const notifications of ['quiet', 'verbose'] as const) {
+    it(`says it is blocked by the failing check, never "ready to merge", and merges once a re-run passes on the same head (${notifications})`, async () => {
+      const s = setup({ autoMerge: 'squash', notifications, ciFix: undefined });
+      const created = await s.gh.api.createIssueComment({ id: REPO_ID, fullName: FULL }, ISSUE, renderStatusComment({ title: 'PR opened', text: `PR #${PR} opened`, mark: { key: 'job_x', stage: STATUS_STAGE.published, pr: PR } }));
+      const status = () => s.gh.comments.find((x) => x.id === created.id)!.body;
+      s.gh.checks = checksOf([run('windows-latest / node 22', 'failure', 2), run('ubuntu-latest / node 22', 'success', 1)]);
+      await s.review('ready-to-merge');
+      s.tick();
+      await evaluateAutoMerges(s.deps);
+      await postMergeNotices(s.deps);
+      expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeCode: 'checks-failed' });
+      const notice = s.gh.comments.find((c) => c.issue === PR && c.body.includes(mergeBlockedMarker(H1)))!;
+      expect(notice.body).toMatch(/^\*\*Blocked by a failing check:\*\* Updraft did not merge /);
+      expect(notice.body).toContain('windows-latest / node 22');
+      for (const body of [notice.body, status()]) expect(body).not.toMatch(/ready to merge|ready for a person to merge|merge it yourself/i);
+      if (notifications === 'quiet') expect(status()).toContain('**Updraft · Blocked by a failing check**');
+
+      // The check event of a re-run that passed: looked at now, merged, the blocked note not posted again.
+      s.gh.checks = checksOf([run('windows-latest / node 22', 'success', 3), run('ubuntu-latest / node 22', 'success', 1)]);
+      s.tick();
+      await evaluateAutoMerges(s.deps, undefined, { only: { repoId: REPO_ID, prNumber: PR } });
+      await postMergeNotices(s.deps);
+      expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+      expect(s.gh.comments.filter((c) => c.body.includes(mergeBlockedMarker(H1)))).toHaveLength(1);
+      if (notifications === 'quiet') expect(status()).toContain('**Updraft · Merged**');
+    });
+  }
+
+  it('turns a check event into a look at a pull request whose merge is blocked on its checks, and at no other', async () => {
+    const s = setup({ autoMerge: 'squash', ciFix: undefined });
+    const deps = { api: s.gh.api, config: s.config, log: silentLogger, db: s.db };
+    const event = { eventName: 'check_suite', payload: { action: 'completed', repository: { id: REPO_ID, full_name: FULL }, check_suite: { head_sha: H1, pull_requests: [{ number: PR }] } } };
+    s.gh.checks = checksOf([run('test', 'failure', 2)]);
+    await s.review('ready-to-merge');
+    expect(await decideWebhook(deps, event)).toMatchObject({ dispatch: false, reason: 'review-loop-off' });
+    s.tick();
+    await evaluateAutoMerges(s.deps);
+    expect(s.pr()).toMatchObject({ mergeState: 'blocked', mergeCode: 'checks-failed' });
+    expect(await decideWebhook(deps, event)).toMatchObject({ dispatch: 'poll-reviews', pullRequest: PR });
+  });
+});
+
+describe('telling a failure that cannot be the change\'s', () => {
+  it('reads matrix legs by their names, and not shards', () => {
+    expect(matrixKey('windows-latest / node 22')).toBe(matrixKey('ubuntu-latest / node 24'));
+    expect(matrixKey('test (macos-14, 3.12)')).toBe(matrixKey('test (ubuntu-22.04, 3.11)'));
+    expect(matrixKey('test (macos-14, 3.12)')).not.toBe(matrixKey('lint (macos-14, 3.12)'));
+    expect(matrixKey('test')).toBeNull();
+    expect(matrixKey('test (2/4)')).toBeNull();
+  });
+
+  it('reads the repository files a log and its annotations name, leaving dependencies and URLs out', () => {
+    expect(
+      namedFiles({
+        annotations: [{ path: 'src/a.ts', line: 1, level: 'failure', message: 'x', title: null }],
+        logTail: 'FAIL D:\\a\\repo\\repo\\src\\b.test.ts\n at node_modules/vitest/dist/x.js:1\n see https://example.com/c.ts\n at node:internal/process/task_queues:95\n##[error]failed',
+        problems: [],
+      }),
+    ).toEqual(['src/a.ts', 'a/repo/repo/src/b.test.ts']);
+    expect(namedFiles(null)).toEqual([]);
+  });
+
+  it('matches a named file against the diff by its repository path, or by name alone', () => {
+    const diff = ['src/b.test.ts', 'cloud/x.ts'];
+    expect(inDiff('/a/repo/repo/src/b.test.ts', diff)).toBe(true);
+    expect(inDiff('b.test.ts', diff)).toBe(true);
+    expect(inDiff('src\\b.test.ts', diff)).toBe(true);
+    expect(inDiff('src/c.test.ts', diff)).toBe(false);
+    expect(inDiff('lib/src/b.test.tsx', diff)).toBe(false);
+  });
+
+  it('decides a re-run only when every failure is re-runnable and outside the diff', () => {
+    const a = { check: run('windows-latest / node 22', 'failure', 2, { workflowRunId: 1 }), diagnostics: { annotations: [], logTail: 'FAIL src/x.test.ts', problems: [] } };
+    const other = run('windows-latest / node 24', 'success', 3, { workflowRunId: 1 });
+    expect(decideRerun([a], [a.check, other], ['cloud/y.ts'])).toMatchObject({ rerun: true, runs: [1], checks: ['windows-latest / node 22'], files: ['src/x.test.ts'] });
+    expect(decideRerun([a], [a.check, other], ['src/x.test.ts'])).toMatchObject({ rerun: false, why: expect.stringMatching(/which this pull request changes/) });
+    expect(decideRerun([a], [a.check, other], null)).toMatchObject({ rerun: false });
+    // A leg of another workflow run is not this job's leg; the log still names only a test outside the diff.
+    expect(decideRerun([a], [a.check, { ...other, workflowRunId: 2 }], [])).toMatchObject({ rerun: true, why: expect.stringMatching(/does not touch/) });
+    const status = { check: { kind: 'status' as const, name: 'ext', outcome: 'failure' as const, conclusion: 'failure', url: null }, diagnostics: null };
+    expect(decideRerun([a, status], [a.check, other], [])).toMatchObject({ rerun: false, why: expect.stringMatching(/not a GitHub Actions job/) });
   });
 });

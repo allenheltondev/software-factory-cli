@@ -24,6 +24,62 @@ describe('validateConfig', () => {
     if (!wrong.ok) expect(wrong.errors).toContainEqual({ path: 'agents.claude.authentication', message: expect.stringMatching(/Claude adapter/) });
   });
 
+  it('native-codex requires a host-native Codex adapter and no provider or key overrides', () => {
+    const cfg = example();
+    cfg.agents.codex = { enabled: true, authentication: 'native-codex', model: 'gpt-5-codex', effort: 'high' };
+    expect(validateConfig(cfg).ok).toBe(true);
+    const errorsOf = (mutate: (a: Record<string, unknown>) => void) => {
+      const c = example();
+      c.agents.codex = { enabled: true, authentication: 'native-codex' };
+      mutate(c.agents.codex);
+      const r = validateConfig(c);
+      return r.ok ? [] : r.errors;
+    };
+    expect(errorsOf((a) => { a.container = { image: 'example/codex:latest' }; })).toContainEqual({ path: 'agents.codex.authentication', message: expect.stringMatching(/credential isolation/) });
+    expect(errorsOf((a) => { a.adapter = 'claude'; })).toContainEqual({ path: 'agents.codex.authentication', message: expect.stringMatching(/Codex adapter/) });
+    expect(errorsOf((a) => { a.args = ['-c', 'model_provider="azure"']; })).toContainEqual({ path: 'agents.codex.args', message: expect.stringMatching(/model_provider/) });
+    expect(errorsOf((a) => { a.args = ['--profile', 'api']; })).toContainEqual({ path: 'agents.codex.args', message: expect.stringMatching(/--profile/) });
+    expect(errorsOf((a) => { a.env = { OPENAI_API_KEY: 'sk-test' }; })).toContainEqual({ path: 'agents.codex.env.OPENAI_API_KEY', message: expect.stringMatching(/ChatGPT sign-in/) });
+    expect(errorsOf((a) => { a.env = { SSL_CERT_FILE: '/tmp/ca.pem' }; })).toContainEqual({ path: 'agents.codex.env.SSL_CERT_FILE', message: expect.stringMatching(/ChatGPT sign-in/) });
+    expect(errorsOf((a) => { a.env = { CODEX_HOME: '/tmp/codex' }; })).toContainEqual({ path: 'agents.codex.env', message: expect.stringMatching(/CODEX_HOME/) });
+  });
+
+  it('refuses code-mode-only Codex models on the isolated native worker, with the reason', () => {
+    // The native worker is a Linux worker, so validate as it does. Native Windows refuses every
+    // containerized agent on its own (checked below), whatever this test runs on.
+    const linux = { platform: 'linux' as const };
+    const cfg = example();
+    const worker = { image: 'native-claude-worker', runtime: '/opt/updraft/bin/updraft-native-worker', network: 'none' };
+    cfg.agents.codex = { enabled: true, command: 'codex', container: worker };
+    expect(validateConfig(cfg, linux).ok).toBe(true);
+    cfg.agents.codex.model = 'gpt-5.5';
+    expect(validateConfig(cfg, linux).ok).toBe(true);
+    for (const model of ['gpt-6-sol', 'gpt-5.6-terra']) {
+      cfg.agents.codex.model = model;
+      for (const platform of ['linux', 'darwin', 'win32'] as const) {
+        const r = validateConfig(cfg, { platform });
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.errors).toContainEqual({ path: 'agents.codex.model', message: expect.stringMatching(/code mode/) });
+      }
+    }
+    // On native Windows the model check still applies; the container itself is refused for its own reason.
+    cfg.agents.codex.model = 'gpt-5.5';
+    const windows = validateConfig(cfg, { platform: 'win32' });
+    expect(windows.ok).toBe(false);
+    if (!windows.ok) {
+      expect(windows.errors.map((e) => e.path)).toEqual(['agents.codex.container']);
+      expect(windows.errors[0]!.message).toMatch(/not supported on native Windows/);
+    }
+    // A Windows-style runtime path is recognized the same way.
+    cfg.agents.codex = { enabled: true, command: 'codex', model: 'gpt-6-sol', container: { ...worker, runtime: 'C:\\updraft\\bin\\updraft-native-worker' } };
+    const r = validateConfig(cfg, linux);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errors).toContainEqual({ path: 'agents.codex.model', message: expect.stringMatching(/code mode/) });
+    // Elsewhere (host-native, or another container) Codex keeps its own tools, so any model is fine.
+    cfg.agents.codex = { enabled: true, model: 'gpt-6-sol' };
+    for (const platform of ['linux', 'darwin', 'win32'] as const) expect(validateConfig(cfg, { platform }).ok).toBe(true);
+  });
+
   it('accepts the shipped example and applies defaults', () => {
     const r = validateConfig(example());
     expect(r.ok).toBe(true);

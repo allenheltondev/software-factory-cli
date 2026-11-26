@@ -25,4 +25,17 @@ describe('native-auth provider selection', () => {
     });
     expect(ctx.err.text).toBe('');
   });
+
+  it('delegates --codex to the Codex ChatGPT sign-in check', async () => {
+    const ctx = fakeContext({ agents: [missingAgentReport('codex')] });
+    expect(await nativeAuthCommand(ctx, { codex: true, json: true })).toBe(EXIT.FAILURE);
+    expect(JSON.parse(ctx.out.text)).toMatchObject({ provider: 'codex', auth: 'chatgpt_subscription', state: 'unknown', reason: 'cli_missing' });
+  });
+
+  it('refuses both providers at once instead of picking one', async () => {
+    const ctx = fakeContext({ agents: [missingAgentReport('claude'), missingAgentReport('codex')] });
+    expect(await nativeAuthCommand(ctx, { claude: true, codex: true })).toBe(EXIT.USAGE);
+    expect(ctx.err.text).toContain('--claude or --codex');
+    expect(ctx.out.text).toBe('');
+  });
 });

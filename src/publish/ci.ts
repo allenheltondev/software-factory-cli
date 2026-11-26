@@ -28,8 +28,11 @@ import {
   markReadyRecorded,
   observeHead,
   recordCiNotice,
+  recordCiRerun,
+  resumeBlockedCi,
   setCiState,
   startCiFor,
+  touchBlockedCi,
   type LoopPr,
 } from '../db/pr-reviews.js';
 import { enqueueRevision, getReviewRequest, revisionJob } from '../db/revisions.js';
@@ -50,6 +53,10 @@ export type CiDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' |
 
 /** How often a head that is waiting for its checks is read again by the polling worker. A webhook does not wait for this. */
 export const CI_POLL_MS = 60_000;
+/** How often the checks of a head stopped for a person are read again by the polling worker, for a pass after a re-run. A webhook does not wait for this. */
+export const CI_BLOCKED_POLL_MS = 5 * 60_000;
+/** GitHub lists at most this many files of a pull request: a diff this long may not be all of it. */
+const MAX_DIFF_FILES = 3_000;
 /** How long after a head was pushed a commit with no checks at all is still waited on: CI registers a moment after the push. */
 export const CI_REGISTER_GRACE_MS = 5 * 60_000;
 /** Failed check runs whose annotations and log are read per head. */
@@ -286,6 +293,136 @@ async function diagnose(deps: CiDeps, repo: RepoRef, failures: readonly CheckDet
 }
 
 // ---------------------------------------------------------------------------
+// One re-run (docs/ci-fix.md, "One re-run")
+// ---------------------------------------------------------------------------
+
+const OS_TOKEN = /\b(?:ubuntu|windows|macos|linux|darwin|win|mac|osx)(?:-(?:latest|\d+(?:\.\d+)*))?\b/g;
+const VERSION_TOKEN = /\bv?\d+(?:\.(?:\d+|x))*\b/g;
+/** A shard ("3/4", "3 of 4"): another part of the tests, not the same tests elsewhere. */
+const SHARD = /\b\d+\s*(?:\/|of)\s*\d+\b/i;
+
+/**
+ * A check's name with its matrix values (an OS, a runtime or tool version) taken out, or null when
+ * it has none: two legs of one matrix job ("windows-latest / node 22", "ubuntu-latest / node 22",
+ * "test (macos-14, 3.12)") come to the same key. Shards of one job do not.
+ */
+export function matrixKey(name: string): string | null {
+  const lower = name.toLowerCase();
+  if (SHARD.test(lower)) return null;
+  const key = lower.replace(OS_TOKEN, '<os>').replace(VERSION_TOKEN, '<v>');
+  return key === lower ? null : key.replace(/\s+/g, ' ').trim();
+}
+
+const SOURCE_FILE =
+  /(?:[A-Za-z]:)?(?:[\w.@+-]+[\\/])*[\w@+-][\w.@+-]*\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|kt|kts|scala|cs|fs|php|swift|c|cc|cpp|cxx|h|hpp|m|mm|vue|svelte|ex|exs|erl|dart|lua|sh|ps1)\b/g;
+const TEST_FILE = /(?:^|\/)(?:tests?|__tests__|spec|specs)\/|[._-](?:test|spec)s?\.[a-z]+$|(?:^|\/)test_[^/]+$|_test\.[a-z]+$/i;
+const MAX_NAMED_FILES = 50;
+
+/** A file path as a log or an annotation names it, as a repository path: forward slashes, no drive or leading "./". */
+const normPath = (p: string) => p.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '').replace(/^(?:\.\/)+/, '');
+
+/**
+ * The source and test files a failed check names: its annotations' paths and the paths in the
+ * error region and end of its log. Dependencies (node_modules, vendor, site-packages) and the
+ * runtime's own files are left out: they are not the repository's. Untrusted text, read only to
+ * compare against the diff.
+ */
+export function namedFiles(d: CheckRunDiagnostics | null): string[] {
+  if (!d) return [];
+  const out = new Set<string>();
+  const add = (raw: string) => {
+    const p = normPath(raw.trim());
+    if (!p || /(?:^|\/)(?:node_modules|vendor|site-packages|dist-packages|\.pnpm|\.yarn)\//.test(p) || /^node:/.test(p)) return;
+    if (out.size < MAX_NAMED_FILES) out.add(p);
+  };
+  for (const a of d.annotations) if (a.path) add(a.path);
+  const text = d.logTail ? logExcerpt(d.logTail).replace(/\b(?:https?|file|node):\/*[^\s)'"]+/g, ' ') : '';
+  for (const m of text.matchAll(SOURCE_FILE)) add(m[0]);
+  return [...out];
+}
+
+/**
+ * Whether a file a check named is one of the diff's: the same path, the diff's path at the end of
+ * an absolute one (the runner's checkout), or, for a bare file name, a diff file of that name.
+ */
+export function inDiff(file: string, diff: readonly string[]): boolean {
+  const f = normPath(file).toLowerCase();
+  return diff.some((raw) => {
+    const d = normPath(raw).toLowerCase();
+    if (!d) return false;
+    if (f === d || f.endsWith(`/${d}`) || d.endsWith(`/${f}`)) return true;
+    return !f.includes('/') && d.slice(d.lastIndexOf('/') + 1) === f;
+  });
+}
+
+export type RerunDecision =
+  | { rerun: true; runs: number[]; checks: string[]; files: string[]; why: string }
+  | { rerun: false; why: string };
+
+/**
+ * Whether the failed checks of a head are re-run once instead of fixed: every one of them is a job
+ * of a GitHub Actions workflow run, its log or annotations were read and name no file of the
+ * pull request's diff, and either the same job passed on another leg of its matrix (same workflow
+ * run, a name that differs only in its matrix values) or what it names includes a test file, all
+ * outside the diff. `diff`: the pull request's files, null when they could not all be read (then
+ * nothing is re-run: a failure inside the diff must never be). Pure.
+ */
+export function decideRerun(failures: readonly DiagnosedFailure[], all: readonly CheckDetail[], diff: readonly string[] | null): RerunDecision {
+  if (!failures.length) return { rerun: false, why: 'nothing failed' };
+  if (diff === null) return { rerun: false, why: "the pull request's files could not all be read" };
+  const runs = new Set<number>();
+  const files = new Set<string>();
+  const whys: string[] = [];
+  for (const f of failures) {
+    const c = f.check;
+    if (c.kind !== 'check-run' || c.workflowRunId === undefined) return { rerun: false, why: `${c.name} is not a GitHub Actions job that can be re-run` };
+    if (failureKind(c) !== 'code') return { rerun: false, why: `${c.name} did not fail in a way a re-run answers` };
+    const d = f.diagnostics;
+    if (!d || (!d.logTail && !d.annotations.length)) return { rerun: false, why: `nothing of ${c.name} could be read, so it is unknown whether it fails in the change` };
+    const named = namedFiles(d);
+    const inside = named.filter((n) => inDiff(n, diff));
+    if (inside.length) return { rerun: false, why: `${c.name} names ${names(inside)}, which this pull request changes` };
+    const key = matrixKey(c.name);
+    const leg =
+      key === null
+        ? undefined
+        : all.find((o) => o !== c && o.kind === 'check-run' && o.outcome === 'success' && o.workflowRunId === c.workflowRunId && o.name !== c.name && matrixKey(o.name) === key);
+    if (leg) whys.push(`${c.name} passed on another leg of its matrix (${leg.name})`);
+    else if (named.some((n) => TEST_FILE.test(n))) whys.push(`${c.name} failed in ${names(named)}, which this pull request does not touch`);
+    else return { rerun: false, why: `${c.name} failed, and nothing shows it is not the change's` };
+    runs.add(c.workflowRunId);
+    for (const n of named) files.add(n);
+  }
+  return { rerun: true, runs: [...runs], checks: failures.map((f) => f.check.name), files: [...files], why: whys.join('; ') };
+}
+
+/** The pull request's files, or null when they could not all be read. Transient failures throw. */
+async function diffFiles(deps: CiDeps, repo: RepoRef, prNumber: number): Promise<string[] | null> {
+  if (!deps.api.listPullRequestFiles) return null;
+  try {
+    const files = await deps.api.listPullRequestFiles(repo, prNumber);
+    return files.length >= MAX_DIFF_FILES ? null : files.map((f) => f.path);
+  } catch (err) {
+    if (isTransient(err)) throw err;
+    return null;
+  }
+}
+
+/**
+ * For the reason a person reads, when the checks of `sha` failed again after their one re-run
+ * (`pr` as it was before this step): that it failed twice, where, and that a pass on this commit
+ * still carries on. Empty when `sha` was not re-run.
+ */
+function afterRerun(pr: LoopPr, sha: string, failedNames: string, merge: boolean): string {
+  if (pr.ciRerunSha !== sha) return '';
+  const where = pr.ciRerunFiles.length ? ` in ${names(pr.ciRerunFiles)}, which this pull request does not touch` : '';
+  return (
+    `. ${failedNames} failed twice, before and after Updraft re-ran it${where}. ` +
+    `It looks unrelated to the change: re-run it or fix it on ${pr.baseBranch ?? 'the base branch'}, and Updraft ${merge ? 'merges' : 'carries on'} once the checks pass on this commit`
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The step
 // ---------------------------------------------------------------------------
 
@@ -311,8 +448,11 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
     startCiFor(db, candidate.repoId, candidate.prNumber, sha, now);
     const pr = getLoopPr(db, candidate.repoId, candidate.prNumber);
     if (!pr || pr.state !== 'open' || pr.verdict !== 'ready-to-merge' || pr.verdictSha !== sha || pr.headSha !== sha) return { status: 'none' };
-    if (pr.ciState !== null && pr.ciState !== 'waiting') return { status: 'none' };
+    if (pr.ciState !== null && pr.ciState !== 'waiting' && pr.ciState !== 'blocked') return { status: 'none' };
     if (!opts.force && pr.ciState === 'waiting' && pr.ciCheckedAt && now() - Date.parse(pr.ciCheckedAt) < CI_POLL_MS) return { status: 'waiting', reason: pr.ciReason ?? '' };
+    if (pr.ciState === 'blocked' && !opts.force && pr.ciCheckedAt && now() - Date.parse(pr.ciCheckedAt) < CI_BLOCKED_POLL_MS) return { status: 'blocked', reason: pr.ciReason ?? '' };
+    const merge = autoMergeMethod(deps.config, cfg);
+    const quiet = quietFor(deps.config, { repoId: pr.repoId, repoFullName: repo.fullName });
 
     const block = (reason: string, signature?: string | null): CiStepResult => {
       if (setCiState(db, pr.repoId, pr.prNumber, sha, { state: 'blocked', reason, signature: signature ?? null }, now)) log.warn('the checks need a person', { reason });
@@ -335,8 +475,31 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
     }
 
     const checks = await api.getCommitChecks(repo, sha);
-    const waitedMs = pr.ciWaitStartedAt ? now() - Date.parse(pr.ciWaitStartedAt) : 0;
     const sincePushMs = pr.headAt ? now() - Date.parse(pr.headAt) : null;
+
+    // Stopped for a person on this head: only a pass on it now (a re-run, by a person or by
+    // Updraft) moves it on, exactly as a pass would have. Anything else leaves it where it is,
+    // with nothing queued and nothing said again.
+    if (pr.ciState === 'blocked') {
+      const again = judgeChecks(checks, settings, sha, 0, sincePushMs);
+      if (again.action !== 'pass') {
+        touchBlockedCi(db, pr.repoId, pr.prNumber, sha, now);
+        return { status: 'blocked', reason: pr.ciReason ?? '' };
+      }
+      if (live.draft) {
+        await api.markPullRequestReady(repo, live.nodeId);
+        markReadyRecorded(db, pr.repoId, pr.prNumber, now);
+      }
+      if (!resumeBlockedCi(db, pr.repoId, pr.prNumber, sha, again.reason, now)) return { status: 'none' };
+      log.info('checks pass now on a head that was stopped for a person; carrying on', { reason: again.reason });
+      if (quiet) {
+        const status = ciStatus({ ciState: 'passed', ciFixes: pr.ciFixes, prNumber: pr.prNumber }, sha, merge);
+        if (status) await noteStatus({ api, log }, { repo, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: true, at: now(), ...status });
+      }
+      return { status: 'passed', reason: again.reason };
+    }
+
+    const waitedMs = pr.ciWaitStartedAt ? now() - Date.parse(pr.ciWaitStartedAt) : 0;
     const verdict = judgeChecks(checks, settings, sha, waitedMs, sincePushMs);
 
     if (verdict.action === 'wait') return wait(verdict.reason);
@@ -350,8 +513,8 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
       setCiState(db, pr.repoId, pr.prNumber, sha, { state: 'passed', reason: verdict.reason }, now);
       log.info('checks passed', { reason: verdict.reason });
       // A pass with no fix before it gets no CI comment (postCiNotices): the status says it.
-      if (pr.ciFixes === 0 && quietFor(deps.config, { repoId: pr.repoId, repoFullName: repo.fullName })) {
-        const status = ciStatus({ ciState: 'passed', ciFixes: 0, prNumber: pr.prNumber }, sha, autoMergeMethod(deps.config, cfg));
+      if (pr.ciFixes === 0 && quiet) {
+        const status = ciStatus({ ciState: 'passed', ciFixes: 0, prNumber: pr.prNumber }, sha, merge);
         if (status) await noteStatus({ api, log }, { repo, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: true, at: now(), ...status });
       }
       return { status: 'passed', reason: verdict.reason };
@@ -359,30 +522,95 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
 
     // A failure the code can cause.
     const failedNames = names(verdict.failures.map((d) => d.name));
-    if (!settings.fix) return block(`check(s) failed on ${short(sha)}: ${failedNames}. Revisions are off for this repository, so fixing them is up to a person`);
+    // Right after Updraft's re-run, GitHub may still list the attempt it re-ran as the latest:
+    // a failure that completed before the re-run was asked for is that attempt, not the re-run's
+    // verdict. Wait for the new attempt, for a while.
+    if (pr.ciRerunSha === sha && pr.ciRerunAt) {
+      const rerunAt = Date.parse(pr.ciRerunAt);
+      const stale = verdict.failures.filter((d) => d.completedAt !== undefined && Date.parse(d.completedAt) < rerunAt);
+      if (stale.length && now() - rerunAt < CI_REGISTER_GRACE_MS) {
+        return wait(`waiting for the re-run of ${names(stale.map((d) => d.name))} on ${short(sha)} to start: GitHub still lists the attempt that failed before it`);
+      }
+    }
     // One revision at a time per pull request: one that is on its way (a person's change request)
     // comes first, and its push gets a review and checks of its own.
     // This head's own fix (queued by an earlier try of this step) is not another revision.
-    const active = activeRevisionJob(db, pr.repoId, pr.prNumber, ciFailureReviewId(pr.prNumber, sha));
+    const active = settings.fix ? activeRevisionJob(db, pr.repoId, pr.prNumber, ciFailureReviewId(pr.prNumber, sha)) : null;
     if (active) return wait(`check(s) failed on ${short(sha)} (${failedNames}), but revision job ${active} is already on its way`);
 
-    let diagnosed: DiagnosedFailure[];
-    try {
-      diagnosed = await diagnose(deps, repo, verdict.failures);
-    } catch (err) {
-      if (isTransient(err)) throw err;
-      diagnosed = verdict.failures.map((check) => ({ check, diagnostics: { annotations: [], logTail: null, problems: [`the diagnostics could not be read: ${message(err)}`] } }));
+    // Before anything else, once per head: a failure the change cannot have caused (the same job
+    // passed on another leg of its matrix, or it failed only in files the change does not touch)
+    // is re-run, and a pass carries on as if it had passed the first time.
+    const mayRerun = pr.ciRerunSha !== sha && api.rerunFailedJobs !== undefined && verdict.failures.every((d) => d.kind === 'check-run' && d.workflowRunId !== undefined);
+    let diagnosed: DiagnosedFailure[] | null = null;
+    const readDiagnostics = async (): Promise<DiagnosedFailure[]> => {
+      try {
+        return await diagnose(deps, repo, verdict.failures);
+      } catch (err) {
+        if (isTransient(err)) throw err;
+        return verdict.failures.map((check) => ({ check, diagnostics: { annotations: [], logTail: null, problems: [`the diagnostics could not be read: ${message(err)}`] } }));
+      }
+    };
+    if (mayRerun) {
+      diagnosed = await readDiagnostics();
+      const decision = decideRerun(diagnosed, relevantChecks(checks, settings), await diffFiles(deps, repo, pr.prNumber));
+      if (decision.rerun) {
+        const reason = `check(s) ${failedNames} failed on ${short(sha)}, and Updraft re-ran the failed jobs once (it looks unrelated to the change: ${decision.why})`;
+        if (recordCiRerun(db, pr.repoId, pr.prNumber, sha, { reason, checks: decision.checks, files: decision.files }, now)) {
+          const accepted: number[] = [];
+          try {
+            for (const id of decision.runs) {
+              await api.rerunFailedJobs!(repo, id);
+              accepted.push(id);
+            }
+            log.info('re-ran the failed jobs once', { checks: failedNames, runs: decision.runs, why: decision.why });
+            if (quiet) {
+              await noteStatus(
+                { api, log },
+                {
+                  repo,
+                  issue: pr.issueNumber,
+                  target: { pr: pr.prNumber },
+                  stage: STATUS_STAGE.loop,
+                  sha,
+                  latest: true,
+                  at: now(),
+                  title: 'Re-running a failed check',
+                  text: `${failedNames} failed on \`${shortSha(sha)}\` of PR #${pr.prNumber}, in a way that looks unrelated to the change; Updraft re-ran the failed jobs once.`,
+                },
+              );
+            }
+            return { status: 'waiting', reason };
+          } catch (err) {
+            // Recorded first, so it is never asked for twice: a re-run that could not be asked
+            // for goes the way any failure does, unless part of it is under way: then wait for
+            // that part, and judge the checks again once it is done.
+            if (accepted.length) {
+              const failedRuns = decision.runs.filter((id) => !accepted.includes(id));
+              log.warn('re-ran the failed jobs of only some workflow runs; waiting for those', { error: message(err), rerun: accepted, failed: failedRuns });
+              return wait(`${reason}; GitHub re-ran workflow run(s) ${accepted.join(', ')} but refused ${failedRuns.join(', ')}`);
+            }
+            log.warn('could not re-run the failed jobs; handling the failure as usual', { error: message(err), runs: decision.runs });
+          }
+        }
+      } else {
+        log.info('not re-running the failed checks', { why: decision.why });
+      }
     }
+    const rerunNote = afterRerun(pr, sha, failedNames, merge !== null);
+
+    if (!settings.fix) return block(`check(s) failed on ${short(sha)}: ${failedNames}. Revisions are off for this repository, so fixing them is up to a person${rerunNote}`);
+    diagnosed ??= await readDiagnostics();
     const signature = failureSignature(diagnosed);
     if (signature !== null && pr.ciLastFixSignature === signature) {
       return block(
-        `check(s) ${failedNames} failed on ${short(sha)} in the same way as before the last automatic fix, so another fix is unlikely to help`,
+        `check(s) ${failedNames} failed on ${short(sha)} in the same way as before the last automatic fix, so another fix is unlikely to help${rerunNote}`,
         signature,
       );
     }
 
     const wf = cfg.workflows.find((w) => workflowId(w) === pr.workflowId);
-    if (!wf) return block(`check(s) failed on ${short(sha)}: ${failedNames}, but workflow "${pr.workflowId}" no longer exists in the config`, signature);
+    if (!wf) return block(`check(s) failed on ${short(sha)}: ${failedNames}, but workflow "${pr.workflowId}" no longer exists in the config${rerunNote}`, signature);
     const login = await workerLogin(api);
     const trigger = ciTrigger({
       prNumber: pr.prNumber,
@@ -428,9 +656,9 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
       return { status: 'fixing', jobId };
     }
     if (queued.status === 'over-limit' || recorded?.state === 'over-limit') {
-      return block(`check(s) failed on ${short(sha)}: ${failedNames}, and the pull request has used its ${max} revision(s) (maxRevisions)`, signature);
+      return block(`check(s) failed on ${short(sha)}: ${failedNames}, and the pull request has used its ${max} revision(s) (maxRevisions)${rerunNote}`, signature);
     }
-    return block(`check(s) failed on ${short(sha)}: ${failedNames}, and a revision for this commit was recorded before (${recorded?.reason ?? 'its job was pruned'})`, signature);
+    return block(`check(s) failed on ${short(sha)}: ${failedNames}, and a revision for this commit was recorded before (${recorded?.reason ?? 'its job was pruned'})${rerunNote}`, signature);
   } catch (err) {
     if (isTransient(err)) {
       log.warn('could not read the checks for now', { error: message(err) });
@@ -539,7 +767,7 @@ export function renderCiNotice(o: {
     lines = [
       head,
       '',
-      `The review passed, but GitHub's checks failed on commit ${code(short(o.sha))}, which Updraft's reviewer found ready to merge. Updraft queued a revision to fix them ` +
+      `The review passed, but GitHub's checks failed on commit ${code(short(o.sha))}. Updraft queued a revision to fix them ` +
         `(automatic CI fix ${pr.ciFixes} on this pull request; revisions of this pull request count against ${code(`repositories.${o.repoFullName}.maxRevisions`)}: ${o.max}).`,
       '',
       ...failed,
@@ -549,22 +777,45 @@ export function renderCiNotice(o: {
       '',
       `Revision job ${code(pr.ciFixJobId ?? '?')} gets the failed checks, their annotations and the end of their logs. Its push gets a new review and new checks.`,
     ];
+  } else if (o.failed?.length) {
+    // Not ready to merge while a check fails: say which, and why Updraft stopped.
+    lines = [
+      head,
+      '',
+      `**Blocked by a failing check:** ${blockedNames(o.failed)} did not pass on commit ${code(short(o.sha))}. The review passed, but Updraft will not fix this commit by itself.`,
+      '',
+      ...failed,
+      '**Why it is blocked**',
+      '',
+      reason,
+      '',
+      `Fix the check, or push a commit (it gets a new review and new checks). If the failure is unrelated to this change, re-run it on GitHub: ${afterPass(o.merge ?? null)}`,
+    ];
   } else {
     lines = [
       head,
       '',
-      `Updraft's reviewer found commit ${code(short(o.sha))} ready to merge, but its checks need a person: Updraft will not fix or merge this commit by itself.`,
+      `The review passed on commit ${code(short(o.sha))}, but its checks need a person: Updraft will not fix this commit by itself.`,
       '',
-      ...failed,
       '**Reason**',
       '',
       reason,
       '',
-      'A new commit on this branch gets a new review and new checks.',
+      `A new commit on this branch gets a new review and new checks. ${afterPass(o.merge ?? null)}`,
     ];
   }
   return [...lines, '', ciNoticeMarker(o.sha)].join('\n');
 }
+
+/** The failed checks of a head, by name, for one sentence. */
+function blockedNames(failed: readonly CheckDetail[]): string {
+  const shown = failed.slice(0, MAX_NAMES).map((d) => code(d.name));
+  return failed.length > MAX_NAMES ? `${shown.join(', ')} and ${failed.length - MAX_NAMES} more` : shown.join(', ');
+}
+
+/** What a pass on the same commit leads to, once a person dealt with what stopped the CI step. */
+const afterPass = (merge: MergeMethod | null) =>
+  merge ? 'once the checks pass on this commit, Updraft merges it without a new commit.' : 'once the checks pass on this commit, Updraft carries on without a new commit.';
 
 /**
  * Quiet notifications: the CI step speaks on the pull request only when it stops and a person has
@@ -576,11 +827,17 @@ export function renderQuietCiNotice(o: { pr: LoopPr; sha: string; failed?: reado
   const { pr } = o;
   const link = o.link ? ` [View this work in Updraft](${o.link})` : '';
   let lines: string[];
-  if (pr.ciState === 'blocked') {
+  if (pr.ciState === 'blocked' && o.failed?.length) {
+    lines = [
+      `**Blocked by a failing check:** ${blockedNames(o.failed)} did not pass on ${code(short(o.sha))} of PR #${pr.prNumber}: ${inline(cap(pr.ciReason ?? 'no reason was recorded', 600))}. ` +
+        `Fix the check or push a commit (a new commit gets a new review and new checks); if it is unrelated, re-run it on GitHub: ${afterPass(o.merge ?? null)}${link}`,
+      '',
+      ...failedLines(o.failed),
+    ];
+  } else if (pr.ciState === 'blocked') {
     lines = [
       `Updraft stopped working on the checks of PR #${pr.prNumber} at ${code(short(o.sha))} and needs a person: ${inline(cap(pr.ciReason ?? 'no reason was recorded', 600))}. ` +
         `Please fix the checks or push a commit; a new commit gets a new review and new checks.${link}`,
-      ...(o.failed?.length ? ['', ...failedLines(o.failed)] : []),
     ];
   } else if (pr.ciState === 'passed' && !o.merge) {
     lines = [
@@ -593,14 +850,26 @@ export function renderQuietCiNotice(o: { pr: LoopPr; sha: string; failed?: reado
   return [...lines, '', ciNoticeMarker(o.sha)].join('\n');
 }
 
-/** The status comment's line for a head's CI step (quiet notifications). */
-function ciStatus(pr: Pick<LoopPr, 'ciState' | 'ciFixes' | 'prNumber'>, sha: string, merge: MergeMethod | null): { stage: number; title: string; text: string } | null {
+/** The status comment's line for a head's CI step (quiet notifications). `failed`: the head's failed checks, when the CI step stopped. */
+function ciStatus(
+  pr: Pick<LoopPr, 'ciState' | 'ciFixes' | 'prNumber'>,
+  sha: string,
+  merge: MergeMethod | null,
+  failed?: readonly CheckDetail[] | null,
+): { stage: number; title: string; text: string } | null {
   const after = pr.ciFixes > 0 ? ` after CI fix ${pr.ciFixes}` : '';
   if (pr.ciState === 'fixing') return { stage: STATUS_STAGE.loop, title: 'Fixing checks', text: `Fixing failed checks on \`${shortSha(sha)}\` of PR #${pr.prNumber} (CI fix ${pr.ciFixes}).` };
   if (pr.ciState === 'passed') {
     return merge
       ? { stage: STATUS_STAGE.loop, title: 'Checks passed', text: `Checks passed on \`${shortSha(sha)}\` of PR #${pr.prNumber}${after}; Updraft merges it once nothing else stands in the way.` }
       : { stage: STATUS_STAGE.person, title: 'Ready for a person to merge', text: `Checks passed on \`${shortSha(sha)}\` of PR #${pr.prNumber}${after}; it is ready for a person to merge.` };
+  }
+  if (pr.ciState === 'blocked' && failed?.length) {
+    return {
+      stage: STATUS_STAGE.person,
+      title: 'Blocked by a failing check',
+      text: `${blockedNames(failed)} did not pass on \`${shortSha(sha)}\` of PR #${pr.prNumber}, and Updraft stopped (see the PR for why). Updraft ${merge ? 'merges it' : 'carries on'} once the checks pass on this commit.`,
+    };
   }
   if (pr.ciState === 'blocked') return { stage: STATUS_STAGE.person, title: 'Waiting for a person', text: `The checks of PR #${pr.prNumber} need a person (see the PR).` };
   return null;
@@ -638,12 +907,13 @@ export async function postCiNotices(deps: CiDeps, signal?: AbortSignal): Promise
     try {
       const merge = autoMergeMethod(deps.config, found.repo);
       if (quietFor(deps.config, { repoId: pr.repoId, repoFullName: found.fullName })) {
-        const status = ciStatus(pr, sha, merge);
+        const failed = pr.ciState === 'blocked' ? await failedChecks(deps, repoRef, sha, settings) : null;
+        const status = ciStatus(pr, sha, merge, failed);
         if (status) await noteStatus({ api: deps.api, log: deps.log }, { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: pr.headSha === sha, at: (deps.now ?? Date.now)(), ...status });
         const body = renderQuietCiNotice({
           pr,
           sha,
-          failed: pr.ciState === 'blocked' ? await failedChecks(deps, repoRef, sha, settings) : null,
+          failed,
           merge,
           link: consoleWorkflowUrl(deps.console, pr.repoId, pr.issueNumber),
         });

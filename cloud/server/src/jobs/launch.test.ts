@@ -156,6 +156,32 @@ describe('the launcher', () => {
     expect(runs).toEqual([]);
   });
 
+  it('never sends a Codex trigger to the Claude subscription session, even when it is selected there (#125)', async () => {
+    // The Claude session runs only Claude. A Codex workflow (CODEX_API_KEY) stays on its own API-key
+    // path until Codex has its own subscription session; it is never parked for a Claude sign-in.
+    const version = await store.createConfigVersion(55, { sha256: 'codex', files: [], publishedBy: 's', publishedAt: '',
+      dispatch: dispatchRules({ dispatch: { allowedActors: ['pat'] }, repositories: {
+        'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] },
+      } }, { keysFor: () => ['CODEX_API_KEY'] }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    const ready = vi.fn(async () => true);
+    deps.native = {
+      route: { installationId: 55, workerId: 'worker-1', microvmId: 'mvm-native', imageVersion: '7',
+        controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/test-abcdef' },
+      secret: async () => 'worker-control-credential-01234567890123456789',
+      mode: async () => ({ enabled: true, revision: 2, routingVersion: 1, triggers: [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }] }),
+      ready,
+    };
+    expect(await createLauncher(deps)(request())).toMatchObject({ reason: 'missing_key' });
+    expect(ready).not.toHaveBeenCalled();
+    await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    const result = await createLauncher(deps)(request({}, 'codex-with-key'));
+    expect(result).toMatchObject({ disposition: 'launched' });
+    expect((await store.getJob(result.jobId!))?.native).toBeUndefined();
+    expect(ready).not.toHaveBeenCalled();
+  });
+
   it('parks a managed issue without reserving runtime, then resumes the same delivery on its own worker', async () => {
     const config = dispatchRules({
       dispatch: { allowedActors: ['pat'] },

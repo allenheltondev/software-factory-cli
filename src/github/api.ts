@@ -306,6 +306,10 @@ export interface CheckDetail {
   /** Check runs: their id (for a GitHub Actions check run, also the id of its job) and the App that reported it. */
   checkRunId?: number;
   app?: string | null;
+  /** A GitHub Actions check run: the workflow run its job belongs to (read from its URL), which a re-run of its failed jobs names. */
+  workflowRunId?: number;
+  /** A completed check run: when it completed (ISO 8601), as GitHub reports it. */
+  completedAt?: string;
   /** A check run's output title and summary, or a status's description; capped. */
   summary?: string;
 }
@@ -449,6 +453,12 @@ export interface GitHubApi {
    * for a part it cannot read: that is listed in `problems`.
    */
   getCheckRunDiagnostics(repo: RepoRef, checkRunId: number, opts?: { maxLogBytes?: number }): Promise<CheckRunDiagnostics>;
+  /**
+   * Write: re-run the failed jobs of one GitHub Actions workflow run (`POST .../actions/runs/{id}/rerun-failed-jobs`).
+   * Used only by the CI step, at most once per head, for a failure the change cannot have caused
+   * (docs/ci-fix.md, "One re-run"). A client without it never re-runs anything.
+   */
+  rerunFailedJobs?(repo: RepoRef, workflowRunId: number): Promise<void>;
   /**
    * Write: merge a pull request at exactly `sha`. Used only by auto-merge. Throws GitHubError with
    * GitHub's status when the merge is refused: 405 not mergeable (conflicts, branch protection, a
