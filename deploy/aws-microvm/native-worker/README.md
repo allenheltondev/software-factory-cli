@@ -263,7 +263,7 @@ image, slot and capacity group as the Claude ones:
     maxConcurrent: 1
     capacityGroup: native-claude-worker
     command: codex
-    model: gpt-5-codex
+    model: gpt-5.5   # a direct-mode model: code-mode-only models are refused here
     container:
       image: native-claude-worker
       runtime: /opt/updraft/bin/updraft-native-worker

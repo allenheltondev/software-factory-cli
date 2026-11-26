@@ -52,6 +52,34 @@ export function ensurePrivateDir(uid, gid, dir) {
   }
 }
 
+export const LOCK_REFUSED = 'credential lock is not a private regular file';
+/**
+ * Hand the credential home's lock file to the credential identity, which takes the lock
+ * (startService). Supervisors before #125 created it as root 0600, which that identity cannot
+ * open. Root opens it without following a link and works on the open descriptor only: a regular
+ * file with one link owned by root is given to `uid` in place (same inode, so an old supervisor
+ * still holding it still excludes this one); one owned by `uid` is left alone; anything else (a
+ * link, a FIFO or other non-regular file, a hard link, another owner) is refused. Never deleted or
+ * recreated. A missing file is created later by the credential identity itself.
+ */
+export function adoptLock(file, uid, gid, rootUid = 0) {
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK | fs.constants.O_NOCTTY);
+  } catch (error) {
+    if (error.code === 'ENOENT') return 'absent';
+    throw new Error(LOCK_REFUSED, { cause: error });
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.nlink !== 1) throw new Error(LOCK_REFUSED);
+    if (st.uid === uid) return 'kept';
+    if (st.uid !== rootUid) throw new Error(LOCK_REFUSED);
+    fs.fchownSync(fd, uid, gid);
+    return 'adopted';
+  } finally { fs.closeSync(fd); }
+}
+
 function kill(child) {
   if (child?.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } }
 }
@@ -185,7 +213,10 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   // The credential home lock excludes a second supervisor in either storage mode.
   // This file contains no credentials. Never use an expiring directory lock that can
   // strand a login after termination, or permit two refresh-token writers after expiry.
-  // Taken as the credential identity: root never opens a path in storage that identity can write.
+  // Taken as the credential identity: root opens nothing there but the lock file itself, without
+  // following links, to hand an older root-owned lock to that identity (adoptLock).
+  try { adoptLock(`${c.credentialHome}/.updraft-worker.lock`, c.claudeUid, c.claudeGid); }
+  catch (error) { await closeEgress(); removeScratch(); throw error; }
   const lease = startAs(c.claudeUid, c.claudeGid, '/usr/bin/flock', ['--nonblock', `${c.credentialHome}/.updraft-worker.lock`,
     '/bin/sh', '-c', 'printf ready; exec cat >/dev/null'], { env: { PATH: '/usr/bin:/bin' }, stdio: ['pipe', 'pipe', 'ignore'] });
   await new Promise((resolve, reject) => {
@@ -407,11 +438,20 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
 
   try {
     // Real namespace probe, including network isolation. A failed probe prevents listening.
-    // Created by the job identity in its own workRoot; root never chowns a path there.
-    const made = runAs(c.workerUid, c.workerGid, '/bin/mktemp', ['-d', `${c.workRoot}/.native-probe-XXXXXXXX`]);
-    const probeDir = made.status === 0 ? made.stdout.trim() : '';
-    const probeStat = probeDir && path.dirname(probeDir) === c.workRoot ? fs.lstatSync(probeDir) : undefined;
-    if (!probeStat?.isDirectory() || probeStat.isSymbolicLink() || probeStat.uid !== c.workerUid) throw new Error('native worker namespace probe failed');
+    // install.sh leaves workRoot root-owned (no other identity can change its entries), so root
+    // creates the probe directory there as before. Where the job identity owns or can write
+    // workRoot, it creates the directory itself: root never chowns a path another identity controls.
+    const workRootStat = fs.lstatSync(c.workRoot);
+    let probeDir;
+    if (workRootStat.uid === 0 && !(workRootStat.mode & 0o022)) {
+      probeDir = fs.mkdtempSync(`${c.workRoot}/.native-probe-`);
+      fs.chownSync(probeDir, c.workerUid, c.workerGid);
+    } else {
+      const made = runAs(c.workerUid, c.workerGid, '/bin/mktemp', ['-d', `${c.workRoot}/.native-probe-XXXXXXXX`]);
+      probeDir = made.status === 0 ? made.stdout.trim() : '';
+      const probeStat = probeDir && path.dirname(probeDir) === c.workRoot ? fs.lstatSync(probeDir) : undefined;
+      if (!probeStat?.isDirectory() || probeStat.isSymbolicLink() || probeStat.uid !== c.workerUid) throw new Error('native worker namespace probe failed');
+    }
     // The supervisor can be PID 1 in the MicroVM. /proc/1 also exists inside
     // an isolated PID namespace, so compare namespace identities instead.
     const pidNamespace = fs.readlinkSync('/proc/self/ns/pid');
@@ -423,7 +463,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     probe.stdin.end();
     probe.stdout.resume(); probe.stderr.resume();
     const code = await new Promise((resolve) => { probe.once('error', () => resolve(125)); probe.once('close', resolve); });
-    runAs(c.workerUid, c.workerGid, '/bin/rm', ['-rf', '--', probeDir]);
+    removeAs(c.workerUid, c.workerGid, probeDir);
     if (code !== 0) throw new Error('native worker namespace probe failed');
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
     fs.chownSync(socketPath, 0, c.workerGid);

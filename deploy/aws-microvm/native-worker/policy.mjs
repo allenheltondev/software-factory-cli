@@ -183,9 +183,21 @@ export const CODEX_LOGIN_PINS = ['-c', 'cli_auth_credentials_store="file"', '-c'
 export function codexInstructions(egress = false) {
   return `Use only the ${CODEX_SERVER} MCP server's ${CODEX_TOOL} tool for repository work: reading, searching, editing and creating files (write them with shell commands such as cat, printf, sed or a script), git and tests. Never use apply_patch or any other built-in tool; they are disabled, and trying one ends the session. The tool starts each command in the job worktree. ${networkNote(egress)} Commit changes when the task requires it.`;
 }
+/**
+ * Models the isolated session can use. A model the bundled catalog marks `tool_mode:
+ * code_mode_only` (codex-rs/models-manager/models.json at openai/codex 8727186: the gpt-5.6, gpt-6.x
+ * and daybreak models, codex-auto-review) reaches MCP tools only through code mode, which is
+ * switched off here, so it would have no usable tool. At 8727186 the only listed direct-mode model
+ * is gpt-5.5, which is also the default. Unknown models are refused rather than guessed. Re-check
+ * against models.json for every pinned Codex version; src/agents/native-codex-args.ts holds the
+ * same list for `updraft validate`.
+ */
+export const CODEX_DIRECT_MODELS = ['gpt-5.5'];
+export const CODEX_DEFAULT_MODEL = 'gpt-5.5';
 export function codexArgs(input, mcp, { egress = false } = {}) {
   if (input[0] !== 'exec') throw new Error('native worker runs only codex exec');
   const safe = [];
+  let model;
   let json = false;
   for (let i = 1; i < input.length; i++) {
     const flag = input[i];
@@ -194,7 +206,8 @@ export function codexArgs(input, mcp, { egress = false } = {}) {
     if (flag === '--model' || flag === '-m') {
       const value = input[++i];
       if (typeof value !== 'string' || !PROFILE_VALUE.test(value)) throw new Error('invalid profile value');
-      safe.push('--model', value);
+      if (!CODEX_DIRECT_MODELS.includes(value)) throw new Error('model needs code mode, which the isolated worker switches off');
+      model = value;
       continue;
     }
     if (flag === '-c' || flag === '--config') {
@@ -208,9 +221,13 @@ export function codexArgs(input, mcp, { egress = false } = {}) {
     throw new Error('unsupported Codex option in isolated worker');
   }
   if (!json) throw new Error('only headless JSONL runs are supported');
+  safe.unshift('--model', model ?? CODEX_DEFAULT_MODEL);
   return ['exec', '--json', '--strict-config', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only',
     '-c', 'approval_policy="never"', '-c', 'model_provider="openai"', ...CODEX_LOGIN_PINS,
     ...CODEX_DISABLED_FEATURES.flatMap((name) => ['-c', `features.${name}=false`]),
+    // Sub-agents: the model catalog's multi_agent_version (v2 for most models) wins over both
+    // multi_agent features; only agents.enabled=false turns them off (core/src/config/mod.rs).
+    '-c', 'agents.enabled=false',
     '-c', 'web_search="disabled"', '-c', 'check_for_update_on_startup=false',
     '-c', `mcp_servers.${CODEX_SERVER}.command=${toml(mcp.command)}`, '-c', `mcp_servers.${CODEX_SERVER}.args=${toml(mcp.args)}`,
     '-c', `mcp_servers.${CODEX_SERVER}.required=true`, '-c', `mcp_servers.${CODEX_SERVER}.enabled_tools=${toml([CODEX_TOOL])}`,

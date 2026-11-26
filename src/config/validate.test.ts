@@ -44,6 +44,24 @@ describe('validateConfig', () => {
     expect(errorsOf((a) => { a.env = { CODEX_HOME: '/tmp/codex' }; })).toContainEqual({ path: 'agents.codex.env', message: expect.stringMatching(/CODEX_HOME/) });
   });
 
+  it('refuses code-mode-only Codex models on the isolated native worker, with the reason', () => {
+    const cfg = example();
+    const worker = { image: 'native-claude-worker', runtime: '/opt/updraft/bin/updraft-native-worker', network: 'none' };
+    cfg.agents.codex = { enabled: true, command: 'codex', container: worker };
+    expect(validateConfig(cfg).ok).toBe(true);
+    cfg.agents.codex.model = 'gpt-5.5';
+    expect(validateConfig(cfg).ok).toBe(true);
+    for (const model of ['gpt-6-sol', 'gpt-5.6-terra']) {
+      cfg.agents.codex.model = model;
+      const r = validateConfig(cfg);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.errors).toContainEqual({ path: 'agents.codex.model', message: expect.stringMatching(/code mode/) });
+    }
+    // Elsewhere (host-native, or another container) Codex keeps its own tools, so any model is fine.
+    cfg.agents.codex = { enabled: true, model: 'gpt-6-sol' };
+    expect(validateConfig(cfg).ok).toBe(true);
+  });
+
   it('accepts the shipped example and applies defaults', () => {
     const r = validateConfig(example());
     expect(r.ok).toBe(true);

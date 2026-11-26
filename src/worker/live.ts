@@ -33,7 +33,7 @@ import {
 import { agentProfile, describeProfile, effectiveArgs } from '../agents/profile.js';
 import { checkNativeClaudeAuth, nativeClaudeAuthHint, type NativeAuthRunner } from '../agents/native-claude-auth.js';
 import { checkNativeCodexAuth, nativeCodexAuthHint, type NativeCodexAuthRunner } from '../agents/native-codex-auth.js';
-import { CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem, codexSubscriptionEnvProblem } from '../agents/native-codex-args.js';
+import { CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem, codexSubscriptionEnvProblem, isolatedCodexModelProblem, onNativeWorker } from '../agents/native-codex-args.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { baseCheckSection, renderPrompt, renderRevisionPrompt, type BaseCheckPrompt, type IssueContext } from '../agents/prompt.js';
 import { dependencyMergedSection, dependencyProtocolSection, MAX_DEPENDENCY_WAITS, readDependency } from '../agents/dependency.js';
@@ -764,6 +764,15 @@ export class LiveExecutor implements Executor {
       if (auth.state !== 'connected') {
         await log([`native subscription preflight: ${auth.state} (${auth.reason})`, 'outcome: start_failed']);
         throw new StartFailedError(`native Claude subscription not ready: ${auth.reason}. ${nativeClaudeAuthHint(auth.reason)}`);
+      }
+    }
+    // The isolated native worker runs Codex without code mode: refuse a code-mode-only model here,
+    // with the reason, instead of the worker's fixed refusal.
+    if (adapterName === 'codex' && onNativeWorker(agentCfg)) {
+      const problem = isolatedCodexModelProblem(agentProfile(adapterName, agentCfg).model.value);
+      if (problem) {
+        await log([`error: ${problem}`, 'outcome: start_failed']);
+        throw new StartFailedError(problem);
       }
     }
     // The same for Codex's own Sign in with ChatGPT (docs/codex-subscription.md): only a ChatGPT

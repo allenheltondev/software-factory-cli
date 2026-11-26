@@ -23,6 +23,7 @@ let probe;
 let networkTrap;
 let shimDir;
 let stubRegistry;
+let ephemeralMount;
 const workerUid = 21000;
 const claudeUid = 21001;
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -47,7 +48,7 @@ try {
   // root installation explicitly, before creating the separately owned data directories.
   execFileSync('/bin/chown', ['-R', 'root:root', fixture]);
   execFileSync('/bin/chmod', ['-R', 'go-w', fixture]);
-  const { startService, assertEfsMount, identityCommand } = await import(pathToFileURL(`${fixture}/native-worker/service.mjs`).href);
+  const { startService, assertEfsMount, assertEphemeralHome, identityCommand } = await import(pathToFileURL(`${fixture}/native-worker/service.mjs`).href);
   const { frames, send } = await import(pathToFileURL(`${fixture}/native-worker/protocol.mjs`).href);
   const credentialParent = `${fixture}/credential-parent`;
   const credentialHome = `${credentialParent}/home`;
@@ -135,7 +136,7 @@ if (args[0] !== 'exec') process.exit(90);
 function required(...seq) { for (let i = 0; i + seq.length <= args.length; i++) if (seq.every((v, k) => args[i + k] === v)) return; process.exit(91); }
 required('--json'); required('--skip-git-repo-check'); required('--ephemeral'); required('--ignore-user-config'); required('--ignore-rules');
 required('--sandbox', 'read-only'); required('-c', 'approval_policy="never"'); required('-c', 'features.shell_tool=false'); required('-c', 'features.unified_exec=false');
-required('-c', 'model_provider="openai"'); required('-c', 'forced_login_method="chatgpt"'); required('-c', 'web_search="disabled"');
+required('-c', 'model_provider="openai"'); required('-c', 'forced_login_method="chatgpt"'); required('-c', 'web_search="disabled"'); required('-c', 'agents.enabled=false'); required('--model', 'gpt-5.5');
 required('--strict-config'); required('-c', 'chatgpt_base_url="https://chatgpt.com/backend-api/"'); required('-c', 'cli_auth_credentials_store="file"');
 for (const feature of ${JSON.stringify(CODEX_FEATURES_OFF)}) required('-c', 'features.' + feature + '=false');
 if (args.some((a) => /^features[.][a-z_0-9]+=true$/.test(a))) process.exit(94);
@@ -321,7 +322,7 @@ let prompt = ''; process.stdin.on('data', (x) => prompt += x); process.stdin.on(
   setStatus({ loggedIn: true, authMethod: 'claude.ai' });
 
   // Codex (Sign in with ChatGPT): the same boundary with the Codex CLI's own login in CODEX_HOME.
-  const codexArgv = (name = `codex-${randomUUID()}`) => argv(['codex', 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5-codex'], name);
+  const codexArgv = (name = `codex-${randomUUID()}`) => argv(['codex', 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5.5'], name);
   const codexRun = (commands, other = {}) => request(codexArgv(), JSON.stringify({ commands, ...other }));
   assert.equal(await service.authStatus('codex'), 'connected');
   const codexDoctor = await request(['run', '--rm', '--name', 'codex-doctor', '--user', `${workerUid}:${workerUid}`, '--network', 'none',
@@ -397,8 +398,19 @@ let prompt = ''; process.stdin.on('data', (x) => prompt += x); process.stdin.on(
   await assert.rejects(startService(config, socketPath, () => {}), /leased|lock/);
   assert(!fs.existsSync(`${target}/created-by-root`));
   asCredential(`rm ${quote(`${credentialHome}/.updraft-worker.lock`)}`);
+  // A lock left by an older supervisor (root 0600, as before #125) is handed over in place.
+  const lockFile = `${credentialHome}/.updraft-worker.lock`;
+  fs.writeFileSync(lockFile, '', { mode: 0o600 });
+  fs.chownSync(lockFile, 0, 0);
+  const lockInode = fs.statSync(lockFile).ino;
   service = await startService(config, socketPath, () => {});
+  assert.equal(fs.statSync(lockFile).uid, claudeUid);
+  assert.equal(fs.statSync(lockFile).ino, lockInode);
   assert.equal(await service.authStatus('codex'), 'connected');
+  // A model that only reaches tools through code mode (switched off here) is refused.
+  assert.equal((await request(argv(['codex', 'exec', '--json', '--model', 'gpt-6-sol']), JSON.stringify({ commands: ['touch codex-model-ran'] }))).code, 125);
+  assert(!fs.existsSync(`${work}/codex-model-ran`));
+  results.push('an older root-owned lock is handed to the credential identity in place; a code-mode-only model is refused');
   results.push("root does not follow links the credential identity plants: a linked CODEX_HOME stops startup with the target unchanged, and the lock cannot create a file through a link");
   const later = `${work}/orphan-ran`;
   await request(argv(['/bin/sh', '-c', `echo started; sleep 2; touch ${quote(later)}`]), '', (text, socket) => { if (text.includes('started')) socket.destroy(); });
@@ -570,10 +582,54 @@ let prompt = ''; process.stdin.on('data', (x) => prompt += x); process.stdin.on(
   service.resetJobEgress();
   assert((await verifyVia(`${tenantHost}:443`)).output.includes('(not-allowed)'));
   results.push("an installation's registry host is reachable only through the dispatcher's per-job policy, never from a socket client or the sandbox; inward names, addresses and another job's policy stay refused, and the end of the job removes it");
+  // Startup as the image runs it (hooks.mjs: mount-home.sh, then startService), for the homes it
+  // meets: a workRoot that install.sh leaves root-owned, a disposable tmpfs home (mounted the way
+  // mount-home.sh --ephemeral mounts it, checked by the real assertEphemeralHome), a durable home
+  // from an earlier version with its root-owned 0600 lock, and images with and without Codex.
+  await service.close(); service = undefined;
+  const imageJobs = `${fixture}/image-jobs`;
+  fs.mkdirSync(imageJobs); fs.chmodSync(imageJobs, 0o755);
+  const imageWork = `${imageJobs}/repo`;
+  fs.mkdirSync(imageWork); fs.chownSync(imageWork, workerUid, workerUid);
+  const claudeOnly = Object.fromEntries(Object.entries(config).filter(([key]) => !['codex', 'codexAuthModule'].includes(key)));
+  const imageRun = () => request(['run', '--rm', '-i', '--name', `image-${randomUUID()}`, '--user', `${workerUid}:${workerUid}`, '--network', 'none',
+    '--tmpfs', '/updraft-home:rw,exec,mode=1777', '-e', 'HOME=/updraft-home', '--mount', `type=bind,source=${imageWork},target=${imageWork}`,
+    '--workdir', imageWork, 'native-claude-worker', 'claude', '-p', '--output-format', 'stream-json', '--verbose'], JSON.stringify({ commands: ['echo image-start-ok'] }));
+  const startsCleanly = async (label, workerConfig, probe) => {
+    service = await startService(workerConfig, socketPath, probe);
+    assert.equal(await service.authStatus(), 'connected', label);
+    const reply = await imageRun();
+    assert.equal(reply.code, 0, `${label}: ${reply.output}`);
+    assert(reply.output.includes('image-start-ok'), label);
+    await service.close(); service = undefined;
+  };
+  // A disposable session's home: a fresh tmpfs, nothing in it but the CLI's status stand-in.
+  const ephemeralParent = `${fixture}/ephemeral-parent`;
+  fs.mkdirSync(ephemeralParent, { mode: 0o700 });
+  execFileSync('/bin/mount', ['-t', 'tmpfs', '-o', `mode=0700,uid=${claudeUid},gid=${claudeUid},size=64m,nosuid,nodev,noexec`, 'tmpfs', ephemeralParent]);
+  ephemeralMount = ephemeralParent;
+  const ephemeralHome = `${ephemeralParent}/home`;
+  execFileSync('/usr/bin/install', ['-d', '-m', '0700', '-o', String(claudeUid), '-g', String(claudeUid), ephemeralHome]);
+  fs.mkdirSync(`${ephemeralHome}/.claude`); fs.chownSync(`${ephemeralHome}/.claude`, claudeUid, claudeUid);
+  fs.copyFileSync(state, `${ephemeralHome}/status.json`); fs.chownSync(`${ephemeralHome}/status.json`, claudeUid, claudeUid);
+  for (const [label, extra] of [['fresh disposable home, Claude only', {}], ['fresh disposable home, with Codex', { codex: config.codex, codexAuthModule: config.codexAuthModule }]]) {
+    await startsCleanly(label, { ...claudeOnly, ...extra, credentialHome: ephemeralHome, workRoot: imageJobs }, assertEphemeralHome);
+  }
+  assert(fs.lstatSync(`${ephemeralHome}/codex`).uid === claudeUid);
+  // A durable home from an earlier version: its lock was made by root, 0600, under umask 077.
+  for (const [label, extra] of [['earlier durable home, Claude only', {}], ['earlier durable home, with Codex', { codex: config.codex, codexAuthModule: config.codexAuthModule }]]) {
+    const lockFile = `${credentialHome}/.updraft-worker.lock`;
+    fs.rmSync(lockFile, { force: true });
+    fs.writeFileSync(lockFile, '', { mode: 0o600 }); fs.chownSync(lockFile, 0, 0); fs.chmodSync(lockFile, 0o600);
+    await startsCleanly(label, { ...claudeOnly, ...extra, workRoot: imageJobs }, () => {});
+    assert.equal(fs.statSync(lockFile).uid, claudeUid, label);
+  }
+  results.push('startup as the image runs it: root-owned workRoot, fresh disposable tmpfs home and earlier durable home with a root-owned lock, each with and without Codex, start and run');
   console.log(JSON.stringify({ passed: results, limitations: ['Synthetic Claude and Codex CLIs, not a model call; the real Codex tool surface under these flags needs live verification', 'Local durable directory, not a deployed EFS mount', 'No AWS replacement or subscription end-to-end proof'] }, null, 2));
 } finally {
   await probe?.close();
   await service?.close();
+  if (ephemeralMount) execFileSync('/bin/umount', [ephemeralMount]);
   if (networkTrap) await new Promise((resolve) => networkTrap.close(resolve));
   if (stubRegistry) await new Promise((resolve) => stubRegistry.close(resolve));
   // Only the exact mkdtemp fixture is removed; no user directories are involved.

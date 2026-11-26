@@ -6,7 +6,7 @@ import {
   nativeCodexAuthFromStatus,
   nativeCodexAuthHint,
 } from './native-codex-auth.js';
-import { CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem, codexSubscriptionEnvProblem } from './native-codex-args.js';
+import { CODEX_DIRECT_MODELS, CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem, codexSubscriptionEnvProblem, isolatedCodexModelProblem, onNativeWorker } from './native-codex-args.js';
 
 const status = (output: string, code: number | null = 0) => ({ code, output });
 
@@ -109,6 +109,20 @@ describe('native Codex profile arguments', () => {
 
   it('allows model, effort and ordinary options', () => {
     expect(codexSubscriptionArgProblem(['--model', 'gpt-5-codex', '-c', 'model_reasoning_effort="high"', '--sandbox', 'workspace-write'])).toBeNull();
+  });
+
+  it('allows only direct-mode models on the isolated native worker', () => {
+    const worker = { runtime: '/opt/updraft/bin/updraft-native-worker', image: 'native-claude-worker' };
+    expect(onNativeWorker({ container: worker })).toBe(true);
+    expect(onNativeWorker({ container: { ...worker, image: 'other' } })).toBe(false);
+    expect(onNativeWorker({ container: { ...worker, runtime: '/usr/local/bin/updraft-sandbox' } })).toBe(false);
+    expect(onNativeWorker({})).toBe(false);
+    expect([...CODEX_DIRECT_MODELS]).toEqual(['gpt-5.5']);
+    expect(isolatedCodexModelProblem(null)).toBeNull();
+    expect(isolatedCodexModelProblem('gpt-5.5')).toBeNull();
+    for (const model of ['gpt-6-sol', 'gpt-5.6-luna', 'gpt-daybreak-red-latest', 'not-in-the-catalog']) {
+      expect(isolatedCodexModelProblem(model)).toMatch(/code mode.*Use gpt-5\.5/);
+    }
   });
 
   it('refuses a profile env that moves CODEX_HOME', () => {

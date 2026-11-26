@@ -1,7 +1,7 @@
 import type { z } from 'zod';
 import { agentProfile, effectiveArgs } from '../agents/profile.js';
 import { getAdapter } from '../agents/adapters/registry.js';
-import { codexSubscriptionArgProblem, codexSubscriptionEnvProblem } from '../agents/native-codex-args.js';
+import { codexSubscriptionArgProblem, codexSubscriptionEnvProblem, isolatedCodexModelProblem, onNativeWorker } from '../agents/native-codex-args.js';
 import { hasCodexAuthOverride } from '../agents/native-codex-auth.js';
 import {
   KNOWN_ADAPTERS,
@@ -87,6 +87,10 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
         errors.push({ path: `agents.${agentName}.env.${name}`, message: `${name} selects an API key, token or endpoint; native-codex runs only on the CLI's own ChatGPT sign-in` });
       }
       if (config.execution.mode !== 'live') warnings.push({ path: at, message: 'native-codex authentication is checked only in live mode' });
+    }
+    if (adapter === 'codex' && onNativeWorker(agent)) {
+      const problem = isolatedCodexModelProblem(agentProfile(adapter, agent).model.value);
+      if (problem) errors.push({ path: `agents.${agentName}.model`, message: problem });
     }
     for (const problem of agentProfile(adapter, agent).problems) {
       errors.push({ path: `agents.${agentName}`, message: problem });

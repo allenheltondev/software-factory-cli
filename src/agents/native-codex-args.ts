@@ -38,3 +38,26 @@ export function codexSubscriptionEnvProblem(env: Record<string, string> | undefi
   const name = Object.keys(env ?? {}).find((n) => n.toUpperCase() === 'CODEX_HOME');
   return name ? `env sets ${name}; native-codex uses the CLI's own home on this worker` : null;
 }
+
+/**
+ * Models the isolated native worker can run (deploy/aws-microvm/native-worker/policy.mjs keeps the
+ * same list). The worker switches Codex's code mode off, and a model whose bundled catalog entry
+ * has `tool_mode: code_mode_only` (codex-rs/models-manager/models.json at openai/codex 8727186:
+ * gpt-5.6-*, gpt-6*, the daybreak models, codex-auto-review) reaches MCP tools only through code
+ * mode, so it would have no usable tool there. gpt-5.5 is the one direct-mode model listed, and the
+ * worker's default. Unknown models are refused rather than guessed. Re-check for every pinned Codex.
+ * Host-native native-codex keeps the CLI's own tools, so any model works there.
+ */
+export const CODEX_DIRECT_MODELS: readonly string[] = ['gpt-5.5'];
+
+/** Does this profile run on the isolated native worker (its runtime and image)? */
+export function onNativeWorker(agent: { container?: { runtime: string; image: string } | undefined }): boolean {
+  const c = agent.container;
+  return !!c && (c.runtime.split(/[\\/]/).pop() ?? '') === 'updraft-native-worker' && c.image === 'native-claude-worker';
+}
+
+/** Why a Codex model cannot run on the isolated native worker, or null (null model: the worker's default). */
+export function isolatedCodexModelProblem(model: string | null): string | null {
+  if (model === null || CODEX_DIRECT_MODELS.includes(model)) return null;
+  return `model "${model}" is not a direct-mode Codex model: code-mode-only models (gpt-5.6, gpt-6.x, daybreak) reach tools only through code mode, which the isolated native worker switches off, so the run would have no usable tool. Use ${CODEX_DIRECT_MODELS.join(' or ')} (the default)`;
+}

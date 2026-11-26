@@ -47,7 +47,7 @@ own browser.
 agents:
   codex:
     authentication: native-codex
-    model: gpt-5-codex
+    model: gpt-5.5
 ```
 
 1. Sign in once as the worker's account: `codex login --device-auth`, then check with
@@ -124,7 +124,19 @@ The controls, in order of importance:
      `send_message_to_user_async`, `artifact`, `statsig_gates`. `js_repl` is `Stage::Removed`
      (ignored by the CLI) and not listed. Infrastructure flags (MCP startup, compression,
      retries, TUI) are left alone. Re-run this audit for every Codex version the image pins;
+   - `agents.enabled=false`: the model catalog's `multi_agent_version` (v2 for most models)
+     wins over both `multi_agent` features, and only `agents.enabled=false` turns sub-agents off
+     (`multi_agent_version_override`, `codex-rs/core/src/config/mod.rs`);
    - `web_search="disabled"`, `check_for_update_on_startup=false`;
+   - a direct-mode model only. A model whose catalog entry has `tool_mode: code_mode_only` reaches
+     MCP tools only through code mode, which is off here, so it would have no usable tool. In
+     `codex-rs/models-manager/models.json` at 8727186 that is every gpt-5.6 and gpt-6.x model, the
+     daybreak models and `codex-auto-review`; the one direct-mode model listed is `gpt-5.5`, which
+     is the worker's default and the only one it accepts (unknown models are refused, not
+     guessed). The CLI does not expose that flag before a run, so the list is kept in
+     `policy.mjs` and `src/agents/native-codex-args.ts`; `updraft validate` and the run refuse
+     another model for a Codex profile on the native worker runtime, with the reason. Host-native
+     `native-codex` keeps Codex's own tools, so any model works there;
    - one MCP server, `updraft`, `required`, limited to `enabled_tools = ["exec"]`, which runs
      each command in the job sandbox exactly as Claude's tool does;
    - `model_provider="openai"`, `forced_login_method="chatgpt"`,
@@ -167,7 +179,11 @@ Other parts of the boundary:
 - **Root never touches credential-writable paths.** CODEX_HOME is created by the credential
   identity (`setpriv … mkdir -m 0700`), then only `lstat`-checked by root (a real directory it
   owns, private); a link stops startup. The credential home's lock is taken as the credential
-  identity. Tool sockets live in a root-owned directory the CLI can only traverse; session and
+  identity. A lock file left by an earlier supervisor (root 0600) is handed over in place: root
+  opens it with `O_NOFOLLOW`, checks the open descriptor (a regular file, one link, owned by root)
+  and `fchown`s it, keeping the inode so an old supervisor still holding it still excludes the new
+  one; a link, a non-regular file, a hard link or another owner is refused, and it is never deleted
+  or recreated. Tool sockets live in a root-owned directory the CLI can only traverse; session and
   status directories are emptied as their owner before root removes the empty directory; the
   namespace probe directory is created and removed by the job identity.
 - `codex login status` runs before every session as the credential identity in a private
@@ -188,7 +204,8 @@ Other parts of the boundary:
 
 **What this does not prove:** whether the real CLI, with these flags, offers the model no
 built-in tool but `apply_patch` is a property of the pinned Codex release and must be verified
-live (below).
+live (below). The feature audit, the sub-agent switch and the direct-mode model list are all
+read from `openai/codex` 8727186 and must be re-checked for every Codex version the image pins.
 
 ## Hosted sign-in
 
@@ -247,6 +264,10 @@ subscription routing needs:
   `command_execution`, `file_change` or `mcp_tool_call` to another server appears, and that the
   gate kills the session if one does. Check that normal runs edit files through `updraft.exec`
   and never trip the gate with `apply_patch`.
+- No sub-agent tools appear with `agents.enabled=false` (the catalog's `multi_agent_version`
+  would otherwise turn them on), and `gpt-5.5` (or whatever the pinned catalog lists without
+  `tool_mode: code_mode_only`) offers `updraft.exec` as a direct tool. Re-check both, and the
+  feature audit, for every pinned Codex version.
 - MCP tool calls run without an approval prompt in `exec` with `approval_policy="never"` and
   `default_tools_approval_mode="approve"`.
 - A real issue through implementation, review, revision and CI repair on the subscription, with

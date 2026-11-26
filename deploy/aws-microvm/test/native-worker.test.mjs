@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, EGRESS_TARGET, CODEX_SERVER, CODEX_TOOL, CODEX_DISABLED_FEATURES, claudeArgs, claudeEnv, codexArgs, codexEnv, checkCodexEvent, sanitizeCodexEvent, sanitizeCodexText, checkInventory, validateRun, resolveRunEnvironment, withEgress, networkNote } from '../native-worker/policy.mjs';
+import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, EGRESS_TARGET, CODEX_SERVER, CODEX_TOOL, CODEX_DISABLED_FEATURES, CODEX_DIRECT_MODELS, claudeArgs, claudeEnv, codexArgs, codexEnv, checkCodexEvent, sanitizeCodexEvent, sanitizeCodexText, checkInventory, validateRun, resolveRunEnvironment, withEgress, networkNote } from '../native-worker/policy.mjs';
 import { parseRunArgs } from '../image/sandbox/updraft-sandbox.mjs';
 import { frames, readPrompt } from '../native-worker/protocol.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
@@ -15,6 +15,8 @@ import { commitIdentityEnv } from '../../../src/github/credentials.ts';
 import { containerSchema } from '../../../src/config/schema.ts';
 import { createGitFixture } from '../../../test/git-fixtures.ts';
 import { createProbeServer, PROBE_PORT } from '../native-worker/probe.mjs';
+import { adoptLock, LOCK_REFUSED } from '../native-worker/service.mjs';
+import { execFileSync } from 'node:child_process';
 
 describe('disposable worker browser login', () => {
   it('accepts only the official authorization endpoint', () => {
@@ -128,19 +130,19 @@ describe('native Codex worker policy', () => {
   const pair = (args, key) => args.find((a, n) => args[n - 1] === '-c' && a.startsWith(`${key}=`));
 
   it('replaces the bypass default with a restricted, configuration-free, ChatGPT-only launch and one MCP tool', () => {
-    const args = codexArgs(['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5-codex', '-c', 'model_reasoning_effort="high"',
+    const args = codexArgs(['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5.5', '-c', 'model_reasoning_effort="high"',
       '-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"'], mcp);
     expect(args.slice(0, 9)).toEqual(['exec', '--json', '--strict-config', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only']);
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     for (const expected of ['approval_policy="never"', 'model_provider="openai"', 'forced_login_method="chatgpt"', 'cli_auth_credentials_store="file"',
-      'chatgpt_base_url="https://chatgpt.com/backend-api/"', 'web_search="disabled"', ...REQUIRED_OFF.map((f) => `features.${f}=false`),
+      'chatgpt_base_url="https://chatgpt.com/backend-api/"', 'web_search="disabled"', 'agents.enabled=false', ...REQUIRED_OFF.map((f) => `features.${f}=false`),
       `mcp_servers.${CODEX_SERVER}.required=true`, `mcp_servers.${CODEX_SERVER}.enabled_tools=["${CODEX_TOOL}"]`]) {
       expect(args[args.indexOf(expected) - 1]).toBe('-c');
     }
     expect(pair(args, `mcp_servers.${CODEX_SERVER}.command`)).toBe(`mcp_servers.${CODEX_SERVER}.command="/usr/local/bin/node"`);
     expect(JSON.parse(pair(args, `mcp_servers.${CODEX_SERVER}.args`).split('=').slice(1).join('='))).toEqual(mcp.args);
     expect(args.filter((a) => a.startsWith('model_provider='))).toEqual(['model_provider="openai"']);
-    expect(args.slice(-4)).toEqual(['--model', 'gpt-5-codex', '-c', 'model_reasoning_effort="high"']);
+    expect(args.slice(-4)).toEqual(['--model', 'gpt-5.5', '-c', 'model_reasoning_effort="high"']);
     expect(pair(args, 'developer_instructions')).toContain('Network access is disabled.');
     expect(pair(args, 'developer_instructions')).toContain('Never use apply_patch');
     expect(pair(codexArgs(['exec', '--json'], mcp, { egress: true }), 'developer_instructions')).toContain('limited to package registries');
@@ -155,6 +157,17 @@ describe('native Codex worker policy', () => {
     [['exec']], [['resume', '--json']], [['exec', '--json', 'resume', '--last']], [['exec', '--json', '--output-schema', '/repo/s.json']],
   ])('refuses caller-controlled capability options: %j', (input) => {
     expect(() => codexArgs(input, mcp)).toThrow();
+  });
+
+  it('runs only direct-mode models: code-mode-only models would have no usable tool here', () => {
+    // models.json at openai/codex 8727186: gpt-5.5 is the one listed model without tool_mode code_mode_only.
+    expect(CODEX_DIRECT_MODELS).toEqual(['gpt-5.5']);
+    const model = (input) => { const a = codexArgs(input, mcp); return a[a.indexOf('--model') + 1]; };
+    expect(model(['exec', '--json'])).toBe('gpt-5.5');
+    expect(model(['exec', '--json', '-m', 'gpt-5.5'])).toBe('gpt-5.5');
+    for (const name of ['gpt-6-sol', 'gpt-5.6-terra', 'gpt-daybreak-blue-latest', 'codex-auto-review', 'gpt-7-unknown']) {
+      expect(() => codexArgs(['exec', '--json', '--model', name], mcp)).toThrow(/code mode/);
+    }
   });
 
   it('lets a turn think, talk, plan and call only the isolated tool', () => {
@@ -204,6 +217,42 @@ describe('native Codex worker policy', () => {
     const message = { type: 'item.completed', item: { type: 'agent_message', text: 'done' } };
     expect(sanitizeCodexEvent(message)).toBe(message);
   });
+});
+
+describe.skipIf(process.platform === 'win32')('credential lock handover (adoptLock)', () => {
+  const uid = process.getuid?.() ?? 0;
+  const gid = process.getgid?.() ?? 0;
+  const withDir = (fn) => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-lock-')); try { fn(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); } };
+
+  it('leaves a missing lock for the credential identity to create, and keeps one it already owns', () => withDir((dir) => {
+    expect(adoptLock(`${dir}/lock`, uid, gid)).toBe('absent');
+    fs.writeFileSync(`${dir}/lock`, '', { mode: 0o600 });
+    expect(adoptLock(`${dir}/lock`, uid, gid)).toBe('kept');
+  }));
+
+  it('refuses a link, a hard link, a FIFO, a directory or another owner, and never removes it', () => withDir((dir) => {
+    fs.writeFileSync(`${dir}/target`, 'x', { mode: 0o600 });
+    fs.symlinkSync(`${dir}/target`, `${dir}/symlink`);
+    fs.linkSync(`${dir}/target`, `${dir}/hardlink`);
+    execFileSync('mkfifo', [`${dir}/fifo`]);
+    fs.mkdirSync(`${dir}/directory`);
+    for (const name of ['symlink', 'hardlink', 'fifo', 'directory']) {
+      expect(() => adoptLock(`${dir}/${name}`, uid, gid)).toThrow(LOCK_REFUSED);
+      expect(fs.lstatSync(`${dir}/${name}`)).toBeTruthy();
+    }
+    fs.writeFileSync(`${dir}/other`, '', { mode: 0o600 });
+    // Owned by neither the credential identity nor root (here: the test's own uid stands for a third owner).
+    expect(() => adoptLock(`${dir}/other`, uid + 1, gid, uid + 2)).toThrow(LOCK_REFUSED);
+  }));
+
+  it.skipIf(uid !== 0)('hands a root-owned 0600 lock to the credential identity in place', () => withDir((dir) => {
+    const file = `${dir}/lock`;
+    fs.writeFileSync(file, '', { mode: 0o600 });
+    const before = fs.statSync(file);
+    expect(adoptLock(file, 21001, 21001)).toBe('adopted');
+    const after = fs.statSync(file);
+    expect([after.uid, after.gid, after.ino, after.mode & 0o777]).toEqual([21001, 21001, before.ino, 0o600]);
+  }));
 });
 
 describe('native Claude worker policy', () => {
