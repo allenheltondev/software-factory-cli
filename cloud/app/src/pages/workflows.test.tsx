@@ -7,6 +7,7 @@ import { fakeApi } from '../test/fakeApi';
 import { InstallationPage } from './InstallationPage';
 import { JobPage } from './JobPage';
 import { WorkflowPage } from './WorkflowPage';
+import { reasonLabel } from '../components/workflows';
 
 afterEach(cleanup);
 
@@ -318,5 +319,18 @@ describe('workflows in the console', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Paused (2)' }));
     expect(screen.getAllByTestId(/^workflow-/).map((e) => e.dataset.testid)).toEqual(['workflow-99-i7', 'workflow-99-i9']);
     expect(within(screen.getByTestId('workflow-99-i9')).getByText('Paused')).toBeInTheDocument();
+  });
+});
+
+describe('Claude wait reasons on the timeline (#176)', () => {
+  it('names each new reason code in words, and leaves other codes alone', () => {
+    expect(reasonLabel('claude_session_worker_lost')).toBe('The Claude session ended because its worker stopped answering; a new one needs a sign-in');
+    expect(reasonLabel('claude_session_lifetime')).toBe('The Claude session ended because it reached its maximum lifetime; a new one needs a sign-in');
+    expect(reasonLabel('claude_session_vm_ended')).toMatch(/its VM stopped running/);
+    expect(reasonLabel('claude_session_something_new')).toMatch(/because something new;/);
+    expect(reasonLabel('claude_startup_failed')).toBe('The Claude session never became ready');
+    expect(reasonLabel('claude_auth_required')).toBe('Claude needs a sign-in');
+    expect(reasonLabel('concurrent_jobs')).toBeUndefined();
+    expect(reasonLabel('claude_unknown_thing')).toBeUndefined();
   });
 });

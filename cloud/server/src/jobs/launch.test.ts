@@ -226,7 +226,7 @@ describe('the launcher', () => {
     });
     deps.waitForClaude = vi.fn(async () => 'job_waiting');
     expect(await createLauncher(deps)(request())).toMatchObject({ status: 202, reason, jobId: 'job_waiting' });
-    expect(deps.waitForClaude).toHaveBeenCalledWith(expect.anything(), 'acme/web', 9, 12, readiness);
+    expect(deps.waitForClaude).toHaveBeenCalledWith(expect.anything(), 'acme/web', 9, 12, readiness, undefined);
     expect(logs).toContainEqual(expect.objectContaining({ nativeDispatch: 'wait', readiness, generation: 'session-a', microvmId: 'mvm-native' }));
     expect(runs).toEqual([]);
   });
@@ -299,7 +299,7 @@ describe('the launcher', () => {
     for (const reason of ['auth-unavailable', 'heartbeat-stale', 'worker-starting'] as const) expect(waitingComment('https://console/x', reason)).toBeUndefined();
     // A session that ended says why, from its own recorded retirement reason.
     const retired = waitingComment('https://console/x', 'environment-retiring', 'lifetime');
-    expect(retired).toBe('Claude needs you to sign in again because the previous Claude session ended (it reached its eight-hour lifetime): [sign in from Updraft](https://console/x) and this job starts on its own.');
+    expect(retired).toBe('Claude needs you to sign in again because the previous Claude session ended (it reached its maximum lifetime): [sign in from Updraft](https://console/x) and this job starts on its own.');
     expect(sentences(retired)).toBe(1);
     expect(waitingComment('https://console/x', 'environment-retiring', 'vm-ended')).toMatch(/its VM stopped running before its lifetime ended/);
     expect(waitingComment('https://console/x', 'environment-suspended')).toMatch(/sign in again .*suspended/);

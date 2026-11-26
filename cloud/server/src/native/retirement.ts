@@ -15,9 +15,9 @@ export const REPLACEMENT_KEEPS_SIGN_IN = false;
 const WORDS: Record<RetirementReason, string> = {
   reconnect: 'an owner reconnected it',
   idle: 'it was idle for its whole idle limit',
-  lifetime: 'it reached its eight-hour lifetime',
+  lifetime: 'it reached its maximum lifetime',
   'vm-ended': 'its VM stopped running before its lifetime ended',
-  expired: 'its VM ended or it reached its eight-hour lifetime',
+  expired: 'its VM ended or it reached its maximum lifetime',
   suspended: 'its VM was suspended, and it is never resumed',
   'worker-lost': 'its worker stopped answering',
   disabled: 'an operator paused Claude connections',

@@ -164,12 +164,34 @@ export function endedWords(reason: NativeReadiness, retirement?: string): string
 export const waitCode = (reason: NativeReadiness, retirement?: string) =>
   reason === 'environment-retiring' ? retirementCode(retirement) : `claude_${reason.replace(/-/g, '_')}`;
 
+/** What a workflow waiting for a person (a sign-in) says, with the specific cause as its event's code (#176). */
+export function signInWait(action: 'sign-in' | 'reconnect', why?: { readiness: NativeReadiness; retirement?: string }) {
+  const code = why ? { code: waitCode(why.readiness, why.retirement) } : {};
+  return action === 'sign-in'
+    ? {
+        reason: 'sign_in_required',
+        message: 'The job waits for a Claude subscription sign-in before it can start.',
+        nextAction: 'Open the Claude page of this installation and sign in; the job then starts on its own.',
+        ...code,
+      }
+    : {
+        reason: 'reconnect_required',
+        // The specific reason: which retirement, or which state, ended the environment.
+        message: why
+          ? `The job waits for a new Claude session: the previous one ended because ${endedWords(why.readiness, why.retirement)}. A new session needs a sign-in.`
+          : 'The job waits for the Claude subscription to be reconnected before it can start.',
+        nextAction: 'Open the Claude page of this installation and sign in again; the job then starts on its own.',
+        ...code,
+      };
+}
+
 /**
  * The issue comment for a parked job, or none. A comment only ever asks for the one thing a
  * person must do, a Claude sign-in, in one sentence with the console link (#176): a new
  * environment always needs one, since the login never leaves its VM (native/retirement.ts). A
- * wait that ends by itself (a startup, a heartbeat gap, an unreadable auth probe) posts nothing:
- * the job starts on its own.
+ * wait that ends by itself (a startup, a heartbeat gap, an unreadable auth probe) posts nothing
+ * at park: the job starts on its own, and should that wait turn into one for a sign-in (the
+ * session is sealed, the login lapses), native/waiting-notice.ts posts this comment then, once.
  */
 export function waitingComment(link: string, reason?: NativeReadiness, retirement?: string): string | undefined {
   const action = reason === undefined ? 'sign-in' : readinessAction(reason);
@@ -437,22 +459,7 @@ export function createLauncher(deps: LaunchDeps) {
     const waitingForSignIn = (jobId: string, action: 'sign-in' | 'reconnect' = 'sign-in', why?: { readiness: NativeReadiness; retirement?: string }) =>
       deps.workflows?.waiting(
         { installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, eventName, deliveryId: req.deliveryId, jobId, ...(decision.issue !== undefined ? { issue: decision.issue } : {}), ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}) },
-        action === 'sign-in'
-          ? {
-              reason: 'sign_in_required',
-              message: 'The job waits for a Claude subscription sign-in before it can start.',
-              nextAction: 'Open the Claude page of this installation and sign in; the job then starts on its own.',
-              ...(why ? { code: waitCode(why.readiness, why.retirement) } : {}),
-            }
-          : {
-              reason: 'reconnect_required',
-              // The specific reason (#176): which retirement, or which state, ended the environment.
-              message: why
-                ? `The job waits for a new Claude session: the previous one ended because ${endedWords(why.readiness, why.retirement)}. A new session needs a sign-in.`
-                : 'The job waits for the Claude subscription to be reconnected before it can start.',
-              nextAction: 'Open the Claude page of this installation and sign in again; the job then starts on its own.',
-              ...(why ? { code: waitCode(why.readiness, why.retirement) } : {}),
-            },
+        signInWait(action, why),
       );
     if (binding?.route.workerId.startsWith('managed-') && !req.resumeClaude && !req.retry) {
       const jobId = await deps.parkedClaude?.(req);
@@ -474,9 +481,7 @@ export function createLauncher(deps: LaunchDeps) {
     }
     if (native && readiness && readiness !== 'ready') {
       if (native.route.workerId.startsWith('managed-') && decision.issue !== undefined && !req.resumeClaude && !req.retry && deps.waitForClaude) {
-        const jobId = retirement
-          ? await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness, retirement)
-          : await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness);
+        const jobId = await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness, retirement);
         const action = readinessAction(readiness);
         // A wait only a person can end (a sign-in, a reconnect) is the workflow's too.
         if (action === 'sign-in' || action === 'reconnect') await waitingForSignIn(jobId, action, { readiness, ...(retirement ? { retirement } : {}) });

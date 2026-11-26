@@ -68,7 +68,21 @@ own: it would spend a launch and then wait for the same sign-in. That is why
 routine rollouts must never cause a retirement. The waiting-job comment is
 posted only when that sign-in is needed. It is one sentence that says why the
 previous session ended and links to the console. A wait that ends by itself
-(startup, a heartbeat gap, an unreadable auth probe) gets no comment.
+(startup, a heartbeat gap, an unreadable auth probe) gets no comment when the
+job is parked. If that wait later turns into one that needs a sign-in (cleanup
+seals the session as `worker-lost` or `startup-failed`, or the login lapses),
+the five-minute workflow reconciliation posts the comment then and records the
+wait on the timeline. Each waiting job gets exactly one sign-in comment: the
+comment is claimed on the waiting record first, and the claim is given back
+only if posting fails.
+
+The in-VM dispatcher retries a poll or heartbeat that failed in transport
+(timeout, throttling, a 5xx, a broker invocation that crashed, a function being
+updated) with backoff, for at most two minutes. That is shorter than Cloud's
+three-minute worker-lost grace. A refusal from Cloud (fenced, revoked, another
+session or generation, a bad credential) still stops it at once. An uncertain
+settlement is still never retried. An assignment whose poll response was lost
+is refused on the retried poll, so the worker stops as it did before.
 
 ## Investigation: the 2026-11-26 01:18 UTC retirement (#176)
 
@@ -105,8 +119,8 @@ Ranked by likelihood:
    Three minutes after the last heartbeat, reconcile seals the session. Each
    merge updated the broker Lambda twice: once in the backend deploy and once
    for the image parameter. #170's deploy ran at about 01:00–01:15 and built
-   no image, which matches a seal shortly before 01:18. This change does not
-   alter the dispatcher (that is #177's area). It is the main remaining risk.
+   no image, which matches a seal shortly before 01:18. The dispatcher now
+   retries transient transport failures (see above).
 3. **Hard lifetime or idle.** The default idle limit and the hard lifetime are
    both eight hours. A session sealed at 01:18 would have started before about
    17:18. Under the code before #155, rollouts at 19:36, 21:00 and 21:33 would
