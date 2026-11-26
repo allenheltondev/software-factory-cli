@@ -264,20 +264,30 @@ describe.runIf(sandbox.usable)('git in the sandbox, in a clone the worker made',
     const worktree = path.join(f.root, 'job');
     f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-1-job_t1', worktree, 'HEAD');
     const runtime = installRuntime(path.join(f.root, 'runtime'));
-    const names = ['GIT_CONFIG_NOSYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+    // Git's own trace of what it ran, for the failure message: which command touched what.
+    const traceDir = path.join(f.root, 'trace');
+    fs.mkdirSync(traceDir);
+    const names = ['GIT_CONFIG_NOSYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_TRACE2_PERF'];
     const args = buildContainerRunArgs(
       { file: '/bin/sh', args: ['-c', 'i=0; while [ $i -lt 3000 ]; do echo $i > f$i; i=$((i+1)); done; git add . && git commit -qm many && echo committed'] },
-      { image: SANDBOX_IMAGE, name: `gc-${process.pid}-${Date.now()}`, mounts: worktreeMounts(worktree), workdir: worktree, user: `${process.getuid()}:${process.getgid()}`, envNames: names, network: 'none' },
+      { image: SANDBOX_IMAGE, name: `gc-${process.pid}-${Date.now()}`, mounts: [...worktreeMounts(worktree), { path: traceDir, readOnly: false }], workdir: worktree, user: `${process.getuid()}:${process.getgid()}`, envNames: names, network: 'none' },
     );
-    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'A', GIT_AUTHOR_EMAIL: 'a@example.com', GIT_COMMITTER_NAME: 'A', GIT_COMMITTER_EMAIL: 'a@example.com' };
-    return spawnSync(runtime.path, args, { env, encoding: 'utf8', timeout: 90_000 });
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'A', GIT_AUTHOR_EMAIL: 'a@example.com', GIT_COMMITTER_NAME: 'A', GIT_COMMITTER_EMAIL: 'a@example.com', GIT_TRACE2_PERF: path.join(traceDir, 'perf') };
+    const result = spawnSync(runtime.path, args, { env, encoding: 'utf8', timeout: 90_000 });
+    let trace = '';
+    try {
+      trace = fs.readFileSync(path.join(traceDir, 'perf'), 'utf8').split('\n').filter((l) => /\| (start|child_start|cmd_name|region_enter|error|def_param) /.test(l)).slice(0, 200).join('\n');
+    } catch {
+      // no trace
+    }
+    return { ...result, diagnosis: `stderr:\n${result.stderr}\ngit version: ${f.git(f.root, '--version')}\ntrace:\n${trace}` };
   }
 
   it('commits without a read-only git warning: no automatic gc tries to write the read-only git directory', () => {
     fixture = createGitFixture('octo/widgets');
     const result = commitMany(fixture, MANAGED_CLONE_CONFIG);
-    expect(result.stdout, result.stderr).toContain('committed');
-    expect(result.stderr).toBe('');
+    expect(result.stdout, result.diagnosis).toContain('committed');
+    expect(result.stderr, result.diagnosis).toBe('');
   });
 
   it('(the same commit with git\'s automatic gc on is what warned)', () => {
