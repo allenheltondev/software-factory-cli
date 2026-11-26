@@ -114,7 +114,6 @@ domain_override = $(if $(filter undefined,$(origin $(2))),,$(if $($(2)),"$(1)=$(
 PARAM_OVERRIDES = $(strip \
 	$(call domain_override,AppDomainName,APP_DOMAIN_NAME) \
 	$(call domain_override,AppHostedZoneId,APP_HOSTED_ZONE_ID) \
-	$(call domain_override,CloudAgents,CLOUD_AGENTS) \
 	$(call domain_override,BenchmarkInstallationId,BENCHMARK_INSTALLATION_ID) \
 	$(call domain_override,BenchmarkRepositoryId,BENCHMARK_REPOSITORY_ID) \
 	$(call domain_override,ManagedClaudeImageName,MANAGED_CLAUDE_IMAGE_NAME) \

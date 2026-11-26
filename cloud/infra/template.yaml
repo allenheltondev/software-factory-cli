@@ -146,13 +146,6 @@ Parameters:
     Default: 20
     MinValue: 1
     Description: Jobs every tenant together may run at once.
-  # The agents tenants may configure: the ones the job image ships (deploy/aws-microvm,
-  # image/build.env: AGENT_PACKAGES for Claude Code and Codex, KIRO_INSTALL_COMMAND for Kiro).
-  CloudAgents:
-    Type: String
-    Default: claude,codex
-    AllowedPattern: '^(claude|codex|kiro|vibe)(,(claude|codex|kiro|vibe))*$'
-    Description: Comma-separated agents tenants may run (claude, codex, kiro, vibe). List only the ones the job image ships.
   # Agent Timeline has no documented link to a conversation (tenants/telemetry-service.ts):
   # empty, and the console links to the conversation's query instead.
   HoneycombTimelineUrl:
@@ -229,10 +222,6 @@ Conditions:
 Globals:
   Function:
     Runtime: nodejs22.x
-    Environment:
-      Variables:
-        # What tenants may configure and the console offers (server/src/tenants/agents.ts).
-        CLOUD_AGENTS: !Ref CloudAgents
     Architectures:
       - arm64
     Tracing: Active

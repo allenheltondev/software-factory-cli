@@ -4,7 +4,6 @@ import { Alert, Button, Card, CardBody, CardHeader, CardTitle, PasswordInput, Sk
 import { api as defaultApi, type AgentKeysView, type AgentKeyView, type ApiClient } from '../api/client';
 import { relativeTime } from '../lib/time';
 import { AGENT_GUIDES, type AgentGuide } from '../lib/agentGuides';
-import { KiroNotEnabled } from '../components/kiro';
 
 type Load = { state: 'loading' } | { state: 'ok'; view: AgentKeysView } | { state: 'error'; message: string };
 type Api = Pick<ApiClient, 'agentKeys' | 'setAgentKey'>;
@@ -186,7 +185,6 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
                 </details>
               ))}
           </div>
-          {!keys.some((k) => k.name === 'KIRO_API_KEY') && <KiroNotEnabled />}
           <p className="text-sm" data-testid="keys-privacy">
             🔒 Keys are write-only. Once saved, a key is never shown again, not even to you; it is stored encrypted and read only by your own jobs, and is removed when you
             uninstall the App.

@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
@@ -64,10 +64,7 @@ describe('AgentKeysPage', () => {
     expect(screen.getByTestId('other-agents')).toHaveTextContent('Other agents (Codex, Kiro)');
   });
 
-  it('says the deployment must enable Kiro when it offers no Kiro key, and says nothing when it does', async () => {
-    show(fakeApi({ agentKeys: async () => view() }));
-    expect(await screen.findByTestId('kiro-not-enabled')).toHaveTextContent('Kiro is not enabled on this Updraft Cloud deployment');
-    cleanup();
+  it('lists the Kiro key like any other, with no not-enabled notice', async () => {
     show(fakeApi({ agentKeys: async () => view({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: false, required: true }, { name: 'KIRO_API_KEY', configured: false, required: false }] }) }));
     expect(await screen.findByTestId('key-KIRO_API_KEY')).toBeInTheDocument();
     expect(screen.queryByTestId('kiro-not-enabled')).toBeNull();

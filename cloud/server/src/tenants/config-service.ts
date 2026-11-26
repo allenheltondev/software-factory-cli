@@ -62,7 +62,7 @@ export interface ConfigView {
   repositories: GitHubRepository[];
   /** Which agent keys are set (never their values). */
   agentKeys: Record<string, boolean>;
-  /** The agents this deployment runs (CLOUD_AGENTS): what the editor offers. */
+  /** Every supported agent: what the editor offers. */
   agents: CloudAgent[];
   activeVersion: number | null;
   /**

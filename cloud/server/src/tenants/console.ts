@@ -822,7 +822,7 @@ export function missingKeys(config: ConsoleConfig, keys: ReadonlySet<string>): C
   const out: ConfigIssue[] = [];
   for (const name of [...agents].sort()) {
     const { adapter } = config.agents[name]!;
-    // An agent this deployment does not run: compiling it says so, with what to do instead.
+    // Not a supported agent: compiling it says so, with what to do instead.
     if (!CONSOLE_AGENTS.includes(adapter)) continue;
     const key = SUPPORTED_AGENT_KEY_ENV[adapter];
     if (!keys.has(key)) out.push({ path: `agents.${name}`, message: `add your ${key}, or turn this agent off: jobs run ${adapter} with your own key` });

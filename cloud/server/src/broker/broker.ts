@@ -377,7 +377,7 @@ export function createBroker(deps: BrokerDeps) {
     if (action === 'start' || action === 'credentials') {
       // The tenant's key secrets by variable name; the runner reads them with the credentials (a
       // missing one is a key the tenant has not set).
-      // Only the agents this deployment runs (CloudAgents): one taken out of service gets no key.
+      // Every supported agent's key (AGENT_KEY_NAMES), whichever agent the job runs.
       const agentKeySecrets = Object.fromEntries((job.benchmark ? job.agentKeys ?? [] : job.native ? (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY') : AGENT_KEY_NAMES).map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
       // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
