@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
@@ -27,7 +27,19 @@ afterEach(() => {
 function setup() {
   const ctx = fakeContext();
   homes.push(ctx.paths.dataDir);
-  ctx.openDb = (file) => openDatabase(file);
+  /** Every database the command opened, and whether it has been closed since. */
+  const opened: Array<{ closed: boolean }> = [];
+  ctx.openDb = (file) => {
+    const handle = openDatabase(file);
+    const entry = { closed: false };
+    opened.push(entry);
+    const close = handle.close.bind(handle);
+    handle.close = () => {
+      entry.closed = true;
+      close();
+    };
+    return handle;
+  };
   const db = openDatabase(ctx.paths.dbFile);
   dbs.push(db);
   const jobId = insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
@@ -42,7 +54,19 @@ function setup() {
     mkdirSync(dirname(c.run.logPath!), { recursive: true });
     appendFileSync(c.run.logPath!, text);
   };
-  return { ctx, db, jobId, start, startWorker, write };
+  /**
+   * Assert the command left nothing open, then close the test's own handle and delete the state
+   * directory straight away. On Windows the delete fails with EBUSY while any handle is open.
+   */
+  const expectAllClosed = () => {
+    expect(opened.length).toBeGreaterThan(0);
+    expect(opened.filter((o) => !o.closed)).toEqual([]);
+    dbs.splice(dbs.indexOf(db), 1);
+    db.close();
+    rmSync(ctx.paths.dataDir, { recursive: true });
+    expect(existsSync(ctx.paths.dbFile)).toBe(false);
+  };
+  return { ctx, db, jobId, start, startWorker, write, opened, expectAllClosed };
 }
 
 /** A `sleep` for --follow that runs one scripted step per poll instead of waiting. */
@@ -149,13 +173,88 @@ describe('updraft logs', () => {
   });
 
   it('--follow on a finished run prints the log and returns at once', async () => {
-    const { ctx, db, start, write } = setup();
+    const { ctx, db, start, write, expectAllClosed } = setup();
     const c = start();
     write(c, 'all of it\n');
     finishRun(db, c.run.id, { outcome: 'failed', now: ctx.now });
     const { sleep } = scripted([]);
     expect(await logsCommand(ctx, c.run.id, { follow: true }, { sleep })).toBe(0);
     expect(ctx.out.text).toBe('all of it\n');
+    expectAllClosed();
+  });
+
+  it('--follow on a finished run does all its work before yielding to the event loop', async () => {
+    const { ctx, db, start, write, opened } = setup();
+    const c = start();
+    write(c, 'all of it\n');
+    finishRun(db, c.run.id, { outcome: 'succeeded', now: ctx.now });
+    const { sleep } = scripted([]);
+    // No wait, no poll and no asynchronous file read stands between the status check and the
+    // return, so nothing timing-dependent (a slow runner, a busy thread pool) can delay it.
+    const pending = logsCommand(ctx, c.run.id, { follow: true }, { sleep });
+    expect(ctx.out.text).toBe('all of it\n');
+    expect(opened.map((o) => o.closed)).toEqual([true]);
+    expect(await pending).toBe(0);
+  });
+
+  it('closes the state database on every exit path, so the state directory can be deleted at once', async () => {
+    const paths: Array<(s: ReturnType<typeof setup>) => Promise<unknown>> = [
+      async ({ ctx, start }) => logsCommand(ctx, start().run.id, { path: true }),
+      async ({ ctx, db, start, write }) => {
+        const c = start();
+        write(c, 'done\n');
+        finishRun(db, c.run.id, { outcome: 'succeeded', now: ctx.now });
+        return logsCommand(ctx, c.run.id);
+      },
+      async ({ ctx, start, write }) => {
+        const c = start(); // orphaned: no worker
+        write(c, 'partial\n');
+        return logsCommand(ctx, c.run.id, { follow: true }, { sleep: scripted([]).sleep });
+      },
+      async ({ ctx, db, start, startWorker, write }) => {
+        startWorker();
+        const c = start();
+        const { sleep } = scripted([() => finishRun(db, c.run.id, { outcome: 'succeeded', now: ctx.now })]);
+        write(c, 'running\n');
+        return logsCommand(ctx, c.run.id, { follow: true }, { sleep });
+      },
+      async ({ ctx }) => expect(logsCommand(ctx, 'run_nope')).rejects.toThrow(/No run or job/),
+      async ({ ctx, start }) => expect(logsCommand(ctx, start().run.id)).rejects.toThrow(/has not written one yet/),
+      async ({ ctx, db, start }) => {
+        const c = start();
+        finishRun(db, c.run.id, { outcome: 'succeeded', now: ctx.now });
+        await expect(logsCommand(ctx, c.run.id, { follow: true }, { sleep: scripted([]).sleep })).rejects.toThrow(/has no log file/);
+      },
+      async ({ ctx, startWorker, start }) => {
+        startWorker();
+        const c = start();
+        const sleep = async () => {
+          throw new Error('interrupted');
+        };
+        await expect(logsCommand(ctx, c.run.id, { follow: true }, { sleep })).rejects.toThrow('interrupted');
+      },
+    ];
+    for (const run of paths) {
+      const s = setup();
+      await run(s);
+      s.expectAllClosed();
+    }
+  });
+
+  it('--follow stops when its signal is aborted, and closes what it opened', async () => {
+    const { ctx, start, startWorker, write, expectAllClosed } = setup();
+    startWorker();
+    const c = start();
+    write(c, 'still running\n');
+    const abort = new AbortController();
+    // The default sleep with a poll far longer than the test: only the abort ends the wait.
+    const pending = logsCommand(ctx, c.run.id, { follow: true }, { pollMs: 3_600_000, signal: abort.signal });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(ctx.out.text).toBe('still running\n');
+    abort.abort();
+    expect(await pending).toBe(0);
+    expect(ctx.err.text).toBe('');
+    expectAllClosed();
   });
 
   it('--follow does not wait forever on a run whose worker is gone', async () => {

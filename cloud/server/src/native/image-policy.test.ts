@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { GetCommand, TransactWriteCommand, DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
-import { createImagePolicies, imageDecision, WORKER_PROTOCOL, type ImagePolicy } from './image-policy.js';
+import { createImageCapabilities, createImagePolicies, imageCapabilityKey, imageDecision, recordCodexCapability, WORKER_PROTOCOL, type ImagePolicy } from './image-policy.js';
 import { classifyReadiness } from './readiness.js';
 import { createNativeStore, type Worker } from './store.js';
 import type { Job } from '../store/store.js';
@@ -75,5 +75,35 @@ describe('exact image compatibility approval', () => {
     expect(update.ConditionExpression).toContain('attribute_not_exists(microvmId)');
     expect(update.ExpressionAttributeValues).toMatchObject({ ':old': 'old-generation', ':next': 'generation-a', ':previous': 'old-hash', ':token': 'new-hash', ':image': '9.0' });
     expect(command.input.TransactItems![0]!.ConditionCheck!.ConditionExpression).toContain('attribute_not_exists(retiring)');
+  });
+});
+
+describe('image capabilities (#125)', () => {
+  it('reads Codex only from the version\'s own capability record, separate from its policy', async () => {
+    const rows = new Map<string, Record<string, unknown>>();
+    const send = vi.fn(async (command: { input: { Key?: { pk: string; sk: string }; Item?: Record<string, unknown> } }) => {
+      if (command.input.Item) { rows.set(`${command.input.Item.pk}|${command.input.Item.sk}`, command.input.Item); return {}; }
+      return { Item: rows.get(`${command.input.Key!.pk}|${command.input.Key!.sk}`) };
+    });
+    let clock = 0;
+    const read = createImageCapabilities('table', dbWith(send), { now: () => clock });
+    // An image built before Codex: no record, Claude only. Looked up again each time.
+    expect(await read('9.0')).toEqual({ codex: false });
+    expect(await read('9.0')).toEqual({ codex: false });
+    expect(send).toHaveBeenCalledTimes(2);
+    await recordCodexCapability(dbWith(send), 'table', '10.0', '0.172.0', new Date(0));
+    expect(rows.get('NATIVE_IMAGE#10.0|CAPABILITIES')).toMatchObject({ ...imageCapabilityKey('10.0'), imageVersion: '10.0', codex: true, codexVersion: '0.172.0' });
+    expect(rows.has('NATIVE_IMAGE#10.0|POLICY')).toBe(false);
+    expect(await read('10.0')).toEqual({ codex: true, codexVersion: '0.172.0' });
+    send.mockClear();
+    expect(await read('10.0')).toEqual({ codex: true, codexVersion: '0.172.0' });
+    expect(send).not.toHaveBeenCalled();
+    clock = 120_000;
+    await read('10.0');
+    expect(send).toHaveBeenCalledOnce();
+    // A record for another version, or a malformed one, grants nothing.
+    rows.set('NATIVE_IMAGE#11.0|CAPABILITIES', { pk: 'NATIVE_IMAGE#11.0', sk: 'CAPABILITIES', imageVersion: '10.0', codex: true });
+    expect(await read('11.0')).toEqual({ codex: false });
+    await expect(recordCodexCapability(dbWith(send), 'table', '10.0', 'latest')).rejects.toThrow();
   });
 });

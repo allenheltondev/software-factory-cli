@@ -5,6 +5,7 @@ import {
 } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { FlowError } from '../flows/github.js';
+import { providerKeys, type NativeProvider } from './provider.js';
 
 export const SESSION_SECONDS = 8 * 60 * 60;
 export const STARTUP_MS = 10 * 60_000;
@@ -20,7 +21,10 @@ export interface SessionLease {
   idleMs?: number;
   retiring?: boolean;
   microvmId?: string;
+  /** Set only for a Codex session; a lease without it (every lease written before #125) is Claude's. */
+  provider?: NativeProvider;
 }
+const leaseProvider = (lease: Pick<SessionLease, 'provider'> | undefined): NativeProvider => lease?.provider === 'codex' ? 'codex' : 'claude';
 interface Registry {
   revision: number;
   leases: Record<string, SessionLease>;
@@ -30,6 +34,30 @@ interface Registry {
   accountingVersion?: number;
   launches?: number;
   tenantLaunches?: Record<string, number>;
+  /**
+   * Codex's own day of accounting (#125), beside Claude's (`seconds`, `tenants`, `launches`,
+   * `tenantLaunches`, unchanged). Absent on a registry written before Codex: nothing spent.
+   */
+  codexSeconds?: number;
+  codexTenants?: Record<string, number>;
+  codexLaunches?: number;
+  codexTenantLaunches?: Record<string, number>;
+}
+/** One provider's counters in the shared registry: Claude keeps the original fields. */
+function ledger(registry: Registry, provider: NativeProvider) {
+  if (provider === 'claude') {
+    registry.tenantLaunches ??= {};
+    return {
+      seconds: () => registry.seconds, addSeconds: (n: number) => { registry.seconds += n; }, tenants: registry.tenants,
+      launches: () => registry.launches ?? 0, addLaunch: () => { registry.launches = (registry.launches ?? 0) + 1; }, tenantLaunches: registry.tenantLaunches,
+    };
+  }
+  registry.codexTenants ??= {};
+  registry.codexTenantLaunches ??= {};
+  return {
+    seconds: () => registry.codexSeconds ?? 0, addSeconds: (n: number) => { registry.codexSeconds = (registry.codexSeconds ?? 0) + n; }, tenants: registry.codexTenants,
+    launches: () => registry.codexLaunches ?? 0, addLaunch: () => { registry.codexLaunches = (registry.codexLaunches ?? 0) + 1; }, tenantLaunches: registry.codexTenantLaunches,
+  };
 }
 export interface AdmissionLimits {
   concurrent: number;
@@ -84,25 +112,43 @@ function migrate(registry: Registry) {
   }
   registry.accountingVersion = 2;
 }
-function budgetDay(registry: Registry, now: number) {
+function budgetDay(registry: Registry, now: number, name = 'Claude') {
   const day = new Date(now).toISOString().slice(0, 10);
   if (registry.day > day)
-    throw new FlowError('throttled', 429, 'The Claude budget window is changing. Try connecting again shortly.');
+    throw new FlowError('throttled', 429, `The ${name} budget window is changing. Try connecting again shortly.`);
   if (registry.day !== day) {
     registry.day = day;
     registry.seconds = 0;
     registry.tenants = {};
     registry.launches = 0;
     registry.tenantLaunches = {};
+    registry.codexSeconds = 0;
+    registry.codexTenants = {};
+    registry.codexLaunches = 0;
+    registry.codexTenantLaunches = {};
   }
 }
 const key = { pk: 'CLAUDE_CAPACITY', sk: 'REGISTRY' };
 
-/** One bounded, strongly consistent CAS registry. Capacity never expires via TTL or a guessed deadline. */
+/**
+ * One bounded, strongly consistent CAS registry. Capacity never expires via TTL or a guessed deadline.
+ *
+ * The registry (`CLAUDE_CAPACITY`) holds every provider's leases, in one record so each change is
+ * one compare-and-swap, but each provider is accounted on its own (#125): its concurrent
+ * environments, platform and tenant runtime hours and launches count only its own leases and
+ * counters, each against the same configured limits, so Codex can never take a Claude slot or
+ * spend Claude's budget. A lease without `provider` (every lease written before Codex) is Claude's,
+ * and Claude's counters are the original fields, so existing Claude usage keeps its limits. An
+ * installation may hold one lease per provider. Each instance lists and reserves only its own
+ * provider's leases; a lease's session check names its own provider's session record.
+ */
 export function createClaudeAdmission(
   table: string,
   db = DynamoDBDocumentClient.from(new DynamoDBClient({}), { marshallOptions: { removeUndefinedValues: true } }),
+  provider: NativeProvider = 'claude',
 ) {
+  const name = providerKeys(provider).name;
+  const mine = (lease: SessionLease | undefined) => !!lease && leaseProvider(lease) === provider;
   async function read(): Promise<Registry> {
     const { Item } = await db.send(new GetCommand({ TableName: table, Key: key, ConsistentRead: true }));
     const registry = (Item as Registry) ?? { revision: 0, leases: {}, day: '', seconds: 0, tenants: {} };
@@ -118,6 +164,8 @@ export function createClaudeAdmission(
       migrate(registry);
       const installationId =
         binding?.installationId ?? (binding ? registry.leases[binding.generation]?.installationId : undefined);
+      // The session record the lease belongs to: a reserve's own provider, else the lease's.
+      const sessionSk = providerKeys(binding?.installationId !== undefined ? provider : leaseProvider(binding ? registry.leases[binding.generation] : undefined)).sessionSk;
       const result = mutate(registry);
       if (binding && installationId === undefined) return result;
       try {
@@ -137,7 +185,7 @@ export function createClaudeAdmission(
                 {
                   ConditionCheck: {
                     TableName: table,
-                    Key: { pk: `TENANT#${installationId}`, sk: 'CLAUDE_SESSION' },
+                    Key: { pk: `TENANT#${installationId}`, sk: sessionSk },
                     ConditionExpression:
                       binding.state === 'active'
                         ? 'generation = :generation AND attribute_not_exists(retiring)'
@@ -161,7 +209,7 @@ export function createClaudeAdmission(
             throw new FlowError(
               'invalid_settings',
               409,
-              'The Claude environment generation changed. Reconnect using its current status.',
+              `The ${name} environment generation changed. Reconnect using its current status.`,
             );
           }
           if (
@@ -174,11 +222,12 @@ export function createClaudeAdmission(
         if (!(err instanceof ConditionalCheckFailedException)) throw err;
       }
     }
-    throw new FlowError('throttled', 429, 'Claude connection admission is busy. Try connecting again shortly.');
+    throw new FlowError('throttled', 429, `${name} connection admission is busy. Try connecting again shortly.`);
   }
   return {
+    /** This provider's leases only: cleanup of one provider never judges another's session. */
     async list() {
-      return Object.values((await read()).leases);
+      return Object.values((await read()).leases).filter(mine);
     },
     async get(generation: string) {
       return (await read()).leases[generation];
@@ -196,48 +245,44 @@ export function createClaudeAdmission(
               );
             return existing;
           }
-          if (
-            Object.keys(registry.leases).length >= limits.concurrent ||
-            Object.values(registry.leases).some((lease) => lease.installationId === installationId)
-          ) {
+          const own = Object.values(registry.leases).filter(mine);
+          if (own.length >= limits.concurrent || own.some((lease) => lease.installationId === installationId)) {
             throw new FlowError(
               'throttled',
               429,
-              'Claude environment capacity is full. Try connecting again after an environment finishes.',
+              `${name} environment capacity is full. Try connecting again after an environment finishes.`,
             );
           }
-          budgetDay(registry, now);
-          const held = Object.values(registry.leases).reduce(
-            (sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS),
-            0,
-          );
-          const tenantHeld = Object.values(registry.leases)
+          budgetDay(registry, now, name);
+          const books = ledger(registry, provider);
+          const held = own.reduce((sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS), 0);
+          const tenantHeld = own
             .filter((lease) => lease.installationId === installationId)
             .reduce((sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS), 0);
-          const tenantSeconds = registry.tenants[String(installationId)] ?? 0;
+          const tenantSeconds = books.tenants[String(installationId)] ?? 0;
           if (
-            registry.seconds + held + SESSION_SECONDS > limits.dailySeconds ||
+            books.seconds() + held + SESSION_SECONDS > limits.dailySeconds ||
             tenantSeconds + tenantHeld + SESSION_SECONDS > limits.tenantDailySeconds
           ) {
             throw new FlowError(
               'throttled',
               429,
-              'The daily Claude runtime budget is reserved or spent. Try again after an environment ends or after midnight UTC.',
+              `The daily ${name} runtime budget is reserved or spent. Try again after an environment ends or after midnight UTC.`,
             );
           }
-          const tenantLaunches = registry.tenantLaunches![String(installationId)] ?? 0;
+          const tenantLaunches = books.tenantLaunches[String(installationId)] ?? 0;
           if (
-            (registry.launches ?? 0) >= (limits.platformLaunchesPerDay ?? DEFAULT_ADMISSION.platformLaunchesPerDay!) ||
+            books.launches() >= (limits.platformLaunchesPerDay ?? DEFAULT_ADMISSION.platformLaunchesPerDay!) ||
             tenantLaunches >= (limits.tenantLaunchesPerDay ?? DEFAULT_ADMISSION.tenantLaunchesPerDay!)
           ) {
             throw new FlowError(
               'throttled',
               429,
-              'The daily Claude connection launch limit has been reached. Try again after midnight UTC or contact an operator.',
+              `The daily ${name} connection launch limit has been reached. Try again after midnight UTC or contact an operator.`,
             );
           }
-          registry.launches = (registry.launches ?? 0) + 1;
-          registry.tenantLaunches![String(installationId)] = tenantLaunches + 1;
+          books.addLaunch();
+          books.tenantLaunches[String(installationId)] = tenantLaunches + 1;
           return (registry.leases[generation] = {
             installationId,
             generation,
@@ -246,6 +291,7 @@ export function createClaudeAdmission(
             idleMs: limits.idleMs ?? IDLE_MS,
             reservedSeconds: SESSION_SECONDS,
             mayHaveLaunched: false,
+            ...(provider === 'codex' ? { provider } : {}),
           });
         },
         { installationId, generation, state: recovery ? 'sealed' : 'active' },
@@ -259,7 +305,7 @@ export function createClaudeAdmission(
             throw new FlowError(
               'invalid_settings',
               409,
-              'This environment was retired. Reconnect Claude to try again.',
+              `This environment was retired. Reconnect ${name} to try again.`,
             );
           lease.mayHaveLaunched = true;
           lease.launchedAt ??= now;
@@ -325,9 +371,11 @@ export function createClaudeAdmission(
                     1000,
                 ),
               );
-        registry.seconds += seconds;
+        // Settled to the lease's own provider: Claude's original counters, or Codex's.
+        const books = ledger(registry, leaseProvider(lease));
+        books.addSeconds(seconds);
         const id = String(lease.installationId);
-        registry.tenants[id] = (registry.tenants[id] ?? 0) + seconds;
+        books.tenants[id] = (books.tenants[id] ?? 0) + seconds;
         delete registry.leases[generation];
       });
     },

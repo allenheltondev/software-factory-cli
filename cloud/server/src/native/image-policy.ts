@@ -58,3 +58,39 @@ export function createImagePolicies(table: string, latest: string, db = DynamoDB
   };
   return Object.assign(read, { durable });
 }
+
+/**
+ * What a subscription worker image version was verified to run (#125), beside its policy record
+ * (`NATIVE_IMAGE#<version>` / `CAPABILITIES`, a separate item, so a policy write never drops it).
+ * `codex` is recorded by the image build (build-job-image.ts --native-claude) only after that
+ * version passed both the Claude and the Codex smoke checks; the image itself proved at build
+ * time that its pinned Codex accepts the worker's launch arguments (codex-config-check.mjs). A
+ * version without the record (every image built before Codex) runs Claude only.
+ */
+export const imageCapabilityKey = (imageVersion: string) => ({ pk: `NATIVE_IMAGE#${imageVersion}`, sk: 'CAPABILITIES' });
+export interface ImageCapabilities { codex: boolean; codexVersion?: string }
+
+export function createImageCapabilities(table: string, db = DynamoDBDocumentClient.from(new DynamoDBClient({})), options: { now?: () => number; cacheMs?: number } = {}) {
+  const now = options.now ?? Date.now;
+  const cacheMs = options.cacheMs ?? 60_000;
+  // Only a positive answer is cached: a capability is never taken back, and a missing one is
+  // looked up again, so a freshly verified image is offered within a minute.
+  const known = new Map<string, { at: number; value: ImageCapabilities }>();
+  return async (imageVersion: string): Promise<ImageCapabilities> => {
+    const hit = known.get(imageVersion);
+    if (hit && now() - hit.at < cacheMs) return hit.value;
+    if (!table || !/^[\w.-]{1,64}$/.test(imageVersion)) return { codex: false };
+    const { Item } = await db.send(new GetCommand({ TableName: table, Key: imageCapabilityKey(imageVersion), ConsistentRead: true }));
+    const value: ImageCapabilities = Item?.imageVersion === imageVersion && Item.codex === true
+      ? { codex: true, ...(typeof Item.codexVersion === 'string' ? { codexVersion: Item.codexVersion } : {}) } : { codex: false };
+    if (value.codex) known.set(imageVersion, { at: now(), value });
+    return value;
+  };
+}
+export type ImageCapabilityReader = ReturnType<typeof createImageCapabilities>;
+
+/** Records that a verified image version runs Codex. Idempotent; never removes anything. */
+export async function recordCodexCapability(db: DynamoDBDocumentClient, table: string, imageVersion: string, codexVersion: string, at = new Date()) {
+  if (!/^[\w.-]{1,64}$/.test(imageVersion) || !/^\d+\.\d+\.\d+$/.test(codexVersion)) throw new Error('Invalid image capability');
+  await db.send(new PutCommand({ TableName: table, Item: { ...imageCapabilityKey(imageVersion), imageVersion, codex: true, codexVersion, recordedAt: at.toISOString() } }));
+}

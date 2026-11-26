@@ -12,6 +12,7 @@ import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { throttleCommentPermissions, throttledComment, installationPage } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
+import { parseManagedWorkerId } from './native/provider.js';
 
 /**
  * The job broker's Lambda entry point (dist/broker.mjs, BrokerFunction). Invoked directly
@@ -81,16 +82,20 @@ export async function handler(event: unknown) {
     if (event && typeof event === 'object' && (event as { action?: unknown }).action === 'worker') {
       const result = await native.handle(event);
       const message = event as { workerId?: string; auth?: string; op?: string };
-      const id = Number(/^managed-([1-9]\d*)$/.exec(message.workerId ?? '')?.[1]);
-      const sessions = nativeWorker.managed?.sessions;
+      // A managed worker's id names its installation and provider (`managed-<id>`, `managed-codex-<id>`).
+      const managedWorker = parseManagedWorkerId(message.workerId);
+      const id = managedWorker?.installationId ?? NaN;
+      const provider = managedWorker?.provider ?? 'claude';
+      const sessions = nativeWorker.managedOf(provider)?.sessions;
       if (result.ok === true && message.op === 'poll' && message.auth === 'connected' && Number.isSafeInteger(id) &&
           sessions && process.env.CLAUDE_WEBHOOK_PARAMETER) {
         try {
           if (!(await sessions.pending(id)).length) return result;
           const name = (await ssm.send(new GetParameterCommand({ Name: process.env.CLAUDE_WEBHOOK_PARAMETER }))).Parameter?.Value;
+          // Claude's resume payload is unchanged; only Codex's names its provider.
           if (name) await webhook.send(new InvokeCommand({ FunctionName: name, InvocationType: 'Event',
-            Payload: Buffer.from(JSON.stringify({ action: 'resumeClaude', installationId: id })) }));
-        } catch { console.error('Could not schedule a waiting Claude job; the next worker poll retries'); }
+            Payload: Buffer.from(JSON.stringify({ action: 'resumeClaude', installationId: id, ...(provider === 'codex' ? { provider } : {}) })) }));
+        } catch { console.error('Could not schedule a waiting subscription job; the next worker poll retries'); }
       }
       return result;
     }

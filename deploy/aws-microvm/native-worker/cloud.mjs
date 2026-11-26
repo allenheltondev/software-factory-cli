@@ -2,14 +2,24 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { setTimeout as pause } from 'node:timers/promises';
 
+/**
+ * The cloud worker settings from the run hook. `provider` is present only for a Codex session
+ * (#125: Codex on a ChatGPT plan, on the same image); a payload without it, as every Claude
+ * session's is, serves Claude exactly as before.
+ */
 export function cloudConfig(c) {
-  if (!c || !['brokerFunctionName,controlSecretArn,imageVersion,region,workerId,workerVersion', 'brokerFunctionName,controlToken,imageVersion,region,workerId,workerVersion'].includes(Object.keys(c).sort().join(',')) ||
+  const fields = c && typeof c === 'object' ? Object.keys(c).filter((k) => k !== 'provider').sort().join(',') : '';
+  if (!c || !['brokerFunctionName,controlSecretArn,imageVersion,region,workerId,workerVersion', 'brokerFunctionName,controlToken,imageVersion,region,workerId,workerVersion'].includes(fields) ||
+      (c.provider !== undefined && c.provider !== 'codex') ||
       typeof c.workerId !== 'string' || !/^[\w-]{1,64}$/.test(c.workerId) || typeof c.workerVersion !== 'string' || !/^[\w.-]{1,64}$/.test(c.workerVersion) ||
       typeof c.imageVersion !== 'string' || !/^[\w.-]{1,64}$/.test(c.imageVersion) || typeof c.region !== 'string' || !/^[\w-]+-\d$/.test(c.region) ||
       typeof c.brokerFunctionName !== 'string' || !/^[\w:-]{1,200}$/.test(c.brokerFunctionName) ||
       !(typeof c.controlToken === 'string' ? /^[A-Za-z0-9_-]{43}$/.test(c.controlToken) : typeof c.controlSecretArn === 'string' && /^arn:[\w-]+:secretsmanager:[\w-]+:\d{12}:secret:updraft\/native-workers\//.test(c.controlSecretArn))) throw new Error('invalid cloud worker configuration');
   return c;
 }
+
+/** Which CLI this worker's session serves: `codex` only when the run hook says so. */
+export const cloudProvider = (config) => config?.provider === 'codex' ? 'codex' : 'claude';
 
 /**
  * The root job runner's environment. Deliberately no inherited secret, native HOME, Claude
@@ -20,6 +30,8 @@ export function runnerEnvironment(config, request, env = process.env) {
   return { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', LANG: 'C.UTF-8', HOME: '/root', AWS_REGION: config.region,
     UPDRAFT_JOB_UID: '1000', UPDRAFT_JOB_GID: '1000', UPDRAFT_JOB_HOME: '/home/updraft', UPDRAFT_JOB_USER: 'updraft',
     UPDRAFT_NATIVE_WORKER: '1', UPDRAFT_RUN_REQUEST: JSON.stringify(request),
+    // Root-owned, from the run hook, never from the job: which profiles run on the subscription.
+    ...(cloudProvider(config) === 'codex' ? { UPDRAFT_NATIVE_PROVIDER: 'codex' } : {}),
     ...Object.fromEntries(['AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', 'AWS_CONTAINER_CREDENTIALS_FULL_URI', 'AWS_CONTAINER_AUTHORIZATION_TOKEN', 'AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE']
       .filter((k) => env[k]).map((k) => [k, env[k]])) };
 }
@@ -96,13 +108,16 @@ export async function startCloudWorker(config, microvmId, service, options = {})
   // A status probe that cannot tell (a slow or failed `claude auth status`) is probed once more
   // before it is reported: one unreadable probe should not park the next issue (#144). Only a
   // fresh answer is ever sent; an earlier "connected" is never reused in its place.
+  // A Codex session reports Codex's ChatGPT login; a Claude session (no provider) Claude's, as before.
+  const provider = cloudProvider(config);
+  const authOf = () => provider === 'codex' ? service.authStatus('codex') : service.authStatus();
   const probeAuth = async () => {
-    const first = await service.authStatus();
+    const first = await authOf();
     if (first !== 'unavailable' || stopped) return first;
     await pause(options.authRetryDelay ?? 1_000, undefined, { signal: controller.signal }).catch(() => {});
-    return stopped ? first : service.authStatus();
+    return stopped ? first : authOf();
   };
-  let auth = await service.authStatus();
+  let auth = await authOf();
   const message = (op) => ({ op, session, microvmId, auth, imageVersion: config.imageVersion, workerVersion: config.workerVersion });
   const stopChild = async () => {
     if (!child || childDone) return true;

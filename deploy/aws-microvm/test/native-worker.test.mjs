@@ -123,7 +123,7 @@ describe('disposable worker Codex sign-in (official device code)', () => {
 
 const REQUIRED_OFF = ['shell_tool', 'unified_exec', 'unified_exec_tty', 'view_image', 'sleep_tool', 'code_mode_host', 'code_mode', 'code_mode_only',
   'hooks', 'apps', 'plugins', 'remote_plugin', 'tool_suggest', 'multi_agent', 'multi_agent_v2', 'image_generation', 'browser_use', 'computer_use',
-  'in_app_browser', 'standalone_web_search', 'request_permissions_tool', 'memories', 'goals', 'agent_message_board', 'enable_mcp_apps'];
+  'in_app_browser', 'standalone_web_search', 'request_permissions_tool', 'memories', 'goals', 'agent_message_board', 'enable_mcp_apps', 'hosted_search_policy'];
 
 describe('native Codex worker policy', () => {
   const mcp = { command: '/usr/local/bin/node', args: ['/opt/updraft/native-worker/mcp.mjs', '/run/updraft-native/s/codex-x/tools.sock'] };
@@ -160,7 +160,7 @@ describe('native Codex worker policy', () => {
   });
 
   it('runs only direct-mode models: code-mode-only models would have no usable tool here', () => {
-    // models.json at openai/codex 8727186: gpt-5.5 is the one listed model without tool_mode code_mode_only.
+    // models.json at openai/codex rust-v0.172.0: gpt-5.5 is the one listed model without tool_mode code_mode_only.
     expect(CODEX_DIRECT_MODELS).toEqual(['gpt-5.5']);
     const model = (input) => { const a = codexArgs(input, mcp); return a[a.indexOf('--model') + 1]; };
     expect(model(['exec', '--json'])).toBe('gpt-5.5');
@@ -197,7 +197,7 @@ describe('native Codex worker policy', () => {
     expect(codexEnv({ credentialHome: '/mnt/native/home' })).toEqual({ PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: '/mnt/native/home/codex', CODEX_HOME: '/mnt/native/home/codex' });
   });
 
-  it('switches off every feature that adds a tool or call path (audited at openai/codex 8727186)', () => {
+  it('switches off every feature that adds a tool or call path (audited at openai/codex rust-v0.172.0)', () => {
     // Listed here on purpose, not imported: dropping one from the policy must fail this test.
     for (const feature of REQUIRED_OFF) expect(CODEX_DISABLED_FEATURES).toContain(feature);
     const args = codexArgs(['exec', '--json'], mcp);

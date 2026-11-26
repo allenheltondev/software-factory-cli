@@ -5,7 +5,8 @@ import type { NativeRoute } from './route.js';
 const PORT = 8081;
 const EXPIRES_MINUTES = 5;
 
-export function browserLoginGrant(imageArn: string, route?: NativeRoute) {
+/** A short-lived, port-scoped grant to the worker's private sign-in route: Claude's, or Codex's device-code route (#125). */
+export function browserLoginGrant(imageArn: string, route?: NativeRoute, path: '/claude-login' | '/codex-login' = '/claude-login') {
   if (!route || !imageArn) return undefined;
   const aws = new LambdaMicrovmsClient({});
   return async () => {
@@ -17,7 +18,7 @@ export function browserLoginGrant(imageArn: string, route?: NativeRoute) {
     if (url.protocol !== 'https:' || !url.hostname.endsWith('.on.aws') || url.username || url.password || url.port ||
         url.pathname !== '/' || url.search || url.hash) throw new Error('Unexpected MicroVM endpoint');
     url.protocol = 'wss:';
-    url.pathname = '/claude-login';
+    url.pathname = path;
     const { authToken } = await aws.send(new CreateMicrovmAuthTokenCommand({
       microvmIdentifier: route.microvmId, expirationInMinutes: EXPIRES_MINUTES, allowedPorts: [{ port: PORT }],
     }));

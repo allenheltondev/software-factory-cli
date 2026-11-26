@@ -254,18 +254,23 @@ const CLAUDE_READINESS: Record<string, string> = {
   protocol_incompatible: "the Claude session's image is no longer compatible",
 };
 
-/** A Claude wait's reason code in words, or undefined for any other code. */
+/** A subscription wait's reason code in words (`claude_…`, or Codex's `codex_…`, #125), or undefined for any other code. */
 export function reasonLabel(code: string): string | undefined {
   // `_uncommented`: the sign-in notice could never be posted on the issue (GitHub refused it for good).
   const uncommented = code.endsWith('_uncommented');
   const base = uncommented ? code.slice(0, -'_uncommented'.length) : code;
   const suffix = uncommented ? '; GitHub would not take the comment asking for it, so sign in from Updraft' : '';
-  if (base === 'claude_sign_in') return uncommented ? `Claude needs a sign-in${suffix}` : undefined;
-  const session = /^claude_session_([a-z_]+)$/.exec(base)?.[1];
-  if (session) return `The Claude session ended because ${CLAUDE_SESSION[session] ?? session.replace(/_/g, ' ')}; a new one needs a sign-in${suffix}`;
-  const readiness = /^claude_([a-z_]+)$/.exec(base)?.[1];
+  const provider = /^(claude|codex)_/.exec(base)?.[1];
+  if (!provider) return undefined;
+  // Codex's words are Claude's with its own name; its sign-in is with ChatGPT.
+  const name = provider === 'codex' ? 'Codex' : 'Claude';
+  const named = (words: string) => (provider === 'codex' ? words.replace(/Claude/g, 'Codex') : words);
+  if (base === `${provider}_sign_in`) return uncommented ? `${name} needs a ${provider === 'codex' ? 'ChatGPT ' : ''}sign-in${suffix}` : undefined;
+  const session = new RegExp(`^${provider}_session_([a-z_]+)$`).exec(base)?.[1];
+  if (session) return `The ${name} session ended because ${named(CLAUDE_SESSION[session] ?? session.replace(/_/g, ' '))}; a new one needs a sign-in${suffix}`;
+  const readiness = new RegExp(`^${provider}_([a-z_]+)$`).exec(base)?.[1];
   const words = readiness ? CLAUDE_READINESS[readiness] : undefined;
-  return words ? words.charAt(0).toUpperCase() + words.slice(1) + suffix : undefined;
+  return words ? named(words.charAt(0).toUpperCase() + words.slice(1)) + suffix : undefined;
 }
 
 /** The route a job ran on: its tier (and the tier first chosen, after an escalation), pool and why. */

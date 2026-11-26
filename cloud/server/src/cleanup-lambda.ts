@@ -7,6 +7,7 @@ import { createDynamoWorkflowStore } from './workflows/store.js';
 import { createWorkflowRecorder } from './workflows/recorder.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
+import { reconcileSessions } from './native/reconcile-sessions.js';
 import { runCleanup } from './tenants/cleanup.js';
 import { expireResults } from './tenants/results-retention.js';
 
@@ -45,11 +46,15 @@ const reconcile = createReconciler({
 export async function handler(event?: { task?: unknown }): Promise<unknown> {
   if (event?.task === 'reconcile') {
     const report = await reconcile();
-    const sessions = await nativeWorker.managed?.reconcile();
-    if (sessions?.failed) throw new Error(`Claude session reconciliation failed for ${sessions.failed} session(s)`);
+    // Claude's and Codex's sessions (#125) each on their own: one failing never skips the other.
+    const { reports, failures } = await reconcileSessions([
+      { provider: 'claude', reconcile: nativeWorker.managed?.reconcile },
+      { provider: 'codex', reconcile: nativeWorker.managedCodex?.reconcile },
+    ]);
+    if (failures.length) throw new Error(`subscription session reconciliation failed (${failures.join('; ')})`);
     // The next run (five minutes on) retries what failed; fail this one so alarms see it.
     if (report.failed > 0) throw new Error(`reconciliation failed for ${report.failed} job(s)`);
-    return { ...report, sessions };
+    return { ...report, sessions: reports.claude, ...(reports.codex ? { codexSessions: reports.codex } : {}) };
   }
   // Both run whatever the other did; a failure of either fails the run (retried, alarmed) at the end.
   let report: Awaited<ReturnType<typeof cleanupTenants>> | undefined;

@@ -258,6 +258,19 @@ describe('workflow reconciliation', () => {
       expect(s.github.pullRequestHead).not.toHaveBeenCalled();
     });
 
+    it('blocks a Codex wait with Codex\'s next step, by the provider the wait recorded (#125)', async () => {
+      const s = setup();
+      // Claude-sounding words on purpose: only the recorded provider decides.
+      await s.recorder.waiting({ installationId: 55, repository: 'acme/web', repositoryId: 99, issue: 7, eventName: 'issues', deliveryId: 'd-1', jobId: 'job_waiting02' },
+        { reason: 'sign_in_required', message: 'waits for Claude', nextAction: 'sign in', provider: 'codex' });
+      expect(await s.wf()).toMatchObject({ signInProvider: 'codex' });
+      s.tick(SIGN_IN_LIMIT_MS * 2);
+      expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+      expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'sign_in_expired', nextAction: expect.stringMatching(/ChatGPT on the Codex page/) });
+      await s.recorder.started(job({ jobId: 'job_waiting02' }));
+      expect(await s.wf()).not.toHaveProperty('signInProvider');
+    });
+
     it('waits a day for a Claude sign-in, then blocks with what to do', async () => {
       const s = setup();
       await s.recorder.waiting({ installationId: 55, repository: 'acme/web', repositoryId: 99, issue: 7, eventName: 'issues', deliveryId: 'd-1', jobId: 'job_waiting01' }, { reason: 'sign_in_required', message: 'waits', nextAction: 'sign in' });

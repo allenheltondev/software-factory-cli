@@ -42,6 +42,11 @@ let vendor;try{vendor=path.join(path.dirname(require.resolve(pkg+"/package.json"
 const bin=fs.realpathSync(path.join(vendor,triple,"bin","codex"));
 const p="/etc/updraft-native-worker.json";const c=JSON.parse(fs.readFileSync(p));
 c.codex=bin;c.codexAuthModule=fs.realpathSync(process.argv[2]);fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n");' "$(command -v codex)" "$codex_auth"
+  # The pinned binary must accept the worker's whole launch argv under --strict-config: a feature
+  # key this release does not know would end every Codex job at startup. Offline and signed out;
+  # see codex-config-check.mjs. A failure here fails the image build.
+  codex_bin=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/etc/updraft-native-worker.json")).codex)')
+  node /opt/updraft/native-worker/codex-config-check.mjs "$codex_bin"
 fi
 printf '{"image":"native-claude-worker"}\n' > /etc/updraft-native-sandbox.json
 printf '#!/bin/sh\nexec /usr/local/bin/node /opt/updraft/native-worker/runtime.mjs "$@"\n' > /opt/updraft/bin/updraft-native-worker

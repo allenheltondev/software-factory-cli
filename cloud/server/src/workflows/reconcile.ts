@@ -190,10 +190,16 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     if (w.stage === 'awaiting-sign-in') {
       const waitedFor = at - Date.parse(w.waitingSince ?? w.updatedAt);
       if (waitedFor < SIGN_IN_LIMIT_MS) return void (await later(SIGN_IN_LIMIT_MS - waitedFor));
+      // Whose sign-in it waited for, as the wait recorded it; one recorded before #125 is Claude's.
+      const codex = w.signInProvider === 'codex';
       return block(
         'sign_in_expired',
-        `The job waited ${Math.round(SIGN_IN_LIMIT_MS / 3_600_000)} hours for a Claude subscription sign-in that did not happen.`,
-        'Sign in on the Claude page of this installation, then apply the label again on GitHub.',
+        codex
+          ? `The job waited ${Math.round(SIGN_IN_LIMIT_MS / 3_600_000)} hours for Codex to be signed in with ChatGPT, which did not happen.`
+          : `The job waited ${Math.round(SIGN_IN_LIMIT_MS / 3_600_000)} hours for a Claude subscription sign-in that did not happen.`,
+        codex
+          ? 'Sign in with ChatGPT on the Codex page of this installation, then apply the label again on GitHub.'
+          : 'Sign in on the Claude page of this installation, then apply the label again on GitHub.',
         `sign-in-expired:${w.lastJobId ?? w.waitingSince}`,
       );
     }

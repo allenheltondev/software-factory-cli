@@ -203,6 +203,8 @@ export interface DeliveryRecord {
   /** launch_failed: the AWS error's class (its name), never its message. */
   errorClass?: string;
   jobId?: string;
+  /** A subscription wait (native_waiting_*) for Codex's ChatGPT sign-in (#125). Absent: Claude's, as before. */
+  provider?: 'codex';
 }
 
 /** One published config: an immutable bundle under tenants/<id>/config/<version>/ in the tenant bucket. */

@@ -96,6 +96,8 @@ export interface AppOptions {
   agentKeys?: AgentKeyService;
   routines?: RoutineService;
   nativeClaude?: NativeSettingsService;
+  /** Codex on a ChatGPT plan (#125): the same API under codex-subscription. */
+  nativeCodex?: NativeSettingsService;
   status?: StatusService;
   /** Workflows: an issue's jobs as one timeline (#139). */
   workflows?: import('./tenants/workflow-service.js').WorkflowService;
@@ -116,7 +118,7 @@ const JOB_ID = /^[A-Za-z0-9_-]{8,64}$/;
 /** Who did it, for the admin's actions: their email, else their sub. */
 const adminName = (caller: Caller) => `admin:${caller.email ?? caller.sub}`;
 
-export function createApp({ resolveCaller, github, admin, config, agentKeys, routines, nativeClaude, status, workflows, stats, telemetry, readiness, registries, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
+export function createApp({ resolveCaller, github, admin, config, agentKeys, routines, nativeClaude, nativeCodex, status, workflows, stats, telemetry, readiness, registries, logError = (err) => console.error(safeMessage(err)) }: AppOptions) {
   const app = new Hono<Env>().basePath('/api');
 
   app.get('/health', (c) => c.json({ ok: true }));
@@ -358,42 +360,44 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
     });
   }
 
-  if (nativeClaude) {
+  // One API per subscription provider: Claude's paths exactly as before, Codex's (ChatGPT, #125) beside them.
+  for (const [path, service] of [['claude-subscription', nativeClaude], ['codex-subscription', nativeCodex]] as const) {
+    if (!service) continue;
     const positive = (raw: string) => {
       const n = Number(raw);
       return Number.isSafeInteger(n) && n > 0 ? n : null;
     };
-    app.get('/v1/installations/:id/claude-subscription', async (c) => {
+    app.get(`/v1/installations/:id/${path}`, async (c) => {
       const id = positive(c.req.param('id'));
-      return id ? c.json(await nativeClaude.view(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+      return id ? c.json(await service.view(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
     });
-    app.get('/v1/installations/:id/claude-subscription/requests/:requestId', async (c) => {
-      const id = positive(c.req.param('id'));
-      const requestId = c.req.param('requestId');
-      if (!id || !/^job_[A-Za-z0-9_-]{16}$/.test(requestId)) return c.json({ error: 'not_found' }, 404);
-      return c.json(await nativeClaude.waiting(c.get('caller'), id, requestId));
-    });
-    app.post('/v1/installations/:id/claude-subscription/connect', async (c) => {
-      const id = positive(c.req.param('id'));
-      return id ? c.json(await nativeClaude.start(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
-    });
-    app.post('/v1/installations/:id/claude-subscription/requests/:requestId/start', async (c) => {
+    app.get(`/v1/installations/:id/${path}/requests/:requestId`, async (c) => {
       const id = positive(c.req.param('id'));
       const requestId = c.req.param('requestId');
       if (!id || !/^job_[A-Za-z0-9_-]{16}$/.test(requestId)) return c.json({ error: 'not_found' }, 404);
-      return c.json(await nativeClaude.start(c.get('caller'), id, requestId));
+      return c.json(await service.waiting(c.get('caller'), id, requestId));
     });
-    app.post('/v1/installations/:id/claude-subscription/restart', async (c) => {
+    app.post(`/v1/installations/:id/${path}/connect`, async (c) => {
       const id = positive(c.req.param('id'));
-      return id ? c.json(await nativeClaude.restart(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+      return id ? c.json(await service.start(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
     });
-    app.post('/v1/installations/:id/claude-subscription/login', async (c) => {
+    app.post(`/v1/installations/:id/${path}/requests/:requestId/start`, async (c) => {
+      const id = positive(c.req.param('id'));
+      const requestId = c.req.param('requestId');
+      if (!id || !/^job_[A-Za-z0-9_-]{16}$/.test(requestId)) return c.json({ error: 'not_found' }, 404);
+      return c.json(await service.start(c.get('caller'), id, requestId));
+    });
+    app.post(`/v1/installations/:id/${path}/restart`, async (c) => {
+      const id = positive(c.req.param('id'));
+      return id ? c.json(await service.restart(c.get('caller'), id)) : c.json({ error: 'not_found' }, 404);
+    });
+    app.post(`/v1/installations/:id/${path}/login`, async (c) => {
       const id = positive(c.req.param('id'));
       if (!id) return c.json({ error: 'not_found' }, 404);
       c.header('Cache-Control', 'no-store');
-      return c.json(await nativeClaude.login(c.get('caller'), id));
+      return c.json(await service.login(c.get('caller'), id));
     });
-    app.put('/v1/installations/:id/claude-subscription', async (c) => {
+    app.put(`/v1/installations/:id/${path}`, async (c) => {
       const id = positive(c.req.param('id'));
       if (!id) return c.json({ error: 'not_found' }, 404);
       const input = (await c.req.json().catch(() => null)) as { enabled?: unknown; triggers?: unknown } | null;
@@ -404,7 +408,7 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
         !Number.isSafeInteger(t.repositoryId) || t.repositoryId <= 0 ||
         typeof t.repository !== 'string' || t.repository.length > 256 || !/^[\w.-]+\/[\w.-]+$/.test(t.repository) ||
         typeof t.label !== 'string' || !t.label.trim() || t.label.length > 100))) return c.json({ error: 'bad_request' }, 400);
-      return c.json(await nativeClaude.update(c.get('caller'), id, input.enabled, triggers as NativeTrigger[] | undefined));
+      return c.json(await service.update(c.get('caller'), id, input.enabled, triggers as NativeTrigger[] | undefined));
     });
   }
 

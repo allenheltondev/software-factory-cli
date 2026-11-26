@@ -44,17 +44,18 @@ import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { createAdminClients } from './admin-clients.js';
 import { checkImageVersionIsolation } from './job-image-check.js';
-import { buildContext, CLOUD_BUILD_ENV, IMAGE_DIR, repoRoot } from './job-image-context.js';
+import { buildContext, IMAGE_DIR, NATIVE_BUILD_ENV, NATIVE_CODEX_VERSION, repoRoot } from './job-image-context.js';
+import { createImageCapabilities, recordCodexCapability } from '../src/native/image-policy.js';
 import { pruneImageVersions, pruneNativeImageVersions } from './job-image-prune.js';
 import { describeInputs, fingerprintOf, IMAGE_INPUTS, imageInputFiles, imageInputFingerprint, inputsFromDescription } from './job-image-inputs.js';
 import { checkNativeClaudeImage } from './native-claude-image-check.js';
+import { ensureCodexCapability } from './native-codex-capability.js';
 import { zip } from './zip.js';
 
 const ARCHITECTURE = 'ARM_64';
 const MEMORY_MIB = 4096;
 const HOOK_PORT = 9000;
 const BUILD_TIMEOUT_MS = 45 * 60 * 1000;
-const NATIVE_BUILD_ENV = CLOUD_BUILD_ENV.replace('@anthropic-ai/claude-code', '@anthropic-ai/claude-code@2.1.330');
 const NATIVE_INPUTS = [...IMAGE_INPUTS, 'src/', 'tsconfig.json', 'tsconfig.build.json', 'scripts/copy-telemetry.mjs', 'cloud/package-lock.json',
   'deploy/aws-microvm/native-worker/', 'cloud/server/scripts/native-claude-image-check.ts'];
 
@@ -107,12 +108,34 @@ async function main() {
     }
   }
 
+  const smokeImage = (version: string) => ({
+    imageArn, version, region, executionRoleArn: outputs.ManagedClaudeExecutionRoleArn!,
+    logGroup: outputs.MicrovmLogGroup!, brokerFunctionName: outputs.BrokerFunctionName!,
+  });
   async function verifyNative(version: string) {
-    await checkNativeClaudeImage(microvms, {
-      imageArn, version, region, executionRoleArn: outputs.ManagedClaudeExecutionRoleArn!,
-      logGroup: outputs.MicrovmLogGroup!, brokerFunctionName: outputs.BrokerFunctionName!,
-    });
+    await checkNativeClaudeImage(microvms, smokeImage(version));
     console.log(`==> Claude worker version ${version} passed the AWS sign-in smoke test`);
+    await ensureCodex(version);
+  }
+
+  /**
+   * Codex on a ChatGPT plan (#125) is offered only on a version recorded as able to run it. This
+   * version's build already proved its pinned Codex accepts the worker's launch arguments
+   * (install.sh runs codex-config-check.mjs); here it must also start as a Codex session. A failure
+   * here never fails the job: the version still goes out for Claude, without Codex
+   * (native-codex-capability.ts).
+   */
+  async function ensureCodex(version: string) {
+    await ensureCodexCapability({
+      has: async (v) => {
+        if (!outputs.TableName) throw new Error('the stack has no TableName output');
+        return (await createImageCapabilities(outputs.TableName, clients.dynamo)(v)).codex;
+      },
+      smoke: (v) => checkNativeClaudeImage(microvms, smokeImage(v), 'codex'),
+      record: (v) => recordCodexCapability(clients.dynamo, outputs.TableName!, v, NATIVE_CODEX_VERSION),
+      log: (line) => console.log(line),
+      ...(process.env.GITHUB_STEP_SUMMARY ? { summary: (line: string) => appendFileSync(process.env.GITHUB_STEP_SUMMARY!, `${line}\n`) } : {}),
+    }, version, NATIVE_CODEX_VERSION);
   }
 
   function reportVersion(version: string) {
@@ -141,6 +164,8 @@ reason=${reason}
         });
       if (built?.state !== 'SUCCESSFUL' || inputsFromDescription(built.description) !== fingerprint) continue;
       if (candidate !== active) await verifyNative(candidate);
+      // Built from this checkout's inputs, so it runs Codex: record that once, after its smoke.
+      else await ensureCodex(candidate);
       reportVersion(candidate);
       return;
     }

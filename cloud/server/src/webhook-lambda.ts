@@ -28,6 +28,7 @@ import { createDynamoQueueStore, type QueueEntry } from './jobs/queue-store.js';
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { nativeAws } from './native/aws.js';
+import { providerKeys, type NativeProvider } from './native/provider.js';
 import { awsJobStopper } from './jobs/stop-aws.js';
 import { BENCHMARK_LABEL } from './benchmarks/config.js';
 import { createBenchmarkDispatch } from './benchmarks/dispatch.js';
@@ -102,6 +103,12 @@ const notifyWaitingClaude = nativeWorker.managed && nativeWorker.resolveNative ?
   ...(env.CLAUDE_CONSOLE_ORIGIN ? { consoleOrigin: env.CLAUDE_CONSOLE_ORIGIN } : {}),
   comment: (job, body) => commentOnIssue(job.request.installationId, job.subject.repositoryId, job.subject.repository, job.subject.issue, body),
 }) : undefined;
+/** The same for a parked Codex job (#125): its own waits, its own console page and words. */
+const notifyWaitingCodex = nativeWorker.managedCodex && nativeWorker.resolveCodex ? createWaitingNotifier({
+  provider: 'codex', tenants: store, sessions: nativeWorker.managedCodex.sessions, resolveNative: nativeWorker.resolveCodex, workflows,
+  ...(env.CLAUDE_CONSOLE_ORIGIN ? { consoleOrigin: env.CLAUDE_CONSOLE_ORIGIN } : {}),
+  comment: (job, body) => commentOnIssue(job.request.installationId, job.subject.repositoryId, job.subject.repository, job.subject.issue, body),
+}) : undefined;
 
 const putEvent = async (key: string, body: string) => {
   await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key, Body: body, ContentType: 'application/json' }));
@@ -169,23 +176,30 @@ function launcher(): Launcher | undefined {
     ...(benchmarkInstallationConfigured ? { benchmarkInstallationId } : {}),
     native: nativeWorker.launch,
     resolveNative: nativeWorker.resolveNative,
-    ...(nativeWorker.managed ? {
-      async parkedClaude(request) {
-        const id = waitingId(request.installationId, request.deliveryId);
-        return (await nativeWorker.managed!.sessions.get(request.installationId, id))?.id;
+    ...(nativeWorker.resolveCodex ? { resolveCodex: nativeWorker.resolveCodex } : {}),
+    ...(nativeWorker.managed || nativeWorker.managedCodex ? {
+      async parkedClaude(request, provider = 'claude') {
+        const managed = nativeWorker.managedOf(provider);
+        if (!managed) return undefined;
+        const id = waitingId(request.installationId, request.deliveryId, provider);
+        return (await managed.sessions.get(request.installationId, id))?.id;
       },
-      async waitForClaude(request, repository, repositoryId, issue, reason, retirement) {
+      async waitForClaude(request, repository, repositoryId, issue, reason, retirement, provider = 'claude') {
+        const managed = nativeWorker.managedOf(provider);
+        if (!managed) throw new Error('No managed session for this provider');
+        const keys = providerKeys(provider);
         const { installationId, deliveryId, eventName, appBot } = request;
-        const id = waitingId(installationId, deliveryId);
-        const eventKey = `tenants/${installationId}/events/claude-wait/${id}.json`;
+        const id = waitingId(installationId, deliveryId, provider);
+        // One folder and retention tag for every provider's waiting events (provider.ts).
+        const eventKey = `tenants/${installationId}/events/${keys.eventFolder}/${id}.json`;
         await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: eventKey, Body: request.body, Tagging: 'updraft-retention=claude-wait' }));
-        const sessions = nativeWorker.managed!.sessions;
+        const sessions = managed.sessions;
         const waiting = await sessions.park({ installationId, deliveryId, eventName, appBot }, eventKey, Date.now(), { repository, repositoryId, issue });
         // Only a wait a person must end (a sign-in) is commented on now; one that ends by itself is
         // not, and gets its notice later only if it comes to need a sign-in (waiting-notice.ts, #176).
         let comment: string | undefined;
         try {
-          if (env.CLAUDE_CONSOLE_ORIGIN) comment = waitingComment(new URL(`/installations/${installationId}/claude?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN).href, reason, retirement);
+          if (env.CLAUDE_CONSOLE_ORIGIN) comment = waitingComment(new URL(`/installations/${installationId}/${keys.consolePage}?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN).href, reason, retirement, provider);
         } catch { comment = undefined; }
         const at = Date.now();
         if (waiting.created && comment && await sessions.claimNotice(installationId, waiting.id, at)) {
@@ -362,11 +376,12 @@ const mentionHandler = createMentionHandler({
   workflows,
 });
 
-async function resumeClaude(installationId: number) {
-  const sessions = nativeWorker.managed?.sessions;
+/** Starts the parked jobs of an installation's session once it is signed in: Claude's, or with `provider`, Codex's. */
+async function resumeClaude(installationId: number, provider: NativeProvider = 'claude') {
+  const sessions = nativeWorker.managedOf(provider)?.sessions;
   if (!sessions || !launch) return;
   for (const pending of await sessions.pending(installationId)) {
-    const key = `tenants/${installationId}/events/claude-wait/${pending.id}.json`;
+    const key = `tenants/${installationId}/events/${providerKeys(provider).eventFolder}/${pending.id}.json`;
     if (pending.eventKey !== key || pending.request.installationId !== installationId) continue;
     const existing = await store.getJob(pending.id);
     if (existing) {
@@ -435,7 +450,7 @@ async function dispatchQueue(trigger: 'schedule' | 'wake'): Promise<DispatchRepo
 }
 
 export async function handler(
-  event: APIGatewayProxyEvent | RetryRequest | QueueCancelRequest | { action: 'resumeClaude'; installationId: number } | { action: 'reconcileWorkflows' } | { action: 'dispatchQueue' } | { Records: unknown[] },
+  event: APIGatewayProxyEvent | RetryRequest | QueueCancelRequest | { action: 'resumeClaude'; installationId: number; provider?: NativeProvider } | { action: 'reconcileWorkflows' } | { action: 'dispatchQueue' } | { Records: unknown[] },
 ): Promise<APIGatewayProxyResult | RetryResult | QueueCancelResult | DispatchReport | (ReconcileReport & { labels: LabelScanReport }) | void> {
   // The table stream (template.yaml QueueWake): a slot was given back, or work was queued. Only a
   // wakeup: the scheduled run catches anything this misses, so it never fails (no stream retries).
@@ -462,19 +477,24 @@ export async function handler(
     // Labeled issues whose delivery never came (workflows/label-scan.ts): reported, never started.
     const labels = !(await killSwitch.engaged()) ? await scanLabels() : { tenants: 0, flagged: 0, failed: 0 };
     // Parked Claude jobs whose wait now needs a sign-in: one comment each (native/waiting-notice.ts).
-    const notices = notifyWaitingClaude ? await notifyWaitingClaude() : { tenants: 0, noticed: 0, unpostable: 0, failed: 0 };
+    const none = { tenants: 0, noticed: 0, unpostable: 0, failed: 0 };
+    const notices = notifyWaitingClaude ? await notifyWaitingClaude() : none;
+    // Codex's waits get their own one notice each (#125), whatever Claude's run did.
+    const codexNotices = notifyWaitingCodex ? await notifyWaitingCodex() : none;
     const combined = { ...report, labels };
     // Metrics first, whatever follows: a failing run is what the alarms look for.
     console.log(reconcileMetricsLine(report, labels, Date.now()));
-    console.log(JSON.stringify({ claudeWaitingNotices: notices }));
+    console.log(JSON.stringify({ claudeWaitingNotices: notices, ...(notifyWaitingCodex ? { codexWaitingNotices: codexNotices } : {}) }));
     // The next run (five minutes on) retries what failed; fail this one so alarms see it.
-    if (report.failed > 0 || labels.failed > 0 || notices.failed > 0) {
-      throw new Error(`workflow reconciliation failed for ${report.failed} workflow(s), ${labels.failed} tenant label scan(s) and ${notices.failed} Claude sign-in notice(s)`);
+    if (report.failed > 0 || labels.failed > 0 || notices.failed > 0 || codexNotices.failed > 0) {
+      throw new Error(`workflow reconciliation failed for ${report.failed} workflow(s), ${labels.failed} tenant label scan(s) and ${notices.failed + codexNotices.failed} subscription sign-in notice(s)`);
     }
     return combined;
   }
   if ('action' in event) {
-    if (event.action === 'resumeClaude' && Number.isSafeInteger(event.installationId) && event.installationId > 0) await resumeClaude(event.installationId);
+    if (event.action === 'resumeClaude' && Number.isSafeInteger(event.installationId) && event.installationId > 0) {
+      await resumeClaude(event.installationId, (event as { provider?: unknown }).provider === 'codex' ? 'codex' : 'claude');
+    }
     return;
   }
   if (isRetryRequest(event)) {

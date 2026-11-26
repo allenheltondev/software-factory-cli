@@ -48,6 +48,8 @@ export interface Workflow {
   nextCheckAt?: string;
   /** Since when it has waited in its current stage (ISO). */
   waitingSince?: string;
+  /** Awaiting a sign-in for Codex's ChatGPT plan (#125). Absent: a Claude sign-in, as before. */
+  signInProvider?: 'codex';
   /** Pull requests of earlier runs (newest last, at most MAX_PAST_PULL_REQUESTS): their events are history of the run they belong to. */
   pastPullRequests?: { number: number; generation: number }[];
   createdAt: string;
@@ -249,7 +251,7 @@ export function newWorkflow(job: Pick<Job, 'installationId' | 'repository' | 're
 }
 
 const clearWait = (w: Workflow): Workflow => {
-  const { reason: _r, message: _m, nextAction: _n, nextCheckAt: _c, waitingSince: _w, controlPause: _p, ...rest } = w;
+  const { reason: _r, message: _m, nextAction: _n, nextCheckAt: _c, waitingSince: _w, controlPause: _p, signInProvider: _s, ...rest } = w;
   return rest as Workflow;
 };
 
@@ -469,7 +471,7 @@ function usageOf(u: { inputTokens?: number; outputTokens?: number; costUsd?: num
 export function onJobWaiting(
   w: Workflow,
   job: { jobId?: string; eventName: string; deliveryId?: string },
-  why: { reason: string; message: string; nextAction: string },
+  why: { reason: string; message: string; nextAction: string; provider?: 'codex' },
   at: number,
 ): { workflow: Workflow; event: WorkflowEvent } {
   // A new label parked for a sign-in starts its run now: the job that starts later continues it.
@@ -484,6 +486,7 @@ export function onJobWaiting(
     reason: why.reason,
     message: why.message,
     nextAction: why.nextAction,
+    ...(why.provider === 'codex' ? { signInProvider: 'codex' as const } : {}),
     waitingSince: iso(at),
     nextCheckAt: iso(at + SIGN_IN_LIMIT_MS),
     ...(job.jobId ? { lastJobId: job.jobId, lastJobAt: iso(at), jobRuns: withJobRun(w, job.jobId, generation) } : {}),

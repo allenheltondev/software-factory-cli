@@ -40,7 +40,7 @@ export function deliveryFromLaunch(base: DeliveryEvent, result: LaunchResult): D
       return filtered(result.disposition);
     case 'not_dispatched':
       if (result.reason === 'native_waiting_for_sign_in' && result.jobId) {
-        return { ...filtered(result.reason, result.message), jobId: result.jobId };
+        return { ...filtered(result.reason, result.message), jobId: result.jobId, ...(result.provider === 'codex' ? { provider: 'codex' as const } : {}) };
       }
       return filtered(result.reason ?? 'not_trigger', result.message);
     case 'jobs_off':
