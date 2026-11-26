@@ -60,7 +60,9 @@ describe('the GitHub client', () => {
 
   it('reads a pull request\'s state and head', async () => {
     const api = createGitHubApi(async () => new Response(JSON.stringify({ state: 'closed', merged: true, head: { sha: 'abc', ref: 'updraft/x' } }), { status: 200 }));
-    expect(await api.pullRequestHead!('ghs_x', 'acme/web', 12)).toEqual({ state: 'closed', merged: true, headSha: 'abc', headRef: 'updraft/x' });
+    expect(await api.pullRequestHead!('ghs_x', 'acme/web', 12)).toEqual({ state: 'closed', merged: true, headSha: 'abc', headRef: 'updraft/x', headRepoId: null });
+    const own = createGitHubApi(async () => new Response(JSON.stringify({ state: 'open', merged: false, head: { sha: 'abc', ref: 'updraft/x', repo: { id: 9 } } }), { status: 200 }));
+    expect(await own.pullRequestHead!('ghs_x', 'acme/web', 12)).toMatchObject({ headRepoId: 9 });
   });
 
   it('counts a commit\'s check runs and statuses together, and says when a listing was not read to its end', async () => {

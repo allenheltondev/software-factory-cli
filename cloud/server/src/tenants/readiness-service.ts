@@ -414,6 +414,12 @@ export function repositoryChecks(f: RepositoryFacts): ReadinessCheck[] {
       ? { id: 'github-events', stage: 'github', required: true, state: 'failing', problem: 'permissions', summary: `The App is not subscribed to ${missing.map((e) => `${e.event} (${e.why})`).join(', ')}.`, fix: { text: 'Accept the App\'s requested events on GitHub', target: 'github' } }
       : { id: 'github-events', stage: 'github', required: true, state: 'verified', summary: `The App receives ${events.map((e) => e.event).join(', ')}.` });
   }
+  // Commands by mention (#135): optional; without issue_comment, `@<app> pause` and the rest are never seen.
+  if (f.gh.ok && f.gh.value?.events) {
+    out.push(f.gh.value.events.includes('issue_comment')
+      ? { id: 'github-mentions', stage: 'github', required: false, state: 'verified', summary: 'Comments reach Updraft, so allowed people can pause, resume, stop or cancel work by mentioning the App.' }
+      : { id: 'github-mentions', stage: 'github', required: false, state: 'off', summary: 'The App is not subscribed to issue comments, so mention commands (pause, resume, stop, cancel) are not seen.', fix: { text: 'Subscribe the App to Issue comment events on GitHub', target: 'github' } });
+  }
 
   // Review and revision loop.
   if ((rule.review || rule.revise) && !f.loop) out.push({ id: 'review', stage: 'review', required: true, state: 'failing', problem: 'invalid_config', summary: 'This configuration was published before pull request events started jobs: publish it again for review and revisions to run.', fix: { text: 'Publish the configuration again', target: 'config' } });

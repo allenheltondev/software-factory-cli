@@ -63,6 +63,7 @@
 import { execFile } from 'node:child_process';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
+import { repoPermissionOf } from '../control/commands.js';
 import { appRequestProblem, redactGitHubSecrets } from './app-auth.js';
 import { appIdentity, createUserCredentials, repoOfRequest, userIdentity, type GitHubCredentials } from './credentials.js';
 import {
@@ -74,6 +75,7 @@ import {
   type GitHubIssue,
   type GitHubIssueBodyEdit,
   type GitHubIssueComment,
+  type RepoIssueComment,
   type GitHubIssueEvent,
   type GitHubPullRequest,
   type GitHubRepo,
@@ -391,6 +393,29 @@ function mapPull(r: RawPullRequest): GitHubPullRequest {
     headRepoId: r.head.repo?.id ?? null,
     baseRef: r.base.ref,
     body: r.body ?? '',
+  };
+}
+
+interface RawRepoComment extends RawComment {
+  issue_url?: string;
+  created_at?: string;
+  updated_at?: string;
+  user: { login: string; type?: string } | null;
+}
+
+function mapRepoComment(r: RawRepoComment): RepoIssueComment | null {
+  const issue = Number(/\/issues\/(\d+)$/.exec(r.issue_url ?? '')?.[1]);
+  if (!Number.isSafeInteger(issue) || !r.created_at || !r.updated_at) return null;
+  return {
+    id: r.id,
+    htmlUrl: r.html_url,
+    body: r.body ?? '',
+    user: r.user?.login ?? null,
+    userType: r.user?.type ?? null,
+    issueNumber: issue,
+    onPullRequest: /\/pull\/\d+/.test(r.html_url),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
   };
 }
 
@@ -936,6 +961,17 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         body: { body },
       });
       return mapComment(res.data!);
+    },
+
+    async listRepoIssueComments(repo, { since, page, perPage = 100 }) {
+      const res = await request<RawRepoComment[]>(buildUrl(`${repoPath(repo)}/issues/comments`, { since, sort: 'updated', direction: 'asc', per_page: perPage, page }));
+      const next = parseLinkHeader(res.headers.get('link'))['next'];
+      return { comments: (res.data ?? []).flatMap((c) => mapRepoComment(c) ?? []), nextPage: next ? page + 1 : null };
+    },
+
+    async getRepoPermission(repo, login) {
+      const res = await request<{ permission?: unknown; role_name?: unknown }>(`${repoPath(repo)}/collaborators/${encodeURIComponent(login)}/permission`);
+      return repoPermissionOf(res.data);
     },
 
     async updateIssueComment(repo, commentId, body) {

@@ -473,6 +473,12 @@ export const configSchema = z.strictObject({
     .default({ reviewers: [] }),
   /** Opt-in usage-limit handling and shared subscription capacity. Absent: nothing changes. */
   capacity: capacitySchema.optional(),
+  /**
+   * Human steering by mention (docs/controls.md): `@<handle> pause`, `resume`, `stop`, ... in a
+   * managed issue or pull request. Off unless enabled: reading comments costs requests.
+   * `handle`: the login people mention; default: the worker's own (its App's slug).
+   */
+  controls: z.strictObject({ enabled: z.boolean().default(false), handle: z.string().min(1).max(100).optional() }).optional(),
   agents: z.record(name, agentSchema),
   pools: z.record(name, poolSchema),
   actions: z.record(name, actionSchema),

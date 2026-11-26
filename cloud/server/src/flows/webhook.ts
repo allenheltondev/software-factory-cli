@@ -8,6 +8,7 @@ import type { RoutineDispatcher } from '../routines/dispatch.js';
 import { PULL_REQUEST_ACTIONS, pullRequestOfPayload } from '../tenants/dispatch.js';
 import { deliveryFromLaunch, LIFECYCLE_EVENTS, type DeliveryEvent } from '../jobs/deliveries.js';
 import type { DeliveryRecord, Store } from '../store/store.js';
+import { isMentionEvent } from '../control/mentions.js';
 
 /**
  * The GitHub webhook (POST /api/webhooks/github, no authorizer: the HMAC is the authentication).
@@ -60,11 +61,14 @@ export function createWebhookHandler({
   routines,
   benchmarkInstallationId,
   queueEvents,
+  mentions,
   now = () => Date.now(),
   log = (m: string) => console.log(m),
 }: {
   /** The admission queue's dispatcher (jobs/queue.ts): label removals and closes cancel queued work. */
   queueEvents?: Pick<import('../jobs/queue.js').QueueDispatcher, 'subjectChanged'>;
+  /** Commands by mention (control/mentions.ts, #135): `issue_comment` and review comments. */
+  mentions?: (event: import('../control/mentions.js').MentionEvent) => Promise<import('../control/mentions.js').MentionResult>;
   store: Store;
   github: Pick<GitHubApi, 'getInstallation'>;
   loadSettings: LoadSettings;
@@ -132,6 +136,16 @@ export function createWebhookHandler({
     };
 
     if (event === 'ping') return done('pong');
+    // A comment that may be a command (#135): a pause, a stop, a resume. Never a launch of its own.
+    if (mentions && validInstallation && isMentionEvent(event, action)) {
+      const result = await mentions({ installationId, deliveryId: delivery, eventName: event, payload: payload as Parameters<typeof mentions>[0]['payload'] });
+      if (result.reason !== 'no_command') {
+        if (result.disposition !== 'ignored' || result.reason === 'automated') {
+          await record({ ...base, disposition: result.disposition === 'deduped' ? 'deduped' : 'filtered', ...(result.reason ? { reason: result.reason } : {}), ...(result.message ? { message: result.message } : {}) });
+        }
+        return done(result.reason ?? result.disposition);
+      }
+    }
     const launches = (event === 'issues' && action === 'labeled') || (Object.hasOwn(PULL_REQUEST_ACTIONS, event) && PULL_REQUEST_ACTIONS[event]!.includes(action));
     if (launches && ((validInstallation && installationId === benchmarkInstallationId) ||
       (event === 'issues' && isBenchmarkLabel(payload.label?.name)))) return done('not_dispatched');
