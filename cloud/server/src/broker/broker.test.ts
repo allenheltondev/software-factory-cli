@@ -10,7 +10,7 @@ import { createMemoryStore, type Job, type Tenant } from '../store/store.js';
 import { createReconciler } from '../jobs/reconcile.js';
 import { createWorkflowRecorder } from '../workflows/recorder.js';
 import { createMemoryWorkflowStore } from '../workflows/store.js';
-import { createBroker, hashToken, JOB_PERMISSIONS, jobPaths, jobSessionPolicy, OPTIONAL_JOB_PERMISSIONS, SESSION_SECONDS } from './broker.js';
+import { createBroker, hashToken, JOB_PERMISSIONS, jobAgentKeys, jobPaths, jobSessionPolicy, OPTIONAL_JOB_PERMISSIONS, SESSION_SECONDS } from './broker.js';
 import { GitHubError } from '../github/client.js';
 import { telemetryView } from '../tenants/telemetry-service.js';
 
@@ -104,6 +104,39 @@ describe('the job broker', () => {
     // The config version is pinned: another version of the same tenant is out of reach.
     expect(JSON.stringify(policy)).toContain('tenants/55/config/3/*');
     expect(JSON.stringify(policy)).not.toContain('tenants/55/config/2/');
+  });
+
+  describe("the agent keys: the job's own, in the descriptor and the session policy alike", () => {
+    const arn = (name: string) => `arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/tenants/55/agent-keys/${name}`;
+    const startedWith = async (agentKeys: string[] | undefined, over: Partial<Job> = {}) => {
+      const { agentKeys: _, ...rest } = job;
+      const keyed = { ...rest, jobId: 'job_keys00001', deliveryId: 'd-keys', ...(agentKeys ? { agentKeys } : {}), ...over };
+      await store.putJob(keyed);
+      const r = await handle({ action: 'start', jobId: keyed.jobId, token });
+      if (!r.ok || !('descriptor' in r)) throw new Error('not started');
+      const policy = JSON.parse(assumeRole.mock.calls.at(-1)![0].policy) as { Statement: { Action: string | string[]; Resource: string | string[] }[] };
+      const secrets = policy.Statement.filter((st) => st.Action === 'secretsmanager:GetSecretValue').flatMap((st) => (Array.isArray(st.Resource) ? st.Resource : [st.Resource]));
+      return { handed: Object.keys(r.descriptor.agentKeySecrets).sort(), secrets: secrets.sort() };
+    };
+
+    it('an ordinary job: exactly its recorded keys, each one secret', async () => {
+      expect(await startedWith(['ANTHROPIC_API_KEY', 'CODEX_API_KEY'])).toEqual({ handed: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY-??????'), arn('CODEX_API_KEY-??????')] });
+    });
+
+    it('a job whose workflow needs no key: none, and no secret at all', async () => {
+      expect(await startedWith([])).toEqual({ handed: [], secrets: [] });
+    });
+
+    it('a job recorded before its keys were (none on its record): every supported key, and the whole key prefix', async () => {
+      expect(await startedWith(undefined)).toEqual({ handed: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY', 'KIRO_API_KEY', 'MISTRAL_API_KEY'], secrets: [arn('*')] });
+    });
+
+    it('the telemetry key too when the job sends telemetry, never as an agent key', async () => {
+      const base = { provider: 'honeycomb' as const, region: 'eu' as const, serviceName: 'factory', captureContent: true, updatedAt: '', updatedBy: 'pat' };
+      await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }, 0);
+      expect(await startedWith(['ANTHROPIC_API_KEY'])).toEqual({ handed: ['ANTHROPIC_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY-??????'), arn('HONEYCOMB_API_KEY-??????')] });
+      expect(await startedWith([], { jobId: 'job_keys00002', deliveryId: 'd-keys-2' })).toEqual({ handed: [], secrets: [arn('HONEYCOMB_API_KEY-??????')] });
+    });
   });
 
   it('refuses starts, credentials and publication tokens after an owner stop fence', async () => {
@@ -668,6 +701,17 @@ describe('the job broker', () => {
   it('keeps an unexpected outcome out of the record', async () => {
     await handle({ action: 'finish', jobId: job.jobId, token, outcome: 'DROP TABLE; --' });
     expect((await store.getJob(job.jobId))?.outcome).toBe('unknown');
+  });
+});
+
+describe('jobAgentKeys', () => {
+  it("is the job's recorded keys; a native job's never the Anthropic key; null for an ordinary job recorded without them", () => {
+    expect(jobAgentKeys({ agentKeys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] })).toEqual(['ANTHROPIC_API_KEY', 'CODEX_API_KEY']);
+    expect(jobAgentKeys({ agentKeys: [] })).toEqual([]);
+    expect(jobAgentKeys({})).toBeNull();
+    expect(jobAgentKeys({ native: { workerId: 'w' }, agentKeys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] })).toEqual(['CODEX_API_KEY']);
+    expect(jobAgentKeys({ native: { workerId: 'w' } })).toEqual([]);
+    expect(jobAgentKeys({ benchmark: {} as NonNullable<Job['benchmark']> })).toEqual([]);
   });
 });
 

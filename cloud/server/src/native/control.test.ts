@@ -92,7 +92,7 @@ describe('native worker Cloud dispatch', () => {
   });
   it('queues without an API key or BYOK image, deduplicates deliveries and claims once across concurrent polls', async () => {
     const job = await queued();
-    expect(job.native?.workerId).toBe(route.workerId); expect(job.agentKeys).toBeUndefined();
+    expect(job.native?.workerId).toBe(route.workerId); expect(job.agentKeys).toEqual([]);
     expect(runMicrovm).not.toHaveBeenCalled();
     expect(await launch(request())).toMatchObject({ disposition: 'duplicate' });
     await control.handle(input('register'));
@@ -539,7 +539,7 @@ describe('native worker Cloud dispatch', () => {
   it('never grants the job access to the worker secret or Anthropic key, while retaining another required key', () => {
     const policy = jobSessionPolicy({ installationId: 55, configVersion: 1, deliveryId: 'd', native: { workerId: route.workerId }, agentKeys: ['CODEX_API_KEY', 'ANTHROPIC_API_KEY'] } as Job,
       { bucket: 'bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' });
-    expect(JSON.stringify(policy)).toContain('agent-keys/CODEX_API_KEY-*');
+    expect(JSON.stringify(policy)).toContain('agent-keys/CODEX_API_KEY-??????');
     expect(JSON.stringify(policy)).not.toMatch(/ANTHROPIC|native-workers|agent-keys\/\*/);
   });
   it('lets an active approved job drain but refuses another assignment after retirement policy changes', async () => {
