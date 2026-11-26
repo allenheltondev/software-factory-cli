@@ -318,7 +318,9 @@ jobs:
           origin=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$DEPLOY_REGION" \
             --query "Stacks[0].Parameters[?ParameterKey=='ManagedClaudeConsoleOrigin'].ParameterValue | [0]" --output text)
           # Preserve exact approvals for live protocol-1 sessions. Existing drain/revoke
-          # records are never overwritten by a routine rollout or rollback.
+          # records are never overwritten by a routine rollout or rollback. Approvals are
+          # never removed, so every image a session launched on keeps its record however
+          # many rollouts later; a launch on an unrecorded latest image records it (#176).
           npm exec --workspace=server -- tsx scripts/claude-image-policy.ts --stack "$STACK_NAME" --region "$DEPLOY_REGION" --seed "$active" --seed "$VERIFIED_VERSION" --require-approved "$VERIFIED_VERSION"
           if [ "$VERIFIED_VERSION" != "$active" ] || [ "$CONSOLE_ORIGIN" != "$origin" ]; then
             make deploy-backend MANAGED_CLAUDE_IMAGE_VERSION="$VERIFIED_VERSION" MANAGED_CLAUDE_CONSOLE_ORIGIN="$CONSOLE_ORIGIN"

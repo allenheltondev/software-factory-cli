@@ -48,6 +48,26 @@ describe('the acceptance checklist', () => {
     expect(text).toContain('this head is not ready while 1 mandatory acceptance criterion is unverified (MORE)');
   });
 
+  it('shows a criterion\'s sub-points inline, and its parent for a nested checkbox, all inert', () => {
+    const snap = extractCriteria({
+      title: 't',
+      body: [
+        '- [ ] Unit tests cover:',
+        '  - ordering for records received in the same millisecond;',
+        '  - `--limit` and @octocat <img src=x> [click](https://evil)',
+        '  1. fixes #12',
+        '  - [ ] Nested <b>box</b> for @someone',
+      ].join('\n'),
+    });
+    const a = assessAcceptance(snap, 'ok');
+    const text = renderAcceptanceChecklist({ assessment: a, gate: acceptanceGate(a), headSha: SHA, prUrl: PR_URL, previous: null });
+    expect(text).toContain(
+      `\`${snap.criteria[0]!.id}\` · Unit tests cover: (1) ordering for records received in the same millisecond; (2) \`--limit\` and @\u200boctocat &lt;img src=x> \\[click\\](https://evil); (3) fixes \u200b#12`,
+    );
+    expect(text).toContain(`\`${snap.criteria[1]!.id}\` · Nested &lt;b>box&lt;/b> for @\u200bsomeone (under: Unit tests cover:)`);
+    expect(text).not.toMatch(/@octocat|@someone|<img|<b>|\[click\]|fixes #12/);
+  });
+
   it('says so honestly when the issue lists nothing and the reviewer named nothing', () => {
     const a = assessAcceptance(extractCriteria({ title: 't', body: 'Make it faster.' }), 'ok');
     expect(renderAcceptanceChecklist({ assessment: a, gate: acceptanceGate(a), headSha: SHA, prUrl: PR_URL, previous: null })).toContain(

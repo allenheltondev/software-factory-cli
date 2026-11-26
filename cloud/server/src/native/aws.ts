@@ -49,6 +49,12 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
       route, secret: () => secret(route), mode: () => mode.snapshot(route.installationId, route.workerId),
       async ready() { return (await readiness()) === 'ready'; },
       readiness,
+      ...(managed && route.workerId.startsWith('managed-') ? {
+        async retirement() {
+          const session = await managed.sessions.session(route.installationId);
+          return session?.retiring ? session.retirementReason ?? 'reconnect' : undefined;
+        },
+      } : {}),
     };
   };
   async function readinessOf(route: NativeRoute, latestImageVersion?: string): Promise<NativeReadiness> {

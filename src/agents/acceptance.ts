@@ -3,8 +3,10 @@
 //
 // 1. extractCriteria reads the criteria from the issue as the run was given it: its task-list
 //    items, or, without any, the list items under a heading such as "Acceptance" or
-//    "Requirements". Nothing is rewritten: the text is the issue's, trimmed and capped. Each
-//    criterion's id comes from its own normalized text, so an edit elsewhere in the issue keeps
+//    "Requirements". An item's text includes its nested sub-bullets, numbered sub-items and
+//    continuation lines; a nested checkbox is a criterion of its own, with its parent's first
+//    line as context. Nothing is rewritten: the text is the issue's, trimmed and capped. Each
+//    criterion's id comes from its own normalized text (sub-points included), so an edit elsewhere in the issue keeps
 //    it, and an edit of the criterion itself makes a new one (an earlier assessment does not carry
 //    over). A heuristic marks the criteria that need live evidence (a real deployment, staging,
 //    screenshots): it can only make a criterion harder to pass, never easier.
@@ -43,7 +45,8 @@ export const MAX_EVIDENCE = 8;
 export const UNREAD_ISSUE = 'ISSUE';
 /** The row of the criteria beyond MAX_CRITERIA, which no review was given. */
 export const UNLISTED_CRITERIA = 'MORE';
-const MAX_CRITERION_TEXT = 500;
+const MAX_CRITERION_TEXT = 2_000;
+const MAX_CONTEXT = 300;
 const MAX_NOTE = 1_500;
 const MAX_REF = 300;
 
@@ -65,12 +68,13 @@ const sha256 = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex
 // 1. Extraction
 // ---------------------------------------------------------------------------
 
-const CHECKBOX = /^(\s*)(?:[-*+]|\d{1,3}[.)])\s+\[( |x|X)\]\s+(.*)$/;
-const BULLET = /^(\s*)(?:[-*+]|\d{1,3}[.)])\s+(.*)$/;
+const CHECKBOX = /^(\s*)([-*+]|\d{1,3}[.)])\s+\[( |x|X)\]\s+(.*)$/;
+const BULLET = /^(\s*)([-*+]|\d{1,3}[.)])\s+(.*)$/;
 const HEADING = /^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/;
 /** A line that is all bold, or a short label ending in a colon: used as a heading by many issues. */
 const LABEL = /^\s{0,3}(?:\*\*|__)([^*_].*?)(?:\*\*|__)\s*:?\s*$|^\s{0,3}([A-Z][A-Za-z0-9 /&()-]{2,60}):\s*$/;
-const FENCE = /^\s{0,3}(`{3,}|~{3,})/;
+// Any indent: a code block nested under a sub-bullet is still a code block.
+const FENCE = /^\s*(`{3,}|~{3,})/;
 
 const OUT_OF_SCOPE = /\b(out of scope|non-goals?|not in scope|won'?t do|not doing)\b/i;
 const OPTIONAL_SECTION = /\b(optional|nice[- ]to[- ]haves?|stretch( goals?)?|follow[- ]?ups?|future( work)?|later)\b/i;
@@ -109,7 +113,12 @@ export function issueFingerprint(issue: { title: string; body: string | null }):
 }
 
 interface Item {
-  text: string;
+  /** The item's first line (with its continuation lines). */
+  head: string;
+  /** Its nested content, one line each: plain sub-bullets and numbered sub-items (with their marker), and continuation lines after them. */
+  points: string[];
+  /** The first line of the item it is nested under; null at the top level. */
+  context: string | null;
   section: string | null;
   checkbox: boolean;
   checked: boolean;
@@ -118,13 +127,25 @@ interface Item {
   requirementSection: boolean;
 }
 
-/** The list items of an issue body, outside code blocks and HTML comments, with the heading each is under. */
+/** An item's whole text: its first line, then its nested content, a line each. */
+const itemText = (i: Item) => [i.head, ...i.points].join('\n');
+
+/**
+ * The list items of an issue body, outside code blocks and HTML comments, with the heading each is
+ * under. An item keeps its nested content (sub-bullets, numbered sub-items, continuation lines) up
+ * to the next item at the same or a lower indent; a nested checkbox is an item of its own, with
+ * its parent's first line as context.
+ */
 function listItems(body: string): Item[] {
   const lines = body.replace(/\r\n?/g, '\n').replace(/<!--[\s\S]*?-->/g, '').split('\n');
   const items: Item[] = [];
   let section: string | null = null;
   let fence: string | null = null;
-  let current: { item: Item; indent: number } | null = null;
+  // The open list entries, outermost first: each the item its text belongs to, the indent of its
+  // marker, its nesting depth within that item (0: the item's own first line), and the line of
+  // the item's text it writes to (-1: the first line).
+  let open: { owner: Item; indent: number; depth: number; line: number }[] = [];
+  const indentOf = (line: string) => line.search(/\S/);
   for (const line of lines) {
     const f = FENCE.exec(line);
     if (fence) {
@@ -133,40 +154,65 @@ function listItems(body: string): Item[] {
     }
     if (f) {
       fence = f[1]!;
-      current = null;
+      // A code block nested under an item is skipped and the item goes on; one at its level ends it.
+      while (open.length && indentOf(line) <= open.at(-1)!.indent) open.pop();
       continue;
     }
     const heading = HEADING.exec(line) ?? null;
     const label = heading ? null : LABEL.exec(line);
     if (heading || label) {
       section = clean((heading ? heading[1] : (label![1] ?? label![2]))!.replace(/[*_`]/g, ''), 120);
-      current = null;
+      open = [];
       continue;
     }
     const box = CHECKBOX.exec(line);
     const bullet = box ? null : BULLET.exec(line);
     if (box || bullet) {
-      const text = (box ? box[3] : bullet![2])!.trim();
+      const indent = (box ? box[1] : bullet![1])!.length;
+      const text = (box ? box[4] : bullet![3])!.trim();
+      while (open.length && open.at(-1)!.indent >= indent) open.pop();
+      const parent = open.at(-1);
+      if (parent && !box) {
+        // A plain sub-bullet or numbered sub-item: part of the text of the item it is under.
+        parent.owner.points.push(`${'  '.repeat(parent.depth)}${bullet![2]} ${text}`);
+        open.push({ owner: parent.owner, indent, depth: parent.depth + 1, line: parent.owner.points.length - 1 });
+        continue;
+      }
       const item: Item = {
-        text,
+        head: text,
+        points: [],
+        context: parent ? (parent.depth === 0 ? parent.owner.head : parent.owner.points[parent.line]!.replace(/^\s*(?:[-*+]|\d{1,3}[.)])\s+/, '')) : null,
         section,
         checkbox: Boolean(box),
-        checked: box ? box[2] !== ' ' : false,
+        checked: box ? box[3] !== ' ' : false,
         optionalSection: section !== null && OPTIONAL_SECTION.test(section),
         outOfScope: section !== null && OUT_OF_SCOPE.test(section),
         requirementSection: section !== null && REQUIREMENT_SECTION.test(section),
       };
       items.push(item);
-      current = { item, indent: (box ? box[1] : bullet![1])!.length };
-      continue;
-    }
-    // A continuation of the item above: indented further than its marker.
-    if (current && line.trim() && /^\s+/.test(line) && line.search(/\S/) > current.indent) {
-      current.item.text = `${current.item.text} ${line.trim()}`;
+      open.push({ owner: item, indent, depth: 0, line: -1 });
       continue;
     }
     if (!line.trim()) continue;
-    current = null;
+    // A continuation of the entry above it: indented further than its marker.
+    if (/^\s+/.test(line)) {
+      const indent = indentOf(line);
+      while (open.length && open.at(-1)!.indent >= indent) open.pop();
+      const at = open.at(-1);
+      if (at) {
+        const { owner } = at;
+        const last = at.line < 0 ? !owner.points.length : at.line === owner.points.length - 1;
+        if (last && at.line < 0) owner.head = `${owner.head} ${line.trim()}`;
+        else if (last) owner.points[at.line] = `${owner.points[at.line]} ${line.trim()}`;
+        // After deeper content: a line of its own, so the text keeps its order.
+        else {
+          owner.points.push(`${'  '.repeat(at.depth)}${line.trim()}`);
+          at.line = owner.points.length - 1;
+        }
+        continue;
+      }
+    }
+    open = [];
   }
   return items;
 }
@@ -178,25 +224,29 @@ function listItems(body: string): Item[] {
 export function extractCriteria(issue: { title: string; body: string | null }, policy: AcceptancePolicy = 'enforce'): AcceptanceSnapshot {
   const fingerprint = issueFingerprint(issue);
   if (issue.body === null) return { fingerprint, source: 'unavailable', criteria: [], omitted: 0, policy };
-  const items = listItems(issue.body).filter((i) => !i.outOfScope && i.text.replace(/[*_`~\s]/g, '').length > 0);
+  const items = listItems(issue.body).filter((i) => !i.outOfScope && i.head.replace(/[*_`~\s]/g, '').length > 0);
   const boxes = items.filter((i) => i.checkbox);
   const chosen = boxes.length ? boxes : items.filter((i) => i.requirementSection);
   const source = boxes.length ? 'checklist' : chosen.length ? 'requirements' : 'none';
   const criteria: AcceptanceCriterion[] = [];
   const ids = new Set<string>();
   for (const item of chosen.slice(0, MAX_CRITERIA)) {
-    const text = clean(item.text, MAX_CRITERION_TEXT)!;
-    const base = `AC-${sha256(normalized(item.text)).slice(0, 8)}`;
+    // The whole text, sub-points too: editing one of them gives a new id, assessed afresh.
+    const full = itemText(item);
+    const text = clean(full, MAX_CRITERION_TEXT)!;
+    const base = `AC-${sha256(normalized(full)).slice(0, 8)}`;
     let id = base;
     for (let n = 2; ids.has(id); n++) id = `${base}-${n}`;
     ids.add(id);
     criteria.push({
       id,
       text,
+      context: item.context === null ? null : clean(item.context, MAX_CONTEXT),
       section: item.section,
       origin: item.checkbox ? 'checklist' : 'requirement',
-      mandatory: !item.optionalSection && !OPTIONAL_ITEM.test(item.text),
-      gate: LIVE_GATE.test(item.text) ? 'live' : 'code',
+      // Only the item's own first line can mark it optional: "(optional)" in a sub-point does not.
+      mandatory: !item.optionalSection && !OPTIONAL_ITEM.test(item.head),
+      gate: LIVE_GATE.test(full) ? 'live' : 'code',
       checkedInSource: item.checked,
     });
   }
@@ -267,6 +317,8 @@ export interface EvidenceRef {
 export interface CriterionAssessment {
   id: string;
   text: string;
+  /** For a checkbox nested under another item: that item's first line. */
+  context?: string | null;
   mandatory: boolean;
   gate: 'code' | 'live';
   /** From the issue (extracted) or added by the reviewer (inferred from the issue or from steering). */
@@ -414,7 +466,7 @@ export function assessAcceptance(snapshot: AcceptanceSnapshot, findingsText: str
   };
   for (const c of snapshot.criteria) {
     rows.push(
-      judge({ id: c.id, text: c.text, mandatory: c.mandatory, gate: c.gate, origin: c.origin, checkedInSource: c.checkedInSource }, said.get(c.id)),
+      judge({ id: c.id, text: c.text, context: c.context ?? null, mandatory: c.mandatory, gate: c.gate, origin: c.origin, checkedInSource: c.checkedInSource }, said.get(c.id)),
     );
   }
   for (const a of added) {

@@ -4,6 +4,7 @@ import { createWorkflowReconciler, type ReconcileReport } from './workflows/reco
 import { createLabelScanner, type LabelScanReport } from './workflows/label-scan.js';
 import { reconcileMetricsLine } from './workflows/metrics.js';
 import { waitingId } from './native/sessions.js';
+import { commentCanNeverPost, createWaitingNotifier } from './native/waiting-notice.js';
 import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
@@ -86,6 +87,22 @@ async function imageVersion(): Promise<string | null> {
 const nativeWorker = nativeAws(store);
 const stopJob = awsJobStopper(store, nativeWorker.control, workflows);
 
+/** Comments on an issue as the App, with a token for that one repository. Throws when it cannot. */
+async function commentOnIssue(installationId: number, repositoryId: number, repository: string, issue: number, body: string) {
+  const settings = await loadSettings();
+  if (!settings) throw new Error('the App settings are unavailable');
+  const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId,
+    { repositoryIds: [repositoryId], permissions: { issues: 'write' } });
+  await github.createIssueComment(token, repository, issue, body);
+}
+
+/** A parked Claude job whose wait came to need a sign-in gets its one comment then (#176). */
+const notifyWaitingClaude = nativeWorker.managed && nativeWorker.resolveNative ? createWaitingNotifier({
+  tenants: store, sessions: nativeWorker.managed.sessions, resolveNative: nativeWorker.resolveNative, workflows,
+  ...(env.CLAUDE_CONSOLE_ORIGIN ? { consoleOrigin: env.CLAUDE_CONSOLE_ORIGIN } : {}),
+  comment: (job, body) => commentOnIssue(job.request.installationId, job.subject.repositoryId, job.subject.repository, job.subject.issue, body),
+}) : undefined;
+
 const putEvent = async (key: string, body: string) => {
   await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: key, Body: body, ContentType: 'application/json' }));
 };
@@ -154,23 +171,28 @@ function launcher(): Launcher | undefined {
         const id = waitingId(request.installationId, request.deliveryId);
         return (await nativeWorker.managed!.sessions.get(request.installationId, id))?.id;
       },
-      async waitForClaude(request, repository, repositoryId, issue, reason) {
+      async waitForClaude(request, repository, repositoryId, issue, reason, retirement) {
         const { installationId, deliveryId, eventName, appBot } = request;
         const id = waitingId(installationId, deliveryId);
         const eventKey = `tenants/${installationId}/events/claude-wait/${id}.json`;
         await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: eventKey, Body: request.body, Tagging: 'updraft-retention=claude-wait' }));
-        const waiting = await nativeWorker.managed!.sessions.park({ installationId, deliveryId, eventName, appBot }, eventKey);
-        if (waiting.created && env.CLAUDE_CONSOLE_ORIGIN) {
+        const sessions = nativeWorker.managed!.sessions;
+        const waiting = await sessions.park({ installationId, deliveryId, eventName, appBot }, eventKey, Date.now(), { repository, repositoryId, issue });
+        // Only a wait a person must end (a sign-in) is commented on now; one that ends by itself is
+        // not, and gets its notice later only if it comes to need a sign-in (waiting-notice.ts, #176).
+        let comment: string | undefined;
+        try {
+          if (env.CLAUDE_CONSOLE_ORIGIN) comment = waitingComment(new URL(`/installations/${installationId}/claude?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN).href, reason, retirement);
+        } catch { comment = undefined; }
+        const at = Date.now();
+        if (waiting.created && comment && await sessions.claimNotice(installationId, waiting.id, at)) {
           try {
-            const settings = await loadSettings();
-            if (settings) {
-              const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId,
-                { repositoryIds: [repositoryId], permissions: { issues: 'write' } });
-              const url = new URL(`/installations/${installationId}/claude?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN);
-              await github.createIssueComment(token, repository, issue,
-                waitingComment(url.href, reason));
-            }
-          } catch (error) { console.error(JSON.stringify({ claudeWaiting: 'issue comment failed', name: (error as Error)?.name })); }
+            await commentOnIssue(installationId, repositoryId, repository, issue, comment);
+          } catch (error) {
+            // A comment GitHub will never take keeps its claim; only a passing failure is retried later.
+            if (!commentCanNeverPost(error)) await sessions.releaseNotice(installationId, waiting.id, at).catch(() => undefined);
+            console.error(JSON.stringify({ claudeWaiting: 'issue comment failed', name: (error as Error)?.name }));
+          }
         }
         return waiting.id;
       },
@@ -436,11 +458,16 @@ export async function handler(
     const report = await reconcileWorkflows();
     // Labeled issues whose delivery never came (workflows/label-scan.ts): reported, never started.
     const labels = !(await killSwitch.engaged()) ? await scanLabels() : { tenants: 0, flagged: 0, failed: 0 };
+    // Parked Claude jobs whose wait now needs a sign-in: one comment each (native/waiting-notice.ts).
+    const notices = notifyWaitingClaude ? await notifyWaitingClaude() : { tenants: 0, noticed: 0, unpostable: 0, failed: 0 };
     const combined = { ...report, labels };
     // Metrics first, whatever follows: a failing run is what the alarms look for.
     console.log(reconcileMetricsLine(report, labels, Date.now()));
+    console.log(JSON.stringify({ claudeWaitingNotices: notices }));
     // The next run (five minutes on) retries what failed; fail this one so alarms see it.
-    if (report.failed > 0 || labels.failed > 0) throw new Error(`workflow reconciliation failed for ${report.failed} workflow(s) and ${labels.failed} tenant label scan(s)`);
+    if (report.failed > 0 || labels.failed > 0 || notices.failed > 0) {
+      throw new Error(`workflow reconciliation failed for ${report.failed} workflow(s), ${labels.failed} tenant label scan(s) and ${notices.failed} Claude sign-in notice(s)`);
+    }
     return combined;
   }
   if ('action' in event) {

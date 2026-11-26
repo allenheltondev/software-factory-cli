@@ -128,14 +128,17 @@ export function createWorkflowRecorder(o: {
     /**
      * A delivery that starts no job yet because it waits for a person (a Claude sign-in): the
      * workflow waits, with why and what to do, and is blocked if no one acts (SIGN_IN_LIMIT_MS).
+     * `code` is the specific cause on the timeline event, such as which retirement ended the
+     * Claude session (`claude_session_idle`, #176).
      */
-    waiting: (job: Omit<JobRef, 'jobId'> & { jobId?: string }, why: { reason: string; message: string; nextAction: string }) =>
+    waiting: (job: Omit<JobRef, 'jobId'> & { jobId?: string }, why: { reason: string; message: string; nextAction: string; code?: string }) =>
       safely('wait', { ...job, jobId: job.jobId ?? 'pending' }, async () => {
         const id = await workflowOfJob(o.store, { ...job, jobId: job.jobId ?? 'pending' });
         if (!id) return;
         const at = now();
         if (job.jobId) await o.store.linkJob(job.installationId, job.jobId, id);
-        await updateWorkflow(o.store, job.installationId, id, (w) => onJobWaiting(w ?? newWorkflow(job, id, at), job, why, at));
+        const { code, ...state } = why;
+        await updateWorkflow(o.store, job.installationId, id, (w) => withEvent(onJobWaiting(w ?? newWorkflow(job, id, at), job, state, at), code ? { reason: code } : {}));
       }),
     /** A delivery waits in the admission queue for capacity (jobs/queue.ts), under its job's stable id. */
     queued: (job: JobRef, why: { reason: string; message: string; code?: string }) =>

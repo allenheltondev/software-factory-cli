@@ -65,14 +65,29 @@ function evidenceText(e: EvidenceRef, repoUrl: string | null, headSha: string): 
   }
 }
 
+const MARKER = /^\s*(?:[-*+]|\d{1,3}[.)])\s+/;
+
+/**
+ * A criterion's text on one line: its first line, then its sub-points as a compact numbered list,
+ * "Unit tests cover: (1) ordering; (2) filtering". Inert like any untrusted text.
+ */
+export function criterionLine(text: string, max = 600): string {
+  const [first = '', ...rest] = text.split('\n');
+  const points = rest.map((l) => l.replace(MARKER, '').trim()).filter(Boolean);
+  if (!points.length) return plain(first, max);
+  const list = points.map((p, i) => `(${i + 1}) ${p}${i < points.length - 1 && !/[;,.:]$/.test(p) ? ';' : ''}`).join(' ');
+  return plain(`${first.trim()} ${list}`, max);
+}
+
 function row(r: CriterionAssessment, repoUrl: string | null, headSha: string): string[] {
   const tags = [
     ...(r.mandatory ? [] : ['optional']),
     ...(r.gate === 'live' ? ['live validation'] : []),
     ...(r.origin === 'inferred' ? ['inferred by the reviewer'] : r.origin === 'steering' ? ['from a change request'] : []),
     ...(r.checkedInSource ? ['ticked in the issue, not evidence'] : []),
+    ...(r.context ? [`under: ${plain(r.context, 80)}`] : []),
   ];
-  const lines = [`- **${STATUS_WORDS[r.status]}** · ${code(r.id)} · ${plain(r.text)}${tags.length ? ` (${tags.join('; ')})` : ''}`];
+  const lines = [`- **${STATUS_WORDS[r.status]}** · ${code(r.id)} · ${criterionLine(r.text)}${tags.length ? ` (${tags.join('; ')})` : ''}`];
   if (r.evidence.length) lines.push(`  - Evidence (the reviewer's references): ${r.evidence.map((e) => evidenceText(e, repoUrl, headSha)).join(', ')}`);
   if (r.note) lines.push(`  - Review agent: ${plain(r.note, 600)}`);
   if (r.claimed && r.claimed !== r.status) lines.push(`  - Updraft: the reviewer called it ${STATUS_WORDS[r.claimed].toLowerCase()}; ${r.notes.map((n) => plain(n, 300)).join('; ')}`);

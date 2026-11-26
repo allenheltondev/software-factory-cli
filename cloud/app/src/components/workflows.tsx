@@ -223,6 +223,51 @@ export function waitedLabel(w: NonNullable<WorkflowEvent['waited']>): string {
   return `After waiting ${formatDuration(w.seconds)} for ${WAIT[w.for] ?? w.for.replace(/_/g, ' ')}`;
 }
 
+/** Why a Claude session was retired (`claude_session_<reason>`, #176). */
+const CLAUDE_SESSION: Record<string, string> = {
+  reconnect: 'an owner reconnected it',
+  idle: 'it was idle for its whole idle limit',
+  lifetime: 'it reached its maximum lifetime',
+  vm_ended: 'its VM stopped running before its lifetime ended',
+  expired: 'its VM ended or it reached its maximum lifetime',
+  suspended: 'its VM was suspended',
+  worker_lost: 'its worker stopped answering',
+  disabled: 'an operator paused Claude connections',
+  startup_failed: 'it never became ready',
+  image_revoked: 'its image was revoked',
+  image_blocked: 'its image was no longer approved',
+  retired: 'it was retired',
+};
+/** Why the Claude environment cannot run the job (`claude_<readiness>`). */
+const CLAUDE_READINESS: Record<string, string> = {
+  not_connected: 'Claude is not connected yet',
+  auth_required: 'Claude needs a sign-in',
+  expired: 'the Claude sign-in expired',
+  environment_suspended: 'the Claude session ended: its VM was suspended',
+  environment_ended: 'the Claude session ended: its VM stopped running',
+  fenced: 'the Claude session was stopped',
+  worker_lost: 'the Claude session ended: its worker stopped answering',
+  startup_failed: 'the Claude session never became ready',
+  image_draining: "the Claude session's image is being retired",
+  image_revoked: "the Claude session's image was revoked",
+  image_unapproved: "the Claude session's image is no longer approved",
+  protocol_incompatible: "the Claude session's image is no longer compatible",
+};
+
+/** A Claude wait's reason code in words, or undefined for any other code. */
+export function reasonLabel(code: string): string | undefined {
+  // `_uncommented`: the sign-in notice could never be posted on the issue (GitHub refused it for good).
+  const uncommented = code.endsWith('_uncommented');
+  const base = uncommented ? code.slice(0, -'_uncommented'.length) : code;
+  const suffix = uncommented ? '; GitHub would not take the comment asking for it, so sign in from Updraft' : '';
+  if (base === 'claude_sign_in') return uncommented ? `Claude needs a sign-in${suffix}` : undefined;
+  const session = /^claude_session_([a-z_]+)$/.exec(base)?.[1];
+  if (session) return `The Claude session ended because ${CLAUDE_SESSION[session] ?? session.replace(/_/g, ' ')}; a new one needs a sign-in${suffix}`;
+  const readiness = /^claude_([a-z_]+)$/.exec(base)?.[1];
+  const words = readiness ? CLAUDE_READINESS[readiness] : undefined;
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) + suffix : undefined;
+}
+
 /** The route a job ran on: its tier (and the tier first chosen, after an escalation), pool and why. */
 export function routingLabel(r: NonNullable<WorkflowEvent['routing']>): string {
   const parts = [
@@ -335,7 +380,7 @@ export function WorkflowTimeline({ events, base, repository, jobRetentionDays, n
                     {e.message && <p className="text-sm">{e.message}</p>}
                     {e.reason && (e.kind === 'blocked' || e.kind === 'waiting' || e.kind === 'admitted') && (
                       <p className="text-xs text-muted-foreground">
-                        Reason code: <code>{e.reason}</code>
+                        {reasonLabel(e.reason) ? `${reasonLabel(e.reason)}. ` : ''}Reason code: <code>{e.reason}</code>
                       </p>
                     )}
                   </li>

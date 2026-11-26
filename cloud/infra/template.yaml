@@ -370,6 +370,11 @@ Resources:
               - lambda:CreateMicrovmAuthToken
               - lambda:TerminateMicrovm
             Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}
+          # Read-only: pruning keeps every version a live Claude session's microVM runs (#176).
+          # Listing microVMs is not scoped to an image resource; without it nothing is pruned.
+          - Effect: Allow
+            Action: lambda:ListMicrovms
+            Resource: '*'
           - Effect: Allow
             Action: [dynamodb:GetItem, dynamodb:PutItem]
             Resource: !GetAtt UpdraftTable.Arn

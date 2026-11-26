@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import { cloudConfig, runnerEnvironment, startCloudWorker } from '../native-worker/cloud.mjs';
+import { cloudConfig, runnerEnvironment, startCloudWorker, TRANSIENT_BUDGET_MS } from '../native-worker/cloud.mjs';
+import { brokerResponse, transientInvokeError } from '../image/runner/worker-control.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
 import { nativeConfig, NATIVE_RUNTIME } from '../image/runner/native-config.mjs';
 import { checkAgentConfig, SANDBOX_RUNTIME, SANDBOX_IMAGE } from '../image/runner/isolation.mjs';
@@ -239,13 +240,147 @@ describe('root subscription worker Cloud loop', () => {
     await worker.done;
     expect(heartbeats).toBe(1);
   });
-  it('bounds a stuck heartbeat and stops execution without waiting for the transport', async () => {
+  it('bounds a stuck heartbeat and stops execution once its retry budget is spent, without waiting for the transport', async () => {
     const child = fakeChild();
+    let heartbeats = 0;
     const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
-      interval: 5, callTimeout: 5, launch: () => child,
-      call: async (p) => p.op === 'heartbeat' ? new Promise(() => {}) : { ok: true, ...(p.op === 'poll' ? { request: { payload: {} } } : {}) },
+      interval: 5, callTimeout: 5, transientBudget: 40, maxBackoff: 10, launch: () => child,
+      call: async (p) => p.op === 'heartbeat' ? (heartbeats++, new Promise(() => {})) : { ok: true, ...(p.op === 'poll' ? { request: { payload: {} } } : {}) },
     });
     await worker.done;
+    expect(heartbeats).toBeGreaterThan(1);
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+});
+
+// #176: a backend redeploy (a throttled, cold, or updating broker) must not end a healthy session.
+describe('transient broker failures', () => {
+  const flaky = (message = 'worker broker unavailable') => Object.assign(new Error(message), { transient: true });
+  it('keeps polling through transient poll failures, then runs the next assignment on the same session', async () => {
+    const ops = []; const sessions = new Set(); let polls = 0;
+    const launch = vi.fn(() => { const child = fakeChild(); globalThis.queueMicrotask(() => child.emit('close')); return child; });
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, maxBackoff: 10, launch,
+      call: async (p) => {
+        ops.push(p.op); sessions.add(p.session);
+        if (p.op === 'poll') {
+          polls++;
+          if (polls <= 3) throw flaky();
+          if (polls === 4) return { ok: true, request: { payload: { jobId: 'job-after-deploy' } } };
+        }
+        return { ok: true, busy: false };
+      },
+    });
+    await until(() => polls >= 5);
+    await worker.close();
+    expect(launch.mock.calls.map(([r]) => r.payload.jobId)).toEqual(['job-after-deploy']);
+    expect(ops.slice(0, 7)).toEqual(['register', 'poll', 'poll', 'poll', 'poll', 'heartbeat', 'settled']);
+    expect(sessions.size).toBe(1);
+  });
+  // Within its 60 s assignment lease (control.ts WORKER_LEASE_MS): a longer gap lets Cloud fence
+  // the assignment, and the next heartbeat's refusal stops the job.
+  it('keeps a running job through a short transient heartbeat gap, within its lease, and settles it normally', async () => {
+    const child = fakeChild(); let polls = 0; let heartbeats = 0; let settled = false;
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, maxBackoff: 10, launch: () => child,
+      call: async (p) => {
+        if (p.op === 'poll') return ++polls === 1 ? { ok: true, request: { payload: {} } } : { ok: true, busy: false };
+        if (p.op === 'heartbeat') {
+          if (++heartbeats <= 2) throw flaky('worker control request timed out');
+          if (heartbeats === 3) globalThis.queueMicrotask(() => child.emit('close'));
+          return { ok: true, busy: true, cancel: false };
+        }
+        if (p.op === 'settled') settled = true;
+        return { ok: true, busy: false };
+      },
+    });
+    await until(() => polls >= 2);
+    await worker.close();
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(settled).toBe(true);
+  });
+  it.each([
+    ['a refusal', () => new Error('worker broker refused request')],
+    ['an unclassified failure', () => new Error('offline')],
+  ])('stops for good on %s, at once', async (_name, error) => {
+    const ops = [];
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, call: async (p) => { ops.push(p.op); if (p.op === 'poll') throw error(); return { ok: true }; },
+    });
+    await worker.done;
+    expect(ops).toEqual(['register', 'poll']);
+  });
+  it('stops an idle worker once transient failures outlast the two-minute budget, which is shorter than Cloud\'s worker-lost grace', async () => {
+    let clock = 0; let polls = 0;
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, maxBackoff: 5, now: () => clock,
+      call: async (p) => { if (p.op === 'poll') { polls++; clock += 50_000; throw flaky(); } return { ok: true }; },
+    });
+    await worker.done;
+    // Failing since the first poll: 50 s, 100 s within two minutes; 150 s is past it.
+    expect(polls).toBe(4);
+    expect(TRANSIENT_BUDGET_MS).toBeLessThan(3 * 60_000);
+  });
+  it('stops a running job once a heartbeat retried past its lease is refused', async () => {
+    const child = fakeChild(); let heartbeats = 0;
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, maxBackoff: 5, launch: () => child,
+      call: async (p) => {
+        if (p.op === 'poll') return { ok: true, request: { payload: {} } };
+        if (p.op === 'heartbeat') {
+          if (++heartbeats <= 2) throw flaky();
+          throw new Error('worker broker refused request'); // the expired lease was fenced
+        }
+        return { ok: true };
+      },
+    });
+    await worker.done;
+    expect(heartbeats).toBe(3);
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+  });
+  it('never retries an uncertain settlement, even a transient one', async () => {
+    const child = fakeChild(); const ops = [];
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, launch: () => { globalThis.queueMicrotask(() => child.emit('close')); return child; },
+      call: async (p) => {
+        ops.push(p.op);
+        if (p.op === 'settled') throw flaky();
+        return { ok: true, ...(p.op === 'poll' ? { request: { payload: {} } } : {}) };
+      },
+    });
+    await worker.done;
+    expect(ops).toEqual(['register', 'poll', 'heartbeat', 'settled']);
+  });
+});
+
+describe('broker invocation classification', () => {
+  it('marks transport faults transient and refusals final', () => {
+    for (const error of [
+      Object.assign(new Error('t'), { name: 'TimeoutError' }), Object.assign(new Error('t'), { name: 'TooManyRequestsException' }),
+      Object.assign(new Error('t'), { name: 'ResourceConflictException' }), Object.assign(new Error('t'), { $metadata: { httpStatusCode: 503 } }),
+      Object.assign(new Error('t'), { code: 'ECONNRESET' }),
+    ]) expect(transientInvokeError(error)).toBe(true);
+    for (const error of [
+      Object.assign(new Error('t'), { name: 'AccessDeniedException', $metadata: { httpStatusCode: 403 } }),
+      Object.assign(new Error('t'), { name: 'ResourceNotFoundException', $metadata: { httpStatusCode: 404 } }), new Error('t'), null,
+    ]) expect(transientInvokeError(error)).toBe(false);
+    expect(() => brokerResponse({ FunctionError: 'Unhandled' })).toThrow(expect.objectContaining({ transient: true }));
+    const refused = (() => { try { brokerResponse({ Payload: Buffer.from(JSON.stringify({ ok: false })) }); } catch (e) { return e; } })();
+    expect(refused.message).toBe('worker broker refused request');
+    expect(refused.transient).toBeUndefined();
+    expect(() => brokerResponse({ Payload: Buffer.from('not json') })).toThrow();
+    expect(brokerResponse({ Payload: Buffer.from(JSON.stringify({ ok: true, busy: false })) })).toEqual({ ok: true, busy: false });
+  });
+  it("treats the broker handler's own failure ('unavailable') as transient for a poll or heartbeat only, never a settlement", () => {
+    const unavailable = { Payload: Buffer.from(JSON.stringify({ ok: false, error: 'unavailable' })) };
+    const thrown = (op) => { try { brokerResponse(unavailable, op); } catch (e) { return e; } return undefined; };
+    for (const op of ['poll', 'heartbeat']) expect(thrown(op)).toMatchObject({ transient: true });
+    for (const op of ['settled', 'register', 'cancel', undefined]) {
+      expect(thrown(op).message).toBe('worker broker refused request');
+      expect(thrown(op).transient).toBeUndefined();
+    }
+    // A plain refusal of a poll stays final.
+    const refusedPoll = (() => { try { brokerResponse({ Payload: Buffer.from(JSON.stringify({ ok: false })) }, 'poll'); } catch (e) { return e; } })();
+    expect(refusedPoll.transient).toBeUndefined();
   });
 });
