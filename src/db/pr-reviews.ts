@@ -5,7 +5,7 @@
 //
 // The PRs are the rows of revision_prs (src/db/revisions.ts): one row per PR Updraft opened,
 // shared with the revision loop. The columns this module owns were added by migration 11.
-import { countOpenThreads, openThreads } from './review-findings.js';
+import { countOpenThreads, openSuggestions, openThreads } from './review-findings.js';
 import { allowedActorsFor, reviewActive, reviewPoolFor, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import {
   ENVELOPE_SCHEMA_VERSION,
@@ -38,6 +38,8 @@ const MAX_CHANGE_REQUESTS = 5;
 export type MergeState = 'waiting' | 'merging' | 'merged' | 'blocked';
 /** The CI step for one head: waiting for checks, passed, a fix was queued, or a person has to act. */
 export type CiState = 'waiting' | 'passed' | 'fixing' | 'blocked';
+/** The suggestion step for one head: its suggestion revision is on its way, or every open suggestion was answered. */
+export type SuggestState = 'fixing' | 'settled';
 
 /** A watched PR with what the review loop knows about it. */
 export interface LoopPr extends RevisionPr {
@@ -79,6 +81,15 @@ export interface LoopPr extends RevisionPr {
   ciCommentId: number | null;
   ciCommentUrl: string | null;
   ciCommentAttempts: number;
+  /** The suggestion step (repositories.<repo>.review.suggestions) for the head `suggestSha`; null when it was not looked at yet. */
+  suggestState: SuggestState | null;
+  suggestSha: string | null;
+  suggestReason: string | null;
+  suggestJobId: string | null;
+  suggestAttempts: number;
+  /** The pull request's one follow-up issue for suggestions left open, once filed. */
+  suggestIssueNumber: number | null;
+  suggestIssueUrl: string | null;
 }
 
 interface LoopPrRow extends RevisionPrRow {
@@ -114,6 +125,13 @@ interface LoopPrRow extends RevisionPrRow {
   ci_comment_id: number | null;
   ci_comment_url: string | null;
   ci_comment_attempts: number;
+  suggest_state: SuggestState | null;
+  suggest_sha: string | null;
+  suggest_reason: string | null;
+  suggest_job_id: string | null;
+  suggest_attempts: number | null;
+  suggest_issue_number: number | null;
+  suggest_issue_url: string | null;
 }
 
 function rowToLoopPr(r: LoopPrRow): LoopPr {
@@ -151,6 +169,13 @@ function rowToLoopPr(r: LoopPrRow): LoopPr {
     ciCommentId: r.ci_comment_id,
     ciCommentUrl: r.ci_comment_url,
     ciCommentAttempts: r.ci_comment_attempts,
+    suggestState: r.suggest_state ?? null,
+    suggestSha: r.suggest_sha ?? null,
+    suggestReason: r.suggest_reason ?? null,
+    suggestJobId: r.suggest_job_id ?? null,
+    suggestAttempts: r.suggest_attempts ?? 0,
+    suggestIssueNumber: r.suggest_issue_number ?? null,
+    suggestIssueUrl: r.suggest_issue_url ?? null,
   };
 }
 
@@ -699,10 +724,11 @@ export function markReadyRecorded(db: Db, repoId: number, prNumber: number, now?
  * Open PRs whose newest verdict is ready-to-merge for their current head and whose merge has not
  * settled for that head: not looked at, waiting for checks, or sent with an unknown result.
  */
-export function listMergeCandidates(db: Db, repoId: number, opts: { requireCi?: boolean } = {}): LoopPr[] {
+export function listMergeCandidates(db: Db, repoId: number, opts: { requireCi?: boolean; requireSuggestions?: boolean } = {}): LoopPr[] {
   // With the CI step on, a head is not a candidate before its checks passed there: a failure is
-  // the CI step's to fix, not the merge's to refuse for good.
-  const ci = opts.requireCi ? "AND ci_sha = head_sha AND ci_state = 'passed'" : '';
+  // the CI step's to fix, not the merge's to refuse for good. With the suggestion step on, not
+  // before its suggestions were settled: a suggestion revision on its way replaces the head.
+  const ci = `${opts.requireCi ? "AND ci_sha = head_sha AND ci_state = 'passed'" : ''} ${opts.requireSuggestions ? SUGGESTIONS_SETTLED : ''}`;
   return (
     db
       .prepare(
@@ -817,13 +843,14 @@ export function recordMergeNotice(
  * Open PRs whose newest verdict is ready-to-merge for their current head and whose CI step has
  * not settled for that head: not looked at, or waiting for checks.
  */
-export function listCiCandidates(db: Db, repoId: number): LoopPr[] {
+export function listCiCandidates(db: Db, repoId: number, opts: { requireSuggestions?: boolean } = {}): LoopPr[] {
+  // With the suggestion step on, the checks of a head are read once its suggestions are settled.
   return (
     db
       .prepare(
         `SELECT * FROM revision_prs
          WHERE repo_id = ? AND state = 'open' AND verdict = 'ready-to-merge' AND head_sha IS NOT NULL AND verdict_sha = head_sha
-           AND (ci_sha IS NULL OR ci_sha != head_sha OR ci_state IS NULL OR ci_state = 'waiting')
+           AND (ci_sha IS NULL OR ci_sha != head_sha OR ci_state IS NULL OR ci_state = 'waiting') ${opts.requireSuggestions ? SUGGESTIONS_SETTLED : ''}
          ORDER BY pr_number`,
       )
       .all(repoId) as unknown as LoopPrRow[]
@@ -937,6 +964,90 @@ export function recordCiNotice(
   }
 }
 
+// ---------------------------------------------------------------------------
+// The suggestion step (repositories.<repo>.review.suggestions, src/publish/suggestions.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * SQL: nothing about suggestions holds the PR's current head back: no suggestion revision for it
+ * is on its way (or has ended without the step having answered for it), and the step settled the
+ * head or the pull request has no open suggestion to settle (openSuggestions, in SQL).
+ */
+const SUGGESTIONS_SETTLED = `AND NOT coalesce(suggest_sha = head_sha AND suggest_state = 'fixing', 0)
+  AND (coalesce(suggest_sha = head_sha AND suggest_state = 'settled', 0)
+    OR NOT EXISTS (SELECT 1 FROM review_findings f WHERE f.repo_id = revision_prs.repo_id AND f.pr_number = revision_prs.pr_number
+                     AND f.thread_key = f.finding_key AND f.severity = 'suggestion' AND f.settled_as IS NULL
+                     AND (f.status != 'verified' OR (f.comment_id IS NOT NULL AND f.thread_resolved_at IS NULL))))`;
+
+/**
+ * Open PRs whose newest verdict is ready-to-merge for their current head and whose suggestion
+ * step has not settled that head: not looked at, or its suggestion revision is on its way.
+ */
+export function listSuggestionCandidates(db: Db, repoId: number): LoopPr[] {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM revision_prs
+         WHERE repo_id = ? AND state = 'open' AND verdict = 'ready-to-merge' AND head_sha IS NOT NULL AND verdict_sha = head_sha
+           AND (suggest_sha IS NULL OR suggest_sha != head_sha OR suggest_state IS NULL OR suggest_state = 'fixing')
+         ORDER BY pr_number`,
+      )
+      .all(repoId) as unknown as LoopPrRow[]
+  ).map(rowToLoopPr);
+}
+
+/**
+ * Point the PR's suggestion columns at `sha`, clearing what was recorded for an earlier head. The
+ * follow-up issue spans heads and stays. No-op when they are already about `sha`.
+ */
+export function startSuggestionsFor(db: Db, repoId: number, prNumber: number, sha: string, now?: () => number): void {
+  db.prepare(
+    `UPDATE revision_prs SET suggest_sha = ?, suggest_state = NULL, suggest_reason = NULL, suggest_job_id = NULL, suggest_attempts = 0, updated_at = ?
+     WHERE repo_id = ? AND pr_number = ? AND (suggest_sha IS NULL OR suggest_sha != ?)`,
+  ).run(sha, nowIso(now), repoId, prNumber, sha);
+}
+
+export type SuggestStep =
+  /** The suggestion revision `jobId` was queued for the head. */
+  | { state: 'fixing'; reason: string; jobId: string }
+  | { state: 'settled'; reason: string };
+
+/**
+ * Record a step of the suggestion step for `sha`. A head that is fixing only ever settles; a
+ * settled one is final for that head. Returns whether it changed the row.
+ */
+export function setSuggestState(db: Db, repoId: number, prNumber: number, sha: string, s: SuggestStep, now?: () => number): boolean {
+  const at = nowIso(now);
+  const where = `repo_id = ? AND pr_number = ? AND suggest_sha = ? AND (suggest_state IS NULL${s.state === 'settled' ? " OR suggest_state = 'fixing'" : ''})`;
+  const res =
+    s.state === 'fixing'
+      ? db.prepare(`UPDATE revision_prs SET suggest_state = 'fixing', suggest_reason = ?, suggest_job_id = ?, updated_at = ? WHERE ${where}`).run(s.reason, s.jobId, at, repoId, prNumber, sha)
+      : db.prepare(`UPDATE revision_prs SET suggest_state = 'settled', suggest_reason = ?, updated_at = ? WHERE ${where}`).run(s.reason, at, repoId, prNumber, sha);
+  return Number(res.changes) > 0;
+}
+
+/** One failed attempt to settle `sha`; returns the attempts so far. */
+export function noteSuggestAttempt(db: Db, repoId: number, prNumber: number, sha: string, reason: string, now?: () => number): number {
+  db.prepare('UPDATE revision_prs SET suggest_attempts = suggest_attempts + 1, suggest_reason = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND suggest_sha = ?').run(
+    reason,
+    nowIso(now),
+    repoId,
+    prNumber,
+    sha,
+  );
+  return getLoopPr(db, repoId, prNumber)?.suggestAttempts ?? 0;
+}
+
+/** The recorded follow-up issue is gone, closed or taken up (labelled): the next deferral opens a new one. */
+export function clearSuggestIssue(db: Db, repoId: number, prNumber: number, now?: () => number): void {
+  db.prepare('UPDATE revision_prs SET suggest_issue_number = NULL, suggest_issue_url = NULL, updated_at = ? WHERE repo_id = ? AND pr_number = ?').run(nowIso(now), repoId, prNumber);
+}
+
+/** The pull request's follow-up issue, once it was filed (or found by its marker). */
+export function recordSuggestIssue(db: Db, repoId: number, prNumber: number, issue: { number: number; url: string }, now?: () => number): void {
+  db.prepare('UPDATE revision_prs SET suggest_issue_number = ?, suggest_issue_url = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ?').run(issue.number, issue.url, nowIso(now), repoId, prNumber);
+}
+
 /** A revision job of the PR that is queued or running, whatever asked for it, except the one for `exceptReviewId`; or null. */
 export function activeRevisionJob(db: Db, repoId: number, prNumber: number, exceptReviewId?: string): string | null {
   const row = db
@@ -977,7 +1088,7 @@ const short = (sha: string | null) => (sha ? sha.slice(0, 12) : '?');
  * Where a watched PR stands in the loop, from local state alone. `maxRevisions` is the
  * repository's limit. Stages and their transitions are listed in docs/review-loop.md.
  */
-export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: boolean } = {}): PrStageInfo {
+export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: boolean; suggestions?: boolean } = {}): PrStageInfo {
   if (pr.mergeState === 'merged') return { stage: 'merged', detail: `merged by Updraft at ${pr.mergedAt ?? '?'} (head ${short(pr.mergeSha)})` };
   if (pr.state === 'closed') return { stage: 'closed', detail: 'closed or merged on GitHub; no longer watched' };
 
@@ -998,6 +1109,7 @@ export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: b
   const revising = revisionJobs.find((j) => j.status === 'running');
   if (revising) {
     if (revising.id === pr.ciFixJobId) return { stage: 'fixing-ci', detail: `revision job ${revising.id} is fixing the failed checks (${round})` };
+    if (revising.id === pr.suggestJobId) return { stage: 'revising', detail: `revision job ${revising.id} is applying the review's suggestions (${round})` };
     return { stage: 'revising', detail: `revision job ${revising.id} is running (${round})` };
   }
   if (push && (push.state === 'publishing' || (push.state === 'failed' && push.retryable === 1))) {
@@ -1008,6 +1120,7 @@ export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: b
   const queuedRevision = revisionJobs.find((j) => j.status === 'queued');
   if (queuedRevision) {
     if (queuedRevision.id === pr.ciFixJobId) return { stage: 'fixing-ci', detail: `checks failed on ${short(pr.ciSha)}; ${round}; revision job ${queuedRevision.id} is queued` };
+    if (queuedRevision.id === pr.suggestJobId) return { stage: 'revising', detail: `${short(pr.suggestSha)} was found ready with suggestions; ${round}; revision job ${queuedRevision.id} is queued for them` };
     return { stage: 'changes-requested', detail: `${round}; revision job ${queuedRevision.id} is queued` };
   }
   const queuedReview = reviewJobs.find((j) => j.status === 'queued');
@@ -1023,6 +1136,12 @@ export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: b
     : undefined;
 
   if (pr.verdictSha === pr.headSha && pr.verdict === 'ready-to-merge') {
+    if (opts.suggestions && (pr.suggestSha !== pr.headSha || pr.suggestState !== 'settled') && ((pr.suggestSha === pr.headSha && pr.suggestState === 'fixing') || openSuggestions(db, pr.repoId, pr.prNumber, 1).length)) {
+      if (pr.suggestSha === pr.headSha && pr.suggestState === 'fixing') {
+        return { stage: 'revising', detail: `${head} was found ready; the revision for its suggestions (job ${pr.suggestJobId ?? '?'}) has ended, and its suggestions are being answered` };
+      }
+      return { stage: 'ready-to-merge', detail: `${head} was found ready; its suggestions are being answered before ${opts.ci ? 'its checks are read' : 'anything else'}` };
+    }
     if (opts.ci) {
       const ci = pr.ciSha === pr.headSha ? pr.ciState : null;
       if (ci === null) return { stage: 'waiting-for-ci', detail: `${head} was found ready; its checks have not been looked at yet` };

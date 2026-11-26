@@ -1,7 +1,7 @@
 // OWNER: queue/worker workstream. Claim-side persistence: atomic claims, runs,
 // leases, retry, and status queries.
 import { join } from 'node:path';
-import { ciSettings, DEFAULT_MAX_REVISIONS, reviewPoolFor, reviewSettings, workflowId, type UpdraftConfig } from '../config/schema.js';
+import { ciSettings, DEFAULT_MAX_REVISIONS, suggestionsActive, reviewPoolFor, reviewSettings, workflowId, type UpdraftConfig } from '../config/schema.js';
 import { recordError, rowToJob, rowToRun, transaction, type Db, type JobRow, type RunRow } from './database.js';
 import { reviewOf, type Job, type JobStatus, type Publication, type Revision, type Run, type RunContainer, type RunOutcome, type RunSummary } from '../types.js';
 import { listRecentFailureComments, type FailureComment } from './failure-comments.js';
@@ -890,7 +890,7 @@ export function getStatusSnapshot(db: Db, config: UpdraftConfig, now?: () => num
     // Only where the review loop is configured: without it a watched PR has no stage to speak of.
     pullRequests: listRecentLoopPrs(db, 20).flatMap((pr) => {
       const repo = Object.values(config.repositories).find((r) => r.id === pr.repoId);
-      return repo && reviewSettings(repo).enabled ? [{ pr, stage: prStage(db, pr, repo.maxRevisions ?? DEFAULT_MAX_REVISIONS, { ci: ciSettings(config, repo) !== null }) }] : [];
+      return repo && reviewSettings(repo).enabled ? [{ pr, stage: prStage(db, pr, repo.maxRevisions ?? DEFAULT_MAX_REVISIONS, { ci: ciSettings(config, repo) !== null, suggestions: suggestionsActive(config, repo) }) }] : [];
     }),
     reviews: listRecentPrReviews(db, 10),
     // Only where capacity or escalation policy is in use (or has ever acted); otherwise absent.

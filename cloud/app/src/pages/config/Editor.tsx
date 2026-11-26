@@ -220,6 +220,7 @@ function RepositoriesSection({ config, onChange, view, errors, onAskAutoMerge, g
                             onChange={(allowedActors) => patch(name, { allowedActors })}
                           />
                         )}
+                        <Suggestions name={name} repo={repo} reviewed={reviews(config, repo)} errors={errors} patch={(p) => patch(name, p)} />
                         <CiRepair name={name} repo={repo} reviewed={reviews(config, repo)} revised={revises(config, repo)} maxRevisions={firstRevise(config, repo)} errors={errors} ceiling={ceilings.ciWaitMinutes ?? ceilings.autoMergeWaitMinutes} patch={(p) => patch(name, p)} />
                         <AutoMerge name={name} repo={repo} reviewed={reviews(config, repo)} errors={errors} ceiling={ceilings.autoMergeWaitMinutes} patch={(p) => patch(name, p)} onAsk={() => onAskAutoMerge(name)} />
                       </div>
@@ -241,6 +242,29 @@ export const firstRevise = (config: ConsoleConfig, repo: ConsoleRepository) => c
 const checkList = (t: string) => t.split(',').map((s) => s.trim()).filter(Boolean);
 
 /** CI as part of the review loop (repositories.R.ciFix): off, or on with optional check filters and a wait. */
+/**
+ * What happens to the review agent's non-blocking suggestions on a pull request it found ready
+ * (the CLI's review.suggestions, #174). Address, the default, is stored as nothing.
+ */
+export function Suggestions({ name, repo, reviewed, errors, patch }: { name: string; repo: ConsoleRepository; reviewed: boolean; errors: ConfigIssue[]; patch: (p: Partial<ConsoleRepository>) => void }) {
+  if (!reviewed) return null;
+  return (
+    <Select
+      label="Review suggestions"
+      value={repo.suggestions ?? 'address'}
+      error={issuesAt(errors, `repositories.${name}.suggestions`)}
+      onChange={(e) => {
+        const suggestions = e.target.value as NonNullable<ConsoleRepository['suggestions']>;
+        patch({ suggestions: suggestions === 'address' ? undefined : suggestions });
+      }}
+    >
+      <option value="address">Address: one revision applies the ones the coding agent agrees with; the rest go into one follow-up issue</option>
+      <option value="follow-up">Follow-up issue: file them all in one issue and merge without a revision</option>
+      <option value="ignore">Ignore: leave their review threads open</option>
+    </Select>
+  );
+}
+
 export function CiRepair({ name, repo, reviewed, revised, maxRevisions, errors, ceiling, patch }: { name: string; repo: ConsoleRepository; reviewed: boolean; revised: boolean; maxRevisions?: number; errors: ConfigIssue[]; ceiling: number; patch: (p: Partial<ConsoleRepository>) => void }) {
   const path = `repositories.${name}.ci`;
   // The CLI's default for `checks` (ciSettings): auto-merge's required checks when set, else every check.

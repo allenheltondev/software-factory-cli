@@ -229,6 +229,7 @@ interface RawIssue {
   state: string;
   labels: Array<string | { name?: string }>;
   pull_request?: unknown;
+  user?: { login?: string } | null;
 }
 interface RawIssueEvent {
   id: number;
@@ -453,6 +454,7 @@ function mapIssue(r: RawIssue): GitHubIssue {
     state: r.state === 'closed' ? 'closed' : 'open',
     labels: r.labels.map((l) => (typeof l === 'string' ? l : (l.name ?? ''))).filter((l) => l !== ''),
     isPullRequest: r.pull_request != null,
+    author: typeof r.user?.login === 'string' ? r.user.login : null,
   };
 }
 
@@ -963,6 +965,27 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
 
     async deleteRef(repo, ref) {
       await request<unknown>(`${repoPath(repo)}/git/refs/${ref.replace(/^refs\//, '').split('/').map(encodeURIComponent).join('/')}`, { method: 'DELETE' });
+    },
+
+    async openIssue(repo, input) {
+      const res = await request<RawIssue>(`${repoPath(repo)}/issues`, { method: 'POST', body: { title: input.title, body: input.body } });
+      return mapIssue(res.data!);
+    },
+
+    async updateIssueBody(repo, issueNumber, body) {
+      await request<unknown>(`${repoPath(repo)}/issues/${issueNumber}`, { method: 'PATCH', body: { body } });
+    },
+
+    async listIssuesByCreator(repo, creator, opts = {}) {
+      // The worker opens pull requests too, which this listing includes: read past them, page by page.
+      const out: GitHubIssue[] = [];
+      let next: string | undefined = buildUrl(`${repoPath(repo)}/issues`, { creator, state: 'all', sort: 'created', direction: 'desc', per_page: 100 });
+      for (let page = 0; next && page < (opts.maxPages ?? 10); page++) {
+        const res: RawResponse<RawIssue[]> = await request<RawIssue[]>(next);
+        out.push(...(res.data ?? []).map(mapIssue).filter((i) => !i.isPullRequest));
+        next = parseLinkHeader(res.headers.get('link'))['next'];
+      }
+      return out;
     },
 
     async listIssueComments(repo, issueNumber) {

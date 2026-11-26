@@ -190,7 +190,10 @@ commit of the review, which it does not act on.
   already made the revision for that review (the pull request got that revision); `updraft
   retry` of a failed revision does not use another. Once the limit is reached, further change requests are recorded and listed in
   `updraft status`, not acted on, and one comment on the PR says so. Raising the limit lets
-  new reviews through; reviews already recorded as over the limit stay that way.
+  new reviews through; reviews already recorded as over the limit stay that way. The one
+  [suggestion revision](review-loop.md#suggestions) of a ready head counts too, and a spent
+  budget is not a change request over the limit: it posts no limit comment, its suggestions go
+  into the pull request's follow-up issue instead.
 - One revision at a time per PR. A change request that arrives while a revision is running
   waits for it, and for its push, and then starts from the pushed result. A revision job also
   waits for any other job on the same issue.

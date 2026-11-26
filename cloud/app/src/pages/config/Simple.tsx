@@ -4,7 +4,7 @@ import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepos
 import { KiroNotEnabled } from '../../components/kiro';
 import { AGENT_GUIDES } from '../../lib/agentGuides';
 import { installationSettingsUrl } from '../../lib/diagnostics';
-import { AutoMerge, CiRepair } from './Editor';
+import { AutoMerge, CiRepair, Suggestions } from './Editor';
 import { Check, FieldError, ParsedText, PromptField } from './fields';
 import { InlineKey, type KeyApi } from './InlineKey';
 import { AGENT_LABEL, DEFAULT_OFFERED, issuesAt, KEY_FOR, newRepository, numberOrUndefined, parseLogins, withoutUnreviewedCi } from './model';
@@ -257,6 +257,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                         onChange={(allowedActors) => patchRepo(name, { allowedActors })}
                       />
                     )}
+                    <Suggestions name={name} repo={repo} reviewed={w.review.enabled} errors={errors} patch={(p) => patchRepo(name, p)} />
                     <CiRepair name={name} repo={repo} reviewed={w.review.enabled} revised={w.revise.enabled} maxRevisions={w.revise.maxRevisions} errors={errors} ceiling={ceilings.ciWaitMinutes ?? ceilings.autoMergeWaitMinutes} patch={(p) => patchRepo(name, p)} />
                     <AutoMerge name={name} repo={repo} reviewed={w.review.enabled} errors={errors} ceiling={ceilings.autoMergeWaitMinutes} patch={(p) => patchRepo(name, p)} onAsk={() => onAskAutoMerge(name)} />
                   </div>

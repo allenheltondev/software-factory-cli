@@ -399,6 +399,47 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(gh.pullBody).not.toContain('Merging is up to a person');
   });
 
+  it.each([['quiet'], ['verbose']] as const)(
+    'suggestions (%s): a ready review with a suggestion gets one suggestion revision, its head is reviewed and merged, and the thread is resolved',
+    async (notifications) => {
+      const s = setup({ repo: { notifications }, reviewerArgs: ['--mode', 'review', '--suggest'], coderArgs: ['--mode', 'success', '--resolve'] });
+      const { db, gh, f, prBranch } = s;
+      // FAKE_AGENT.md is in the diff, so the suggestion on its first line is an inline thread.
+      gh.files = [{ path: 'FAKE_AGENT.md', status: 'added', patch: '@@ -0,0 +1,3 @@\n+# Done\n+\n+Implement the issue below.' }];
+      const worker = start(s, {}, notifications === 'quiet');
+      await vi.waitFor(() => expect(gh.merges).toHaveLength(1), { timeout: 150_000, interval: 100 });
+      await worker.stop();
+
+      const jobs = jobsOf(db);
+      expect(jobs.map((j) => [j.envelope.type, j.status])).toEqual([
+        ['issue.labeled', 'succeeded'],
+        ['pull_request.review', 'succeeded'],
+        ['pull_request.changes_requested', 'succeeded'],
+        ['pull_request.review', 'succeeded'],
+      ]);
+      const [, review1, revision, review2] = jobs as [Job, Job, Job, Job];
+      const head1 = reviewOf(review1)!.headSha;
+      const head2 = remoteHead(f, prBranch);
+      expect(revisionOf(revision)).toMatchObject({ trigger: 'suggestions', reviewedSha: head1, findings: [expect.objectContaining({ severity: 'suggestion', title: 'Say what was done' })] });
+      expect(reviewOf(review2)!.headSha).toBe(head2);
+      // Only the head after the suggestion revision was merged, never the one it revised.
+      expect(gh.merges).toEqual([{ sha: head2, method: 'squash' }]);
+      // The thread: the coding agent's reply names the commit, and it is resolved.
+      const root = gh.reviewComments.find((c) => c.inReplyToId === null && c.user === 'updraft-bot')!;
+      expect(gh.thread(root.id).map((c) => c.body).join('\n')).toContain(`Fixed in [${head2.slice(0, 12)}]`);
+      expect(gh.resolved.has(root.id)).toBe(true);
+      expect(gh.issues).toEqual([]);
+      if (notifications === 'quiet') {
+        // Nothing on the pull request but the reviews and the thread; one status comment on the issue.
+        expect(gh.comments.filter((c) => c.issue === PR)).toEqual([]);
+        expect(gh.comments.filter((c) => c.issue === ISSUE)).toHaveLength(1);
+      } else {
+        // Verbose: the revision's reply, as for every revision; nothing else from the suggestion step.
+        expect(gh.comments.filter((c) => c.issue === PR)).toHaveLength(1);
+      }
+    },
+  );
+
   it('quiet notifications, autoMerge off: the status rests on "Ready for a person to merge", and a person\'s merge is its last word', async () => {
     const s = setup({ repo: { notifications: 'quiet', autoMerge: undefined }, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] });
     const { gh } = s;

@@ -49,9 +49,10 @@ import { verdictTrigger } from '../poller/review-trigger.js';
 import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type ReviewVerdict, type RevisionFinding, type RevisionRequest, type Run } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { evaluateCiAll, postCiNotices } from './ci.js';
-import { noteStatus, quietFor, shortSha } from './status-comment.js';
+import { evaluateSuggestionsAll, queueSuggestions, suggestionStatus, type QueueDecision } from './suggestions.js';
+import { verdictStatus } from './verdict-status.js';
+import { noteStatus, quietFor } from './status-comment.js';
 import { startOf } from './assignment-comment.js';
-import { STATUS_STAGE } from './status-marker.js';
 import { code } from './failure-comment.js';
 import { runDetails, selectionLine } from './run-details.js';
 import { evaluateAutoMerges, postMergeNotices } from './merge.js';
@@ -133,33 +134,7 @@ export function renderReview(o: {
   return `${cap(body, MAX_BODY - marker.length - 2)}\n\n${marker}`;
 }
 
-/**
- * The status comment's stage after a verdict on the current head (quiet notifications): the loop
- * at work (a revision queued, checks or a merge to come) or resting until a person acts. Null for
- * a verdict that was stale, or a pull request that is closed.
- */
-export function verdictStatus(config: UpdraftConfig, repo: RepositoryConfig, outcome: ReviewOutcome, prNumber: number, headSha: string): { stage: number; title: string; text: string } | null {
-  const at = `\`${shortSha(headSha)}\``;
-  switch (outcome) {
-    case 'revision-queued':
-      return { stage: STATUS_STAGE.loop, title: 'Changes requested', text: `The review asked for changes on ${at} of PR #${prNumber}; a revision is queued.` };
-    case 'over-limit':
-      return { stage: STATUS_STAGE.person, title: 'Revision limit reached', text: `The review asked for changes on ${at}, and PR #${prNumber} has used its ${repo.maxRevisions ?? DEFAULT_MAX_REVISIONS} revision(s); the changes are up to a person.` };
-    case 'no-revise':
-      return { stage: STATUS_STAGE.person, title: 'Changes requested', text: `The review asked for changes on ${at} of PR #${prNumber}; revisions are off here, so the changes are up to a person.` };
-    case 'needs-verification':
-      return { stage: STATUS_STAGE.person, title: 'Waiting for a person', text: `The review found ${at} of PR #${prNumber} done but some acceptance criteria unverified; a person checks them and merges.` };
-    case 'ready': {
-      if (ciSettings(config, repo)) return { stage: STATUS_STAGE.loop, title: 'Waiting for checks', text: `The review found ${at} of PR #${prNumber} ready; Updraft waits for its checks.` };
-      const method = autoMergeMethod(config, repo);
-      return method
-        ? { stage: STATUS_STAGE.loop, title: 'Ready to merge', text: `The review found ${at} of PR #${prNumber} ready; Updraft merges it once its required checks pass.` }
-        : { stage: STATUS_STAGE.person, title: 'Ready for a person to merge', text: `The review found ${at} of PR #${prNumber} ready; merging is up to a person.` };
-    }
-    default:
-      return null;
-  }
-}
+export { verdictStatus } from './verdict-status.js';
 
 /** The sentence under the findings: what happens next, as far as the config says. */
 function nextStep(config: UpdraftConfig, repo: RepositoryConfig, verdict: ReviewVerdict, used: number, held: AcceptanceGate | null = null): string {
@@ -555,12 +530,28 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
       const answered = await answerInThreads(threadDeps, { repo: repoRef, prNumber, runId, headSha, round, login, comments: ownComments, answers, stillCurrent });
       if (answered.log.length) await runLog(answered.log);
     }
+    // 4. Ready for the current head, with suggestions open (review.suggestions): their one
+    // revision is queued now, from local state, so it runs before anything else happens to this
+    // head; the suggestion step (suggestions.ts) settles them otherwise, before the checks and the merge.
+    let suggestions: QueueDecision | null = null;
+    if (outcome === 'ready') {
+      hold();
+      const fresh = getLoopPr(deps.db, job.repoId, prNumber);
+      if (fresh && fresh.headSha === headSha) suggestions = queueSuggestions(deps, repoRef, repo, fresh, { reviewUrl: rev.reviewUrl ?? request.pullRequest.url, worker: login });
+      if (suggestions?.status === 'queued') {
+        revisionJobId = suggestions.jobId;
+        await runLog([`suggestions: revision job ${suggestions.jobId} queued for ${suggestions.count} suggestion(s), before the checks and the merge of ${short(headSha)}`]);
+      }
+    }
 
     hold({ outcome, outcomeDetail: detail, ...(revisionJobId ? { revisionJobId } : {}) });
     const done = finish({ state: 'published' });
     // Quiet notifications: where the loop rests now. The review itself (its next step) is what
     // asks the person, so no comment is added here.
-    const status = verdictStatus(deps.config, repo, outcome, prNumber, headSha);
+    const status =
+      suggestions?.status === 'queued'
+        ? suggestionStatus(prNumber, headSha, suggestions.count, Boolean(autoMergeMethod(deps.config, repo)))
+        : verdictStatus(deps.config, repo, outcome, prNumber, headSha);
     if (status && quietFor(deps.config, { repoId: job.repoId, repoFullName })) {
       await noteStatus({ api: deps.api, log }, { repo: repoRef, issue: job.issueNumber, target: { pr: prNumber }, sha: headSha, latest: true, ...(startOf(run) !== undefined ? { at: startOf(run)! } : {}), ...status });
     }
@@ -654,6 +645,10 @@ export function createReviewLoopPublisher(deps: PublishDeps, inner?: Publisher):
         if (signal?.aborted) return;
         await post(runId, signal);
       }
+      schedule();
+      if (signal?.aborted) return;
+      // The suggestions of heads found ready (review.suggestions), before their checks and merge.
+      await evaluateSuggestionsAll(deps, signal);
       schedule();
       if (signal?.aborted) return;
       // The checks of heads found ready (ciFix), before the merge: a merge needs them passed.

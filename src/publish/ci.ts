@@ -19,7 +19,7 @@
 // left to its own review. The revision is dropped before it starts if the head moved since
 // (verdictStale). CI output is untrusted input: it is redacted, capped and fenced in the prompt.
 import { createHash } from 'node:crypto';
-import { autoMergeMethod, ciSettings, DEFAULT_MAX_REVISIONS, workflowId, type CiSettings, type MergeMethod, type RepositoryConfig } from '../config/schema.js';
+import { autoMergeMethod, ciSettings, DEFAULT_MAX_REVISIONS, suggestionsActive, workflowId, type CiSettings, type MergeMethod, type RepositoryConfig } from '../config/schema.js';
 import {
   activeRevisionJob,
   getLoopPr,
@@ -454,7 +454,7 @@ export async function evaluateCiAll(deps: CiDeps, signal?: AbortSignal, opts: { 
     if (opts.only && opts.only.repoId !== cfg.id) continue;
     let candidates: LoopPr[];
     try {
-      candidates = listCiCandidates(deps.db, cfg.id).filter(
+      candidates = listCiCandidates(deps.db, cfg.id, { requireSuggestions: suggestionsActive(deps.config, cfg) }).filter(
         (pr) => (deps.scope?.pr(pr.repoId, pr.prNumber) ?? true) && (!opts.only || opts.only.prNumber === pr.prNumber),
       );
     } catch (err) {

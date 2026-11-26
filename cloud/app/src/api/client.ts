@@ -805,6 +805,8 @@ export interface ConsoleRepository {
   ci?: { checks?: string[]; ignore?: string[]; waitMinutes?: number };
   /** Absent or quiet: one live status comment per run, and a comment only when a person has to act. verbose: separate status comments. */
   notifications?: 'quiet' | 'verbose';
+  /** Absent or address: one revision applies the reviewer's suggestions it agrees with, the rest go into one follow-up issue. follow-up: all into the issue. ignore: left open. */
+  suggestions?: 'address' | 'follow-up' | 'ignore';
 }
 
 export interface ConsoleConfig {

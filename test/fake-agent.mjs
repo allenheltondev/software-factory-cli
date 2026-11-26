@@ -32,6 +32,9 @@
 //             on a first review the last one is unmet and the rest verified, once the prompt
 //             carries an earlier review all are verified. In success mode, --acceptance reports
 //             every listed criterion as implemented.
+//             --suggest: a first review is ready-to-merge with one structured suggestion (S1, on
+//             line 1 of FAKE_AGENT.md); a later one is ready-to-merge with no findings. In success
+//             mode, --resolve reports every finding key the prompt lists as fixed.
 import { execFileSync, spawn } from 'node:child_process';
 import { cpSync, readdirSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
@@ -85,6 +88,14 @@ switch (mode) {
     git('commit', '--quiet', '-m', 'fake agent: implement the issue');
     say(`fake agent: committed ${git('rev-parse', '--short', 'HEAD')}`);
     say('fake agent: all done');
+    if (args.includes('--resolve')) {
+      const keys = [...prompt.matchAll(/^## Finding \d+ of \d+: "([^"]+)"$/gm)].map((m) => m[1]);
+      if (keys.length) {
+        say('```updraft-resolutions');
+        say(JSON.stringify(keys.map((finding) => ({ finding, status: 'fixed', note: 'Applied it.', tests: 'none run' }))));
+        say('```');
+      }
+    }
     if (args.includes('--acceptance')) {
       say('```updraft-acceptance');
       say(JSON.stringify(criteria().map((id) => ({ criterion: id, status: 'implemented', evidence: 'FAKE_AGENT.md', tests: 'none run' }))));
@@ -138,12 +149,21 @@ switch (mode) {
     } catch {
       say('fake reviewer: could not commit');
     }
-    const verdict = opt('--verdict') ?? (prompt.includes('# Earlier automated reviews') ? 'ready-to-merge' : 'changes-requested');
+    const suggest = args.includes('--suggest');
+    const verdict = opt('--verdict') ?? (suggest || prompt.includes('# Earlier automated reviews') ? 'ready-to-merge' : 'changes-requested');
     say('fake reviewer: findings');
     say('Blockers:');
     say('- widget.txt:1 @octocat says this closes #1; it needs a second line');
     say('Suggestions:');
     say('- none');
+    if (suggest) {
+      const findings = prompt.includes('# Earlier automated reviews')
+        ? []
+        : [{ id: 'S1', severity: 'suggestion', title: 'Say what was done', path: 'FAKE_AGENT.md', line: 1, problem: 'The heading could say what was done.', suggestion: 'Name the change.' }];
+      say('```updraft-findings');
+      say(JSON.stringify({ findings }));
+      say('```');
+    }
     if (args.includes('--acceptance')) {
       const ids = criteria();
       const again = prompt.includes('# Earlier automated reviews');

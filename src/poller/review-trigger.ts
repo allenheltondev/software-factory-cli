@@ -140,6 +140,32 @@ export function ciTrigger(c: { prNumber: number; headSha: string; diagnostics: s
   };
 }
 
+/** Review id (the dedupe key in review_requests) of the suggestion revision of a pull request: one per pull request, whatever head and however often asked. */
+export function suggestionsReviewId(prNumber: number): string {
+  return `suggestions:${prNumber}`;
+}
+
+/**
+ * The revision that a ready head's open suggestions ask for (src/publish/suggestions.ts).
+ * `summary` is the worker's own list of them; their titles and text are the reviewer's, so the
+ * revision prompt fences it like any review. Bound to `headSha`: dropped as stale if the pull
+ * request moved on before it starts.
+ */
+export function suggestionsTrigger(c: { prNumber: number; headSha: string; summary: string; worker: string; url: string; recordedAt: string }): {
+  kind: RevisionTriggerKind;
+  reviewId: string;
+  review: ReviewSnapshot;
+  reviewedSha: string;
+} {
+  const id = suggestionsReviewId(c.prNumber);
+  return {
+    kind: 'suggestions',
+    reviewId: id,
+    reviewedSha: c.headSha,
+    review: { id, url: c.url, author: c.worker, submittedAt: c.recordedAt, body: c.summary, comments: [], omittedComments: 0, headSha: c.headSha },
+  };
+}
+
 /**
  * Why whoever asked for a queued revision may no longer do so, or null. A person must still be an
  * allowed actor; Updraft's own reviewer needs `reviewOn` (the repository still has review on).
@@ -147,6 +173,7 @@ export function ciTrigger(c: { prNumber: number; headSha: string; diagnostics: s
 export function requesterProblem(revision: RevisionRequest, allowedActors: readonly string[], reviewOn: boolean): string | null {
   if (revision.trigger === 'ci_failure') return reviewOn ? null : 'review is off for this repository now, so failed checks are no longer acted on';
   if (revision.trigger === 'updraft_review') return reviewOn ? null : 'review is off for this repository now, so its reviewer verdicts are no longer acted on';
+  if (revision.trigger === 'suggestions') return reviewOn ? null : "review is off for this repository now, so its reviewer's suggestions are no longer acted on";
   return isAllowedActor(allowedActors, revision.review.author)
     ? null
     : `${revision.review.author}, who requested the changes, is no longer an allowed actor for this workflow`;
@@ -162,6 +189,9 @@ export function verdictStale(revision: RevisionRequest, headSha: string | null):
   if (revision.trigger === 'ci_failure') {
     return `the failed checks were on ${revision.reviewedSha.slice(0, 12)}, but the pull request is now at ${headSha.slice(0, 12)}; that failure is stale`;
   }
+  if (revision.trigger === 'suggestions') {
+    return `the suggestions were made on ${revision.reviewedSha.slice(0, 12)}, but the pull request is now at ${headSha.slice(0, 12)}; they are stale`;
+  }
   return `the reviewer's verdict was for ${revision.reviewedSha.slice(0, 12)}, but the pull request is now at ${headSha.slice(0, 12)}; the verdict is stale`;
 }
 
@@ -173,6 +203,8 @@ export function verdictStale(revision: RevisionRequest, headSha: string | null):
 export function reviewWithdrawn(revision: RevisionRequest, current: readonly GitHubReview[]): string | null {
   // Failed checks are not a review anyone can dismiss; whether they still apply is verdictStale's to say.
   if (revision.trigger === 'ci_failure') return null;
+  // Nor are suggestions: they are the worker's own record of a review it already acted on.
+  if (revision.trigger === 'suggestions') return null;
   const { review } = revision;
   const now = current.find((r) => r.id === review.id);
   if (now && now.state !== 'CHANGES_REQUESTED') {

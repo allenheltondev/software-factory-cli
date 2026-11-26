@@ -226,7 +226,7 @@ export const TABLE_RULES: Readonly<Record<string, TableRule>> = {
 };
 
 /** Columns that hold a job id, in any table: rewritten when a job was folded into another (see the jobs rule). */
-const JOB_ID_COLUMNS = ['job_id', 'revision_job_id', 'resume_job_id', 'ci_fix_job_id'];
+const JOB_ID_COLUMNS = ['job_id', 'revision_job_id', 'resume_job_id', 'ci_fix_job_id', 'suggest_job_id'];
 
 /** Rows that record a step towards GitHub with a lease: what a run that ended mid-step leaves behind. */
 const LEASED_TABLES: ReadonlyArray<{ table: string; busy: string; retryLater: boolean }> = [

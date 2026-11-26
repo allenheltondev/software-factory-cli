@@ -454,3 +454,19 @@ describe('migration v20', () => {
     expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 19 });
   });
 });
+
+describe('migration v21', () => {
+  it('adds the suggestion step: a watched PR and its findings start with nothing settled, and a second run changes nothing', () => {
+    const db = openDatabase(':memory:', { migrateTo: 20 });
+    const cols = (table: string) => (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+    expect(cols('revision_prs')).not.toContain('suggest_state');
+    migrate(db, 21);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 21 });
+    expect(cols('revision_prs')).toEqual(expect.arrayContaining(['suggest_state', 'suggest_sha', 'suggest_reason', 'suggest_job_id', 'suggest_attempts', 'suggest_issue_number', 'suggest_issue_url']));
+    expect(cols('review_findings')).toEqual(expect.arrayContaining(['settled_as', 'settled_at', 'settled_issue']));
+    // As after a hand downgrade: the columns are there already.
+    db.exec('PRAGMA user_version = 20');
+    migrate(db, 21);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 21 });
+  });
+});

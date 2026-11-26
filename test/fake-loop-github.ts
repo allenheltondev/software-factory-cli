@@ -36,7 +36,8 @@ type Failable =
   | 'replyToReviewComment'
   | 'resolveReviewThread'
   | 'unresolveReviewThread'
-  | 'listReviewThreads';
+  | 'listReviewThreads'
+  | 'openIssue';
 
 export class FakeLoopGitHub {
   login = 'updraft-bot';
@@ -77,6 +78,10 @@ export class FakeLoopGitHub {
   readonly resolved = new Set<number>();
   /** Refuse a review with inline comments (422), as GitHub does for a line outside the diff. */
   refuseInline = false;
+  /** A listing of issues by creator that returns everyone's issues (as if the filter were not applied). */
+  creatorFilterIgnored = false;
+  /** Issues opened through the API (the follow-up issue of a pull request's suggestions). */
+  issues: Array<GitHubIssue & { user: string; gone?: number }> = [];
   private version = 0;
   private nextId = 1;
 
@@ -124,7 +129,13 @@ export class FakeLoopGitHub {
   async listIssueEvents(): Promise<IssueEventsPage> {
     return { events: [], nextPage: null, etag: null, notModified: false };
   }
-  async getIssue(): Promise<GitHubIssue> {
+  async getIssue(_repo?: RepoRef, issueNumber?: number): Promise<GitHubIssue> {
+    const opened = this.issues.find((i) => i.number === issueNumber);
+    if (opened) {
+      if (opened.gone) throw new GitHubError('issue not found', opened.gone);
+      const { user, gone: _g, ...rest } = opened;
+      return { ...rest, labels: [...rest.labels], author: user };
+    }
     return { number: this.issue, title: 'Add a widget', body: this.issueBody, htmlUrl: `https://github.com/${this.fullName}/issues/${this.issue}`, state: 'open', labels: ['updraft:ready'], isPullRequest: false };
   }
   async listEventsForIssue(): Promise<GitHubIssueEvent[]> {
@@ -143,6 +154,29 @@ export class FakeLoopGitHub {
     this.pullAuthor = this.login;
     this.touch();
     return { number: this.pull.number, htmlUrl: `https://github.com/${this.fullName}/pull/${this.pull.number}`, state: 'open', draft: input.draft, merged: false, headRef: input.head, headRepoId: 42, baseRef: input.base, body: input.body };
+  }
+  async openIssue(_repo: RepoRef, input: { title: string; body: string }): Promise<GitHubIssue> {
+    this.maybeFail('openIssue');
+    const number = 500 + this.issues.length;
+    this.writes.push(`open issue #${number}`);
+    const issue = { number, title: input.title, body: input.body, htmlUrl: `https://github.com/${this.fullName}/issues/${number}`, state: 'open' as const, labels: [] as string[], isPullRequest: false, user: this.login };
+    this.issues.push(issue);
+    const { user, ...rest } = issue;
+    return { ...rest, author: user };
+  }
+  async updateIssueBody(_repo: RepoRef, issueNumber: number, body: string): Promise<void> {
+    const issue = this.issues.find((i) => i.number === issueNumber);
+    if (!issue || issue.gone) throw new GitHubError('issue not found', issue?.gone ?? 404);
+    this.writes.push(`edit issue #${issueNumber}`);
+    issue.body = body;
+  }
+  async listIssuesByCreator(_repo: RepoRef, creator: string): Promise<GitHubIssue[]> {
+    this.calls.push(`listIssuesByCreator ${creator}`);
+    // As GitHub's filter, and with each issue's author: the code under test checks it again.
+    return this.issues
+      .filter((i) => i.user === creator || this.creatorFilterIgnored)
+      .reverse()
+      .map(({ user, gone: _g, ...i }) => ({ ...i, labels: [...i.labels], author: user }));
   }
   async listIssueComments(_repo: RepoRef, issue: number): Promise<GitHubIssueComment[]> {
     this.calls.push(`listIssueComments #${issue}`);

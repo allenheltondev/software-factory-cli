@@ -202,6 +202,12 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       if (repo.autoMergeRequiredChecks !== undefined && repo.autoMerge === undefined && !repo.ciFix) {
         warnings.push({ path: `repositories.${repoName}.autoMergeRequiredChecks`, message: 'has no effect without autoMerge or ciFix' });
       }
+      if (typeof repo.review === 'object' && repo.review.suggestions === 'address' && !repo.revise) {
+        warnings.push({
+          path: `repositories.${repoName}.review.suggestions`,
+          message: 'revise is off, so no revision can address them: open suggestions go into one follow-up issue, as with follow-up',
+        });
+      }
       if (repo.ciFix && !repo.revise) {
         warnings.push({
           path: `repositories.${repoName}.ciFix`,

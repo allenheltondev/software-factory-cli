@@ -18,7 +18,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { loadConfig } from '../config/io.js';
-import { ciSettings, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
+import { ciSettings, autoMergeMethod, DEFAULT_MAX_REVISIONS, publishMode, reviewActive, reviseActive, suggestionsActive, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
 import { routeReasonCode, routeSourceOf } from '../db/metrics.js';
 import { getFailureComment } from '../db/failure-comments.js';
@@ -41,6 +41,7 @@ import { consoleContextFromEnv, createAssignmentCommenter, type AssignmentCommen
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
 import { evaluateCiAll, postCiNotices } from '../publish/ci.js';
+import { evaluateSuggestionsAll } from '../publish/suggestions.js';
 import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
 import { createRevisionPublisher, findRevisionClaims, revisionsEnabled, SUPERSEDED_PREFIX } from '../publish/revision.js';
 import { reviewOf, revisionOf, type Job, type RepoRef, type VerificationSummary } from '../types.js';
@@ -503,7 +504,7 @@ function summarizeLoop(db: Db, config: UpdraftConfig, repoId: number, prNumber: 
   const cfg = Object.values(config.repositories).find((r) => r.id === repoId);
   if (!pr || !cfg) return null;
   const maxRevisions = cfg.maxRevisions ?? DEFAULT_MAX_REVISIONS;
-  const stage = prStage(db, pr, maxRevisions, { ci: ciSettings(config, cfg) !== null });
+  const stage = prStage(db, pr, maxRevisions, { ci: ciSettings(config, cfg) !== null, suggestions: suggestionsActive(config, cfg) });
   const merged = pr.mergeState === 'merged';
   let notMergedReason: string | null = null;
   if (!merged) {
@@ -802,10 +803,13 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       // The worker's clock, as for the review poller above and the publishers of the drain: the CI
       // step's wait is measured across both.
       const ciDeps = { db: openDb, config, api, log: log.child({ component: 'ci' }), scope };
+      // The suggestion step first (review.suggestions): a head's checks are read once its suggestions are settled.
+      const suggested = await evaluateSuggestionsAll({ ...ciDeps, log: log.child({ component: 'suggestions' }) }, undefined, { only: { repoId: repo.id, prNumber: n } });
       const ci = await evaluateCiAll(ciDeps, undefined, { only: { repoId: repo.id, prNumber: n }, force: true });
       if (ci.length) await postCiNotices(ciDeps);
       const ciQueued = ci.filter((r) => r.status === 'fixing').length;
-      summary.dispatched = (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0) + ciQueued > 0;
+      const suggestionsQueued = suggested.filter((r) => r.status === 'fixing').length;
+      summary.dispatched = (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0) + ciQueued + suggestionsQueued > 0;
       // What it queued is this run's own, also on a pull request another run still holds.
       if (summary.dispatched) scope.engage();
       summary.loop = summarizeLoop(openDb, config, repo.id, n);

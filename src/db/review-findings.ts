@@ -10,6 +10,8 @@ import type { Db } from './database.js';
 
 export type FindingStatus = 'open' | 'verified' | 'unresolved';
 export type FindingResolution = 'fixed' | 'disagreed' | 'deferred' | 'unable' | 'unreported';
+/** How the suggestion step closed a suggestion's thread (src/publish/suggestions.ts). */
+export type SettledAs = 'fixed' | 'declined' | 'deferred';
 
 export interface ReviewFinding {
   repoId: number;
@@ -37,6 +39,9 @@ export interface ReviewFinding {
   resolutionSha: string | null;
   resolutionRunId: string | null;
   threadResolvedAt: string | null;
+  settledAs: SettledAs | null;
+  settledAt: string | null;
+  settledIssue: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -67,6 +72,9 @@ interface Row {
   resolution_sha: string | null;
   resolution_run_id: string | null;
   thread_resolved_at: string | null;
+  settled_as?: SettledAs | null;
+  settled_at?: string | null;
+  settled_issue?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -97,6 +105,9 @@ const toFinding = (r: Row): ReviewFinding => ({
   resolutionSha: r.resolution_sha,
   resolutionRunId: r.resolution_run_id,
   threadResolvedAt: r.thread_resolved_at,
+  settledAs: r.settled_as ?? null,
+  settledAt: r.settled_at ?? null,
+  settledIssue: r.settled_issue ?? null,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
 });
@@ -152,6 +163,45 @@ export function unverifiedBlockers(db: Db, repoId: number, prNumber: number): Re
       .prepare("SELECT * FROM review_findings WHERE repo_id = ? AND pr_number = ? AND thread_key = finding_key AND status != 'verified' AND severity = 'blocker' ORDER BY created_at, rowid")
       .all(repoId, prNumber) as unknown as Row[]
   ).map(toFinding);
+}
+
+/**
+ * The suggestion threads of a pull request the suggestion step has not closed yet: roots whose
+ * severity is suggestion (a repeat never lowers a blocker), oldest first, that no reviewer has
+ * verified, or that were verified without their thread being resolved on GitHub.
+ */
+export function openSuggestions(db: Db, repoId: number, prNumber: number, limit = MAX_OPEN_FINDINGS): ReviewFinding[] {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM review_findings WHERE repo_id = ? AND pr_number = ? AND thread_key = finding_key AND severity = 'suggestion' AND settled_as IS NULL
+            AND (status != 'verified' OR (comment_id IS NOT NULL AND thread_resolved_at IS NULL))
+          ORDER BY created_at, rowid LIMIT ?`,
+      )
+      .all(repoId, prNumber, limit) as unknown as Row[]
+  ).map(toFinding);
+}
+
+/** The suggestions of a pull request deferred to follow-up issue `issue`, oldest first: what that issue lists. */
+export function deferredSuggestions(db: Db, repoId: number, prNumber: number, issue: number): ReviewFinding[] {
+  return (
+    db
+      .prepare("SELECT * FROM review_findings WHERE repo_id = ? AND pr_number = ? AND thread_key = finding_key AND settled_as = 'deferred' AND settled_issue = ? ORDER BY created_at, rowid")
+      .all(repoId, prNumber, issue) as unknown as Row[]
+  ).map(toFinding);
+}
+
+/** The suggestion step closed this thread (`issue`: the follow-up issue it was deferred to): it is not answered again (until a reviewer repeats it). */
+export function markSettled(db: Db, repoId: number, prNumber: number, threadKey: string, as: SettledAs, now?: () => number, issue?: number | null): void {
+  db.prepare('UPDATE review_findings SET settled_as = ?, settled_at = ?, settled_issue = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ? AND finding_key = ?').run(
+    as,
+    iso(now),
+    issue ?? null,
+    iso(now),
+    repoId,
+    prNumber,
+    threadKey,
+  );
 }
 
 /**
@@ -249,7 +299,7 @@ export function applyRepeat(db: Db, repoId: number, prNumber: number, threadKey:
   const res = db
     .prepare(
       `UPDATE review_findings SET severity = CASE WHEN severity = 'blocker' THEN 'blocker' ELSE ? END, title = ?, problem = ?, suggestion = ?, path = ?, line = ?,
-              status = 'unresolved', status_sha = ?, status_note = ?, status_at = ?,
+              status = 'unresolved', status_sha = ?, status_note = ?, status_at = ?, settled_as = NULL, settled_at = NULL, settled_issue = NULL,
               updated_at = ? WHERE repo_id = ? AND pr_number = ? AND finding_key = ? AND (status_at IS NULL OR status_at <= ?)`,
     )
     .run(repeat.severity, repeat.title, repeat.problem, repeat.suggestion, repeat.path, repeat.line, repeat.headSha, repeat.problem, at, iso(now), repoId, prNumber, threadKey, at);

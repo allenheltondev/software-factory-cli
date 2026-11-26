@@ -18,7 +18,7 @@
 // that runs out or a refused merge is final for that head: the reason is recorded, one comment
 // says so, and the PR stays ready for a person. Nothing is forced, bypassed or retried, and no
 // branch is deleted.
-import { allowedActorsFor, autoMergeMethod, ciSettings, DEFAULT_AUTO_MERGE_WAIT_MINUTES, workflowId, type MergeMethod, type RepositoryConfig } from '../config/schema.js';
+import { allowedActorsFor, autoMergeMethod, ciSettings, DEFAULT_AUTO_MERGE_WAIT_MINUTES, suggestionsActive, workflowId, type MergeMethod, type RepositoryConfig } from '../config/schema.js';
 import {
   codeRunForHead,
   getLoopPr,
@@ -277,7 +277,7 @@ export async function evaluateAutoMerges(deps: MergeDeps, signal?: AbortSignal):
     if (!autoMergeMethod(deps.config, cfg)) continue;
     let candidates: LoopPr[];
     try {
-      candidates = listMergeCandidates(deps.db, cfg.id, { requireCi: ciSettings(deps.config, cfg) !== null }).filter((pr) => deps.scope?.pr(pr.repoId, pr.prNumber) ?? true);
+      candidates = listMergeCandidates(deps.db, cfg.id, { requireCi: ciSettings(deps.config, cfg) !== null, requireSuggestions: suggestionsActive(deps.config, cfg) }).filter((pr) => deps.scope?.pr(pr.repoId, pr.prNumber) ?? true);
     } catch (err) {
       deps.log.error('could not list pull requests to merge', { repo: fullName, error: message(err) });
       continue;

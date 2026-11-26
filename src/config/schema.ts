@@ -21,6 +21,14 @@ export type PublishMode = (typeof PUBLISH_MODES)[number];
 /** repositories.<repo>.notifications: quiet (the default) or verbose. */
 export const NOTIFICATION_MODES = ['quiet', 'verbose'] as const;
 export type NotificationMode = (typeof NOTIFICATION_MODES)[number];
+/**
+ * repositories.<repo>.review.suggestions: what happens to the reviewer's non-blocking suggestions
+ * on a head it found ready (docs/review-loop.md, "Suggestions"). address (the default): one
+ * revision applies the ones the coding agent agrees with, budget allowing; follow-up: they go into
+ * one follow-up issue; ignore: their threads are left as they are.
+ */
+export const SUGGESTION_MODES = ['address', 'follow-up', 'ignore'] as const;
+export type SuggestionMode = (typeof SUGGESTION_MODES)[number];
 /** repositories.<repo>.autoMerge: how Updraft merges a PR its reviewer found ready. */
 export const MERGE_METHODS = ['squash', 'merge', 'rebase'] as const;
 export type MergeMethod = (typeof MERGE_METHODS)[number];
@@ -326,6 +334,14 @@ export const repositorySchema = z.strictObject({
          * the config). off: not given to the agents at all.
          */
         acceptance: z.enum(['enforce', 'report', 'off']).optional(),
+        /**
+         * The reviewer's non-blocking suggestions on a head it found ready. address (the default):
+         * one revision of the pull request (counted against maxRevisions) applies those the coding
+         * agent agrees with before the merge; what is left goes into one follow-up issue.
+         * follow-up: no revision, every open suggestion goes into the follow-up issue. ignore:
+         * their threads stay open, as before.
+         */
+        suggestions: z.enum(SUGGESTION_MODES).optional(),
       }),
     ])
     .optional(),
@@ -581,6 +597,24 @@ export function acceptancePolicy(repo: Pick<RepositoryConfig, 'review'>): 'enfor
   if (repo.review === undefined || repo.review === false) return null;
   const set = repo.review === true ? undefined : repo.review.acceptance;
   return set === 'off' ? null : (set ?? 'enforce');
+}
+
+/**
+ * repositories.<repo>.review.suggestions with its default (address), or null when the review loop
+ * is not active for the repository.
+ */
+export function suggestionMode(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'review'>): SuggestionMode | null {
+  if (!reviewActive(config, repo)) return null;
+  return repo.review === true || repo.review === undefined || repo.review === false ? 'address' : (repo.review.suggestions ?? 'address');
+}
+
+/**
+ * The suggestion step is on (address or follow-up): a head found ready waits for its suggestions
+ * to be settled before its checks are read and before a merge.
+ */
+export function suggestionsActive(config: Pick<UpdraftConfig, 'execution'>, repo: Pick<RepositoryConfig, 'publish' | 'review'>): boolean {
+  const mode = suggestionMode(config, repo);
+  return mode === 'address' || mode === 'follow-up';
 }
 
 /** repositories.<repo>.review as settings: off unless set to true or to an options object. */
