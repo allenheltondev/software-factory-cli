@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { attachLogin, loginUrl } from '../native-worker/browser-login.mjs';
+import { attachCodexLogin, attachLogin, codexDeviceCode, loginUrl } from '../native-worker/browser-login.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, EGRESS_TARGET, claudeArgs, claudeEnv, checkInventory, validateRun, resolveRunEnvironment, withEgress, networkNote } from '../native-worker/policy.mjs';
+import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, EGRESS_TARGET, CODEX_SERVER, CODEX_TOOL, CODEX_DISABLED_FEATURES, CODEX_DIRECT_MODELS, claudeArgs, claudeEnv, codexArgs, codexEnv, checkCodexEvent, sanitizeCodexEvent, sanitizeCodexText, checkInventory, validateRun, resolveRunEnvironment, withEgress, networkNote } from '../native-worker/policy.mjs';
 import { parseRunArgs } from '../image/sandbox/updraft-sandbox.mjs';
 import { frames, readPrompt } from '../native-worker/protocol.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
@@ -15,6 +15,8 @@ import { commitIdentityEnv } from '../../../src/github/credentials.ts';
 import { containerSchema } from '../../../src/config/schema.ts';
 import { createGitFixture } from '../../../test/git-fixtures.ts';
 import { createProbeServer, PROBE_PORT } from '../native-worker/probe.mjs';
+import { adoptLock, LOCK_REFUSED } from '../native-worker/service.mjs';
+import { execFileSync } from 'node:child_process';
 
 describe('disposable worker browser login', () => {
   it('accepts only the official authorization endpoint', () => {
@@ -51,6 +53,206 @@ describe('disposable worker browser login', () => {
     await vi.waitFor(() => expect(socket.close).toHaveBeenCalledOnce());
     expect(launch).not.toHaveBeenCalled();
   });
+});
+
+// What `codex login --device-auth` prints (codex-rs/login/src/device_code_auth.rs), colors included.
+const devicePrompt = (url = 'https://auth.openai.com/codex/device', code = 'ABCD-1234') =>
+  `\nWelcome to Codex [v\x1b[90m0.200.0\x1b[0m]\n\x1b[90mOpenAI's command-line coding agent\x1b[0m\n\nFollow these steps to sign in with ChatGPT using device code authorization:\n\n1. Open this link in your browser and sign in to your account\n   \x1b[94m${url}\x1b[0m\n\n2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n   \x1b[94m${code}\x1b[0m\n\n\x1b[90mContinue only if you started this login in Codex.\x1b[0m\n`;
+
+describe('disposable worker Codex sign-in (official device code)', () => {
+  it('accepts only the official verification page and a plain one-time code', () => {
+    expect(codexDeviceCode(devicePrompt())).toEqual({ verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD-1234' });
+    for (const text of [
+      devicePrompt('https://auth.openai.com.evil.test/codex/device'), devicePrompt('https://auth.openai.com/codex/device?next=https://evil.test'),
+      devicePrompt('http://auth.openai.com/codex/device'), devicePrompt('https://auth.openai.com/oauth/authorize'),
+      devicePrompt(undefined, 'abcd 1234'), devicePrompt(undefined, '<script>'), devicePrompt().split('2. Enter')[0],
+    ]) expect(codexDeviceCode(text)).toBeUndefined();
+  });
+
+  it('runs the official device login, shows the page and code, and reports only sanitized status', async () => {
+    const socket = Object.assign(new EventEmitter(), { readyState: 1, close: vi.fn(), send: vi.fn() });
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    const launch = vi.fn(() => child);
+    const status = vi.fn().mockResolvedValueOnce('login_required').mockResolvedValueOnce('connected');
+    const disconnect = attachCodexLogin(socket, { codex: '/trusted/codex', credentialHome: '/private/home' }, status, launch);
+    try {
+      await vi.waitFor(() => expect(launch).toHaveBeenCalledOnce());
+      const [file, args, options] = launch.mock.calls[0];
+      expect(file).toBe('/trusted/codex');
+      expect(args).toEqual(['-c', 'cli_auth_credentials_store="file"', '-c', 'forced_login_method="chatgpt"', '-c', 'chatgpt_base_url="https://chatgpt.com/backend-api/"', 'login', '--device-auth']);
+      expect(options.env).toEqual({ ...codexEnv({ credentialHome: '/private/home' }), BROWSER: '/bin/false' });
+      expect(options.stdio[0]).toBe('ignore'); // nothing from the browser ever reaches the CLI
+      const [first, second] = [devicePrompt().slice(0, 200), devicePrompt().slice(200)];
+      child.stdout.write(first);
+      expect(socket.send).not.toHaveBeenCalled();
+      child.stdout.write(second);
+      expect(socket.send).toHaveBeenCalledExactlyOnceWith(JSON.stringify({ verificationUrl: 'https://auth.openai.com/codex/device', userCode: 'ABCD-1234' }));
+      child.stdout.write('Successfully logged in\n');
+      child.emit('close', 0);
+      await vi.waitFor(() => expect(socket.send).toHaveBeenLastCalledWith(JSON.stringify({ status: 'connected' })));
+      expect(socket.close).toHaveBeenCalledOnce();
+    } finally { disconnect(); }
+  });
+
+  it('ends the attempt if the browser sends anything, and never starts a login over an API key', async () => {
+    const socket = Object.assign(new EventEmitter(), { readyState: 1, close: vi.fn(), send: vi.fn() });
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough() });
+    const report = vi.fn();
+    attachCodexLogin(socket, { codex: '/trusted/codex', credentialHome: '/h' }, async () => 'login_required', () => child, report);
+    await vi.waitFor(() => expect(child.stdout.listenerCount('data')).toBe(1));
+    socket.emit('message', Buffer.from('injected'), false);
+    expect(socket.send).toHaveBeenLastCalledWith(JSON.stringify({ status: 'failed' }));
+    expect(report).toHaveBeenCalledWith('codex_unexpected_input');
+
+    const other = Object.assign(new EventEmitter(), { readyState: 1, close: vi.fn(), send: vi.fn() });
+    const launch = vi.fn();
+    attachCodexLogin(other, { codex: '/trusted/codex', credentialHome: '/h' }, async () => 'wrong_method', launch, report);
+    await vi.waitFor(() => expect(other.send).toHaveBeenLastCalledWith(JSON.stringify({ status: 'failed' })));
+    expect(launch).not.toHaveBeenCalled();
+    expect(report).toHaveBeenCalledWith('codex_auth_status_wrong_method');
+  });
+
+  it('does not start a login when Codex is already signed in with ChatGPT', async () => {
+    const socket = Object.assign(new EventEmitter(), { readyState: 1, close: vi.fn(), send: vi.fn() });
+    const launch = vi.fn();
+    attachCodexLogin(socket, { codex: '/trusted/codex', credentialHome: '/h' }, async () => 'connected', launch);
+    await vi.waitFor(() => expect(socket.send).toHaveBeenLastCalledWith(JSON.stringify({ status: 'connected' })));
+    expect(launch).not.toHaveBeenCalled();
+  });
+});
+
+const REQUIRED_OFF = ['shell_tool', 'unified_exec', 'unified_exec_tty', 'view_image', 'sleep_tool', 'code_mode_host', 'code_mode', 'code_mode_only',
+  'hooks', 'apps', 'plugins', 'remote_plugin', 'tool_suggest', 'multi_agent', 'multi_agent_v2', 'image_generation', 'browser_use', 'computer_use',
+  'in_app_browser', 'standalone_web_search', 'request_permissions_tool', 'memories', 'goals', 'agent_message_board', 'enable_mcp_apps'];
+
+describe('native Codex worker policy', () => {
+  const mcp = { command: '/usr/local/bin/node', args: ['/opt/updraft/native-worker/mcp.mjs', '/run/updraft-native/s/codex-x/tools.sock'] };
+  const pair = (args, key) => args.find((a, n) => args[n - 1] === '-c' && a.startsWith(`${key}=`));
+
+  it('replaces the bypass default with a restricted, configuration-free, ChatGPT-only launch and one MCP tool', () => {
+    const args = codexArgs(['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5.5', '-c', 'model_reasoning_effort="high"',
+      '-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"'], mcp);
+    expect(args.slice(0, 9)).toEqual(['exec', '--json', '--strict-config', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only']);
+    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+    for (const expected of ['approval_policy="never"', 'model_provider="openai"', 'forced_login_method="chatgpt"', 'cli_auth_credentials_store="file"',
+      'chatgpt_base_url="https://chatgpt.com/backend-api/"', 'web_search="disabled"', 'agents.enabled=false', ...REQUIRED_OFF.map((f) => `features.${f}=false`),
+      `mcp_servers.${CODEX_SERVER}.required=true`, `mcp_servers.${CODEX_SERVER}.enabled_tools=["${CODEX_TOOL}"]`]) {
+      expect(args[args.indexOf(expected) - 1]).toBe('-c');
+    }
+    expect(pair(args, `mcp_servers.${CODEX_SERVER}.command`)).toBe(`mcp_servers.${CODEX_SERVER}.command="/usr/local/bin/node"`);
+    expect(JSON.parse(pair(args, `mcp_servers.${CODEX_SERVER}.args`).split('=').slice(1).join('='))).toEqual(mcp.args);
+    expect(args.filter((a) => a.startsWith('model_provider='))).toEqual(['model_provider="openai"']);
+    expect(args.slice(-4)).toEqual(['--model', 'gpt-5.5', '-c', 'model_reasoning_effort="high"']);
+    expect(pair(args, 'developer_instructions')).toContain('Network access is disabled.');
+    expect(pair(args, 'developer_instructions')).toContain('Never use apply_patch');
+    expect(pair(codexArgs(['exec', '--json'], mcp, { egress: true }), 'developer_instructions')).toContain('limited to package registries');
+  });
+
+  it.each([
+    [['exec', '--json', '--sandbox', 'danger-full-access']], [['exec', '--json', '-s', 'workspace-write']], [['exec', '--json', '--full-auto']],
+    [['exec', '--json', '-c', 'model_provider="azure"']], [['exec', '--json', '-c', 'mcp_servers.evil.command="/bin/sh"']],
+    [['exec', '--json', '-c', 'features.shell_tool=true']], [['exec', '--json', '-c', 'model_reasoning_effort=high; rm']],
+    [['exec', '--json', '--profile', 'api']], [['exec', '--json', '--add-dir', '/']], [['exec', '--json', '--cd', '/']],
+    [['exec', '--json', '--image', '/etc/passwd']], [['exec', '--json', '--model']], [['exec', '--json', '--model', '--oss']],
+    [['exec']], [['resume', '--json']], [['exec', '--json', 'resume', '--last']], [['exec', '--json', '--output-schema', '/repo/s.json']],
+  ])('refuses caller-controlled capability options: %j', (input) => {
+    expect(() => codexArgs(input, mcp)).toThrow();
+  });
+
+  it('runs only direct-mode models: code-mode-only models would have no usable tool here', () => {
+    // models.json at openai/codex 8727186: gpt-5.5 is the one listed model without tool_mode code_mode_only.
+    expect(CODEX_DIRECT_MODELS).toEqual(['gpt-5.5']);
+    const model = (input) => { const a = codexArgs(input, mcp); return a[a.indexOf('--model') + 1]; };
+    expect(model(['exec', '--json'])).toBe('gpt-5.5');
+    expect(model(['exec', '--json', '-m', 'gpt-5.5'])).toBe('gpt-5.5');
+    for (const name of ['gpt-6-sol', 'gpt-5.6-terra', 'gpt-daybreak-blue-latest', 'codex-auto-review', 'gpt-7-unknown']) {
+      expect(() => codexArgs(['exec', '--json', '--model', name], mcp)).toThrow(/code mode/);
+    }
+  });
+
+  it('lets a turn think, talk, plan and call only the isolated tool', () => {
+    expect(checkCodexEvent({ type: 'thread.started', thread_id: 't' })).toBe(true);
+    for (const event of [{ type: 'turn.started' }, { type: 'turn.completed', usage: {} }, { type: 'turn.failed', error: { message: 'x' } }, { type: 'error', message: 'retrying' },
+      { type: 'item.completed', item: { type: 'agent_message', text: 'hi' } }, { type: 'item.started', item: { type: 'reasoning', text: '' } },
+      { type: 'item.updated', item: { type: 'todo_list', items: [] } }, { type: 'item.completed', item: { type: 'error', message: 'x' } },
+      { type: 'item.started', item: { type: 'mcp_tool_call', server: CODEX_SERVER, tool: CODEX_TOOL, arguments: {} } }]) {
+      expect(checkCodexEvent(event)).toBe(false);
+    }
+  });
+
+  it.each([
+    { type: 'item.started', item: { type: 'command_execution', command: 'cat ~/.codex/auth.json' } },
+    { type: 'item.completed', item: { type: 'file_change', changes: [] } },
+    { type: 'item.started', item: { type: 'web_search', query: 'x' } },
+    { type: 'item.started', item: { type: 'collab_tool_call' } },
+    { type: 'item.started', item: { type: 'mcp_tool_call', server: 'other', tool: 'exec' } },
+    { type: 'item.started', item: { type: 'mcp_tool_call', server: CODEX_SERVER, tool: 'read_resource' } },
+    { type: 'item.started', item: { type: 'image_view' } },
+    { type: 'item.started' }, { type: 'session.configured' }, {}, null,
+  ])('ends the session on anything else: %j', (event) => {
+    expect(() => checkCodexEvent(event)).toThrow(/isolation rejected/);
+  });
+
+  it('gives Codex its own private home, apart from Claude\'s: no inherited keys, tokens, CAs or endpoints', () => {
+    expect(codexEnv({ credentialHome: '/mnt/native/home' })).toEqual({ PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: '/mnt/native/home/codex', CODEX_HOME: '/mnt/native/home/codex' });
+  });
+
+  it('switches off every feature that adds a tool or call path (audited at openai/codex 8727186)', () => {
+    // Listed here on purpose, not imported: dropping one from the policy must fail this test.
+    for (const feature of REQUIRED_OFF) expect(CODEX_DISABLED_FEATURES).toContain(feature);
+    const args = codexArgs(['exec', '--json'], mcp);
+    for (const feature of CODEX_DISABLED_FEATURES) expect(args[args.indexOf(`features.${feature}=false`) - 1]).toBe('-c');
+    expect(args.some((a) => /^features\.[a-z_0-9]+=true$/.test(a))).toBe(false);
+  });
+
+  it('relays Codex errors only as a bounded line without URLs, addresses or token-like values', () => {
+    const raw = 'unexpected status 401 from https://chatgpt.com/backend-api/codex/responses?x=1 for owner@example.com token eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9abc\nsecond line';
+    const clean = sanitizeCodexText(raw);
+    expect(clean).toBe('unexpected status 401 from <url> for <email> token <redacted>');
+    expect(sanitizeCodexText(`You've hit your usage limit. ${'x'.repeat(400)}`)).toMatch(/^You've hit your usage limit\./);
+    expect(sanitizeCodexText(`${'a b '.repeat(200)}`).length).toBeLessThanOrEqual(300);
+    expect(sanitizeCodexEvent({ type: 'error', message: raw, extra: 'x' })).toEqual({ type: 'error', message: clean });
+    expect(sanitizeCodexEvent({ type: 'turn.failed', error: { message: raw, code: 'x' } })).toEqual({ type: 'turn.failed', error: { message: clean } });
+    expect(sanitizeCodexEvent({ type: 'item.completed', item: { id: 'e', type: 'error', message: raw } }).item.message).toBe(clean);
+    const message = { type: 'item.completed', item: { type: 'agent_message', text: 'done' } };
+    expect(sanitizeCodexEvent(message)).toBe(message);
+  });
+});
+
+describe.skipIf(process.platform === 'win32')('credential lock handover (adoptLock)', () => {
+  const uid = process.getuid?.() ?? 0;
+  const gid = process.getgid?.() ?? 0;
+  const withDir = (fn) => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-lock-')); try { fn(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); } };
+
+  it('leaves a missing lock for the credential identity to create, and keeps one it already owns', () => withDir((dir) => {
+    expect(adoptLock(`${dir}/lock`, uid, gid)).toBe('absent');
+    fs.writeFileSync(`${dir}/lock`, '', { mode: 0o600 });
+    expect(adoptLock(`${dir}/lock`, uid, gid)).toBe('kept');
+  }));
+
+  it('refuses a link, a hard link, a FIFO, a directory or another owner, and never removes it', () => withDir((dir) => {
+    fs.writeFileSync(`${dir}/target`, 'x', { mode: 0o600 });
+    fs.symlinkSync(`${dir}/target`, `${dir}/symlink`);
+    fs.linkSync(`${dir}/target`, `${dir}/hardlink`);
+    execFileSync('mkfifo', [`${dir}/fifo`]);
+    fs.mkdirSync(`${dir}/directory`);
+    for (const name of ['symlink', 'hardlink', 'fifo', 'directory']) {
+      expect(() => adoptLock(`${dir}/${name}`, uid, gid)).toThrow(LOCK_REFUSED);
+      expect(fs.lstatSync(`${dir}/${name}`)).toBeTruthy();
+    }
+    fs.writeFileSync(`${dir}/other`, '', { mode: 0o600 });
+    // Owned by neither the credential identity nor root (here: the test's own uid stands for a third owner).
+    expect(() => adoptLock(`${dir}/other`, uid + 1, gid, uid + 2)).toThrow(LOCK_REFUSED);
+  }));
+
+  it.skipIf(uid !== 0)('hands a root-owned 0600 lock to the credential identity in place', () => withDir((dir) => {
+    const file = `${dir}/lock`;
+    fs.writeFileSync(file, '', { mode: 0o600 });
+    const before = fs.statSync(file);
+    expect(adoptLock(file, 21001, 21001)).toBe('adopted');
+    const after = fs.statSync(file);
+    expect([after.uid, after.gid, after.ino, after.mode & 0o777]).toEqual([21001, 21001, before.ino, 0o600]);
+  }));
 });
 
 describe('native Claude worker policy', () => {

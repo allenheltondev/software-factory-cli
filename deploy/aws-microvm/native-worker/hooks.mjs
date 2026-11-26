@@ -105,7 +105,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     })().catch((error) => {
       const reason = error instanceof Error && [
         'native worker namespace probe failed', 'credential lease failed',
-        'credential home already leased or lock unavailable', 'credential home must be private to the Claude account',
+        'credential home already leased or lock unavailable', 'credential lock is not a private regular file', 'credential home must be private to the Claude account',
         'credential mount needs a private local parent directory', 'disposable Claude home requires a private tmpfs mount',
         'unexpected mount inside the disposable Claude home', 'probe listener exited before readiness',
       ].includes(error.message) ? error.message : undefined;

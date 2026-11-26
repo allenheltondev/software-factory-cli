@@ -225,6 +225,56 @@ Do not introduce a host-native agent or host verification wrapper. Existing narr
 git mounts protect metadata that host git would later obey. The optional Cloud worker control
 loop is documented separately in [CLOUD.md](CLOUD.md); no SSH server or custom login UI is added.
 
+## Codex on a ChatGPT subscription (#125)
+
+The same supervisor serves the official Codex CLI when the image installs it (add a pinned
+`@openai/codex` to `AGENT_PACKAGES` in `build.env`). `install.sh` then records `codex` and
+`codexAuthModule` (Updraft's `dist/agents/native-codex-auth.js`) in the worker config; without
+them Codex runs are refused. Codex runs as the same credential identity, with
+its own 0700 `HOME=CODEX_HOME=/var/lib/updraft-native-auth/home/codex` (created by that identity,
+never by root), and the config names the official native binary, not the npm wrapper. It is
+restricted like Claude: no user configuration or rules, every tool-adding feature off under
+`--strict-config` (shell, exec, apps/connectors, plugins, hooks, sub-agents, browser, image and
+web tools), its own sandbox read-only, a ChatGPT-only login on the OpenAI provider and the
+official backend, and one MCP tool (`updraft.exec`) into the same job sandbox. Codex announces no
+tool list, so the supervisor also kills the session on any event other than reasoning, messages,
+the to-do list and that one tool, and refuses to start it if CODEX_HOME holds a hooks file. Details and what remains to verify
+live: [docs/codex-subscription.md](../../../docs/codex-subscription.md).
+
+Sign in from a direct terminal, with the official device code flow:
+
+```sh
+cd /
+setpriv --reuid 1001 --regid 1001 --clear-groups -- \
+  env -i PATH=/usr/local/bin:/usr/bin:/bin \
+  HOME=/var/lib/updraft-native-auth/home/codex \
+  CODEX_HOME=/var/lib/updraft-native-auth/home/codex \
+  codex -c cli_auth_credentials_store='"file"' -c forced_login_method='"chatgpt"' \
+  -c chatgpt_base_url='"https://chatgpt.com/backend-api/"' login --device-auth
+```
+
+Open the printed page in your own browser, sign in to ChatGPT and enter the code. Use the same
+identity and environment with `login status` or `logout`. A Codex profile uses the same runtime,
+image, slot and capacity group as the Claude ones:
+
+```yaml
+  codex:
+    adapter: codex
+    maxConcurrent: 1
+    capacityGroup: native-claude-worker
+    command: codex
+    model: gpt-5.5   # a direct-mode model: code-mode-only models are refused here
+    container:
+      image: native-claude-worker
+      runtime: /opt/updraft/bin/updraft-native-worker
+      network: none
+```
+
+As for Claude, do not set `authentication: native-codex` on this container profile; the
+supervisor applies the Codex classifier before every launch itself. The disposable Cloud
+session's sign-in listener also offers `/codex-login` (device code shown in the private panel);
+Cloud does not route Codex jobs to a session yet.
+
 ## Live acceptance checklist — all still pending
 
 - Provision application tokens with explicit allowed ports excluding 9000 and run

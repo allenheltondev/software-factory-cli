@@ -32,6 +32,8 @@ import {
 } from '../agents/adapters/registry.js';
 import { agentProfile, describeProfile, effectiveArgs } from '../agents/profile.js';
 import { checkNativeClaudeAuth, nativeClaudeAuthHint, type NativeAuthRunner } from '../agents/native-claude-auth.js';
+import { checkNativeCodexAuth, nativeCodexAuthHint, type NativeCodexAuthRunner } from '../agents/native-codex-auth.js';
+import { CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem, codexSubscriptionEnvProblem, isolatedCodexModelProblem, onNativeWorker } from '../agents/native-codex-args.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { baseCheckSection, renderPrompt, renderRevisionPrompt, type BaseCheckPrompt, type IssueContext } from '../agents/prompt.js';
 import { dependencyMergedSection, dependencyProtocolSection, MAX_DEPENDENCY_WAITS, readDependency } from '../agents/dependency.js';
@@ -105,6 +107,8 @@ export interface LiveExecutorOptions {
   locate?: (adapter: string, agent: AgentConfig, opts: { env: NodeJS.ProcessEnv; configDir: string }) => LocatedLaunch;
   /** Injectable official Claude CLI subscription auth probe for opted-in agent jobs. */
   nativeClaudeAuth?: NativeAuthRunner;
+  /** Injectable official Codex CLI `login status` probe for native-codex (ChatGPT sign-in) jobs. */
+  nativeCodexAuth?: NativeCodexAuthRunner;
   /** POSIX: SIGTERM-to-SIGKILL grace when stopping the agent's process group. */
   killGraceMs?: number;
   /** Reads a pid's OS start time (see processStartTime). */
@@ -762,6 +766,29 @@ export class LiveExecutor implements Executor {
         throw new StartFailedError(`native Claude subscription not ready: ${auth.reason}. ${nativeClaudeAuthHint(auth.reason)}`);
       }
     }
+    // The isolated native worker runs Codex without code mode: refuse a code-mode-only model here,
+    // with the reason, instead of the worker's fixed refusal.
+    if (adapterName === 'codex' && onNativeWorker(agentCfg)) {
+      const problem = isolatedCodexModelProblem(agentProfile(adapterName, agentCfg).model.value);
+      if (problem) {
+        await log([`error: ${problem}`, 'outcome: start_failed']);
+        throw new StartFailedError(problem);
+      }
+    }
+    // The same for Codex's own Sign in with ChatGPT (docs/codex-subscription.md): only a ChatGPT
+    // login passes, and the profile may not choose another provider or sign-in method.
+    if (agentCfg.authentication === 'native-codex') {
+      if (adapterName !== 'codex' || agentCfg.container) {
+        throw new StartFailedError('native-codex authentication requires a host-native Codex CLI');
+      }
+      const problem = codexSubscriptionArgProblem(effectiveArgs(adapterName, agentCfg)) ?? codexSubscriptionEnvProblem(agentCfg.env);
+      if (problem) throw new StartFailedError(`native-codex profile cannot run on the ChatGPT subscription: ${problem}`);
+      const auth = await checkNativeCodexAuth(located.launch, lookup.env, this.opts.nativeCodexAuth);
+      if (auth.state !== 'connected') {
+        await log([`native subscription preflight: ${auth.state} (${auth.reason})`, 'outcome: start_failed']);
+        throw new StartFailedError(`native Codex ChatGPT sign-in not ready: ${auth.reason}. ${nativeCodexAuthHint(auth.reason)}`);
+      }
+    }
 
     // Who the agent commits as, when that is the GitHub App's bot. Asked before the worktree
     // exists, so a failure leaves nothing behind; commits are never rewritten afterwards.
@@ -867,7 +894,11 @@ export class LiveExecutor implements Executor {
         promptFile,
         worktree: prepared.worktreePath,
         runDir,
-        extraArgs: effectiveArgs(adapterName, agentCfg),
+        // native-codex: the built-in OpenAI provider and a ChatGPT-only login, whatever the CLI's
+        // own config.toml says (`-c` wins), so Codex itself refuses an API key that shows up later.
+        extraArgs: agentCfg.authentication === 'native-codex'
+          ? [...effectiveArgs(adapterName, agentCfg), ...CODEX_SUBSCRIPTION_ARGS]
+          : effectiveArgs(adapterName, agentCfg),
         platform: process.platform,
       });
     } catch (err) {
@@ -882,6 +913,13 @@ export class LiveExecutor implements Executor {
       if (finalAuth.state !== 'connected') {
         await log([`native subscription launch check: ${finalAuth.state} (${finalAuth.reason})`, 'outcome: start_failed']);
         throw new StartFailedError(`native Claude subscription not ready at launch: ${finalAuth.reason}. ${nativeClaudeAuthHint(finalAuth.reason)}`);
+      }
+    }
+    if (agentCfg.authentication === 'native-codex') {
+      const finalAuth = await checkNativeCodexAuth(located.launch, agentEnv, this.opts.nativeCodexAuth, prepared.worktreePath);
+      if (finalAuth.state !== 'connected') {
+        await log([`native subscription launch check: ${finalAuth.state} (${finalAuth.reason})`, 'outcome: start_failed']);
+        throw new StartFailedError(`native Codex ChatGPT sign-in not ready at launch: ${finalAuth.reason}. ${nativeCodexAuthHint(finalAuth.reason)}`);
       }
     }
     const timeoutMs = Math.round(timeoutMinutes * 60_000);

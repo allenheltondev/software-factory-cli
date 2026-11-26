@@ -1,6 +1,7 @@
 # Persistent Claude Code worker: native subscription proof (#100)
 
 The next experiment is the [EFS-backed Lambda MicroVM worker](../deploy/aws-microvm/native-worker/README.md).
+Codex on a ChatGPT subscription follows the same design: [codex-subscription.md](codex-subscription.md).
 It separates the credential-owning CLI from repository tools and verification, with Linux
 adversarial checks. Live EFS persistence and authenticated end-to-end execution remain unverified.
 

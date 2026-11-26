@@ -1,6 +1,8 @@
 import type { z } from 'zod';
 import { agentProfile, effectiveArgs } from '../agents/profile.js';
 import { getAdapter } from '../agents/adapters/registry.js';
+import { codexSubscriptionArgProblem, codexSubscriptionEnvProblem, isolatedCodexModelProblem, onNativeWorker } from '../agents/native-codex-args.js';
+import { hasCodexAuthOverride } from '../agents/native-codex-auth.js';
 import {
   KNOWN_ADAPTERS,
   agentAdapter,
@@ -72,6 +74,23 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       if (adapter !== 'claude') errors.push({ path: `agents.${agentName}.authentication`, message: 'native-claude authentication requires the Claude adapter' });
       if (agent.container) errors.push({ path: `agents.${agentName}.authentication`, message: 'native-claude authentication is unsupported with containerized agents until credential isolation is proven' });
       if (config.execution.mode !== 'live') warnings.push({ path: `agents.${agentName}.authentication`, message: 'native-claude authentication is checked only in live mode' });
+    }
+    if (agent.authentication === 'native-codex') {
+      const at = `agents.${agentName}.authentication`;
+      if (adapter !== 'codex') errors.push({ path: at, message: 'native-codex authentication requires the Codex adapter' });
+      if (agent.container) errors.push({ path: at, message: 'native-codex authentication is unsupported with containerized agents until credential isolation is proven' });
+      const problem = codexSubscriptionArgProblem(effectiveArgs(adapter, agent));
+      if (problem) errors.push({ path: `agents.${agentName}.args`, message: problem });
+      const envProblem = codexSubscriptionEnvProblem(agent.env);
+      if (envProblem) errors.push({ path: `agents.${agentName}.env`, message: envProblem });
+      for (const name of Object.keys(agent.env ?? {}).filter((n) => hasCodexAuthOverride({ [n]: 'set' }))) {
+        errors.push({ path: `agents.${agentName}.env.${name}`, message: `${name} selects an API key, token or endpoint; native-codex runs only on the CLI's own ChatGPT sign-in` });
+      }
+      if (config.execution.mode !== 'live') warnings.push({ path: at, message: 'native-codex authentication is checked only in live mode' });
+    }
+    if (adapter === 'codex' && onNativeWorker(agent)) {
+      const problem = isolatedCodexModelProblem(agentProfile(adapter, agent).model.value);
+      if (problem) errors.push({ path: `agents.${agentName}.model`, message: problem });
     }
     for (const problem of agentProfile(adapter, agent).problems) {
       errors.push({ path: `agents.${agentName}`, message: problem });
