@@ -171,6 +171,88 @@ describe('extractCriteria', () => {
     expect(g.pending.map((r) => r.id)).toEqual([UNLISTED_CRITERIA]);
   });
 
+  const UNIT_TESTS = [
+    '## Acceptance criteria',
+    '- [ ] Unit tests cover:',
+    '  - ordering for records received in the same millisecond;',
+    '  - issue filtering and pull-request-to-issue resolution;',
+    '  - `--limit`, `--outcome` and `--json`;',
+    '  - truncation and escaping;',
+    '  - every error case listed above.',
+    '- [ ] Errors are reported',
+  ].join('\n');
+
+  it('keeps a checklist item\'s sub-bullets as part of its criterion, and gives them to the reviewer', () => {
+    const s = extractCriteria(issue(UNIT_TESTS));
+    expect(s.criteria).toHaveLength(2);
+    expect(s.criteria[0]!.text).toBe(
+      [
+        'Unit tests cover:',
+        '- ordering for records received in the same millisecond;',
+        '- issue filtering and pull-request-to-issue resolution;',
+        '- `--limit`, `--outcome` and `--json`;',
+        '- truncation and escaping;',
+        '- every error case listed above.',
+      ].join('\n'),
+    );
+    expect(s.criteria[0]!.context).toBeNull();
+    expect(s.criteria[1]!.text).toBe('Errors are reported');
+    const prompt = reviewerAcceptanceSection(s, {}).join('\n');
+    expect(prompt).toContain(`<untrusted-acceptance-criterion>\n${s.criteria[0]!.text}\n</untrusted-acceptance-criterion>`);
+    expect(coderAcceptanceSection(s).join('\n')).toContain('- every error case listed above.\n</untrusted-acceptance-criterion>');
+  });
+
+  it('makes a nested checkbox a criterion of its own, with its parent\'s first line as context', () => {
+    const s = extractCriteria(
+      issue(['- [ ] The export works', '  continued here', '  - [ ] CSV export', '    - with a header row', '  - plain point of the parent', '- [ ] Next one'].join('\n')),
+    );
+    expect(s.criteria.map((c) => [c.text, c.context])).toEqual([
+      ['The export works continued here\n- plain point of the parent', null],
+      ['CSV export\n- with a header row', 'The export works continued here'],
+      ['Next one', null],
+    ]);
+    expect(reviewerAcceptanceSection(s, {}).join('\n')).toContain('- Nested under the item: "The export works continued here"');
+    // Nested checkboxes count toward the limit like any other.
+    const many = extractCriteria(issue(['- [ ] parent', ...Array.from({ length: MAX_CRITERIA }, (_, i) => `  - [ ] child ${i}`)].join('\n')));
+    expect(many.criteria).toHaveLength(MAX_CRITERIA);
+    expect(many.omitted).toBe(1);
+  });
+
+  it('keeps continuation lines and numbered sub-items; a following top-level item starts a new criterion', () => {
+    const s = extractCriteria(
+      issue(['- [ ] Retire is safe', '  when the generation', '  matches:', '  1. old workers', '     are skipped', '  2) new ones retire', '', '  Afterwards it logs.', '- [ ] Second'].join('\n')),
+    );
+    expect(s.criteria.map((c) => c.text)).toEqual([
+      'Retire is safe when the generation matches:\n1. old workers are skipped\n2) new ones retire\nAfterwards it logs.',
+      'Second',
+    ]);
+  });
+
+  it('leaves code blocks and HTML comments nested under an item out of its text', () => {
+    const s = extractCriteria(
+      issue(['- [ ] Parse the config', '  ```yaml', '  - [ ] not a criterion', '  - not a point', '  ```', '  <!-- - hidden point -->', '  - real point', '- [ ] Next'].join('\n')),
+    );
+    expect(s.criteria.map((c) => c.text)).toEqual(['Parse the config\n- real point', 'Next']);
+    // A sub-point marked optional does not make the criterion optional.
+    expect(extractCriteria(issue('- [ ] Tests\n  - (optional) a benchmark')).criteria[0]!.mandatory).toBe(true);
+  });
+
+  it('gives a criterion a new id when a sub-point is edited, and the old assessment does not carry over', () => {
+    const before = extractCriteria(issue(UNIT_TESTS));
+    const after = extractCriteria(issue(UNIT_TESTS.replace('truncation and escaping', 'truncation, escaping and wrapping')));
+    expect(after.criteria[0]!.id).not.toBe(before.criteria[0]!.id);
+    expect(after.criteria[1]!.id).toBe(before.criteria[1]!.id);
+    // An item without sub-points keeps the id it had before sub-points were read.
+    expect(before.criteria[1]!.id).toBe(extractCriteria(issue('- [ ] Errors are reported')).criteria[0]!.id);
+    const old = review({ criteria: before.criteria.map((c) => ({ criterion: c.id, status: 'verified', evidence: ['src/a.ts'] })) });
+    const a = assessAcceptance(after, old);
+    expect(a.rows.map((r) => [r.id, r.status])).toEqual([
+      [after.criteria[0]!.id, 'unverified'],
+      [after.criteria[1]!.id, 'verified'],
+    ]);
+    expect(acceptanceGate(a).pending.map((r) => r.id)).toEqual([after.criteria[0]!.id]);
+  });
+
   it('reports a withheld body as unavailable, never as an issue without requirements', () => {
     const s = extractCriteria(issue(null), 'report');
     expect(s).toMatchObject({ source: 'unavailable', criteria: [], policy: 'report' });

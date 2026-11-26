@@ -411,7 +411,10 @@ export type AcceptanceSourceKind = 'checklist' | 'requirements' | 'none' | 'unav
 export interface AcceptanceCriterion {
   /** `AC-<8 hex>`, from the criterion's normalized text: the same text keeps its id across edits of the rest of the issue. */
   id: string;
+  /** The item's first line, then its nested sub-bullets and numbered sub-items, a line each. */
   text: string;
+  /** For a checkbox nested under another item: that item's first line. Absent in snapshots recorded before it was read. */
+  context?: string | null;
   /** The heading it was listed under, if any. */
   section: string | null;
   origin: 'checklist' | 'requirement';
