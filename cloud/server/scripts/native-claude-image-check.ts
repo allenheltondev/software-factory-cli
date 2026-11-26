@@ -14,8 +14,14 @@ interface SmokeImage {
   brokerFunctionName: string;
 }
 
-/** Prove the signed-out customer entry point without logging in or binding a tenant. */
-export async function checkNativeClaudeImage(client: LambdaMicrovmsClient, image: SmokeImage) {
+/**
+ * Prove the signed-out customer entry point without logging in or binding a tenant. With
+ * `provider: 'codex'` (#125), the same image started as a Codex session: it accepts the Codex run
+ * hook and starts, serves its private `/codex-login` route and refuses Claude's. The socket is
+ * closed as soon as it opens, before the worker checks a login or asks OpenAI for a device code.
+ */
+export async function checkNativeClaudeImage(client: LambdaMicrovmsClient, image: SmokeImage, provider: 'claude' | 'codex' = 'claude') {
+  const label = provider === 'codex' ? 'Codex' : 'Claude';
   if (!image.brokerFunctionName) throw new Error('the stack has no BrokerFunctionName output');
   const connectors = `arn:${image.imageArn.split(':')[1]}:lambda:${image.region}:aws:network-connector:aws-network-connector:`;
   const vm = await client.send(new RunMicrovmCommand({
@@ -28,6 +34,7 @@ export async function checkNativeClaudeImage(client: LambdaMicrovmsClient, image
         region: image.region, brokerFunctionName: image.brokerFunctionName,
         workerId: 'signed-out-smoke', workerVersion: 'smoke', imageVersion: image.version,
         controlToken: randomBytes(32).toString('base64url'),
+        ...(provider === 'codex' ? { provider } : {}),
       },
     }),
   }));
@@ -64,11 +71,35 @@ export async function checkNativeClaudeImage(client: LambdaMicrovmsClient, image
     });
     await hook.body?.cancel();
     if (![401, 403].includes(hook.status)) throw new Error(`browser grant did not deny the lifecycle port: HTTP ${hook.status}`);
-    await verifyLoginPrompt(endpoint, token);
+    if (provider === 'codex') {
+      if (!await routeOpens(endpoint, token, '/codex-login')) throw new Error('the Codex worker did not serve its sign-in route');
+      if (await routeOpens(endpoint, token, '/claude-login')) throw new Error('the Codex worker served the Claude sign-in route');
+    } else await verifyLoginPrompt(endpoint, token);
   } catch (error) {
-    throw new Error(`Claude sign-in smoke failed for version ${image.version} (worker ${id}, logs ${image.logGroup}): ${error instanceof Error ? error.message : 'unknown error'}`, { cause: error });
+    throw new Error(`${label} sign-in smoke failed for version ${image.version} (worker ${id}, logs ${image.logGroup}): ${error instanceof Error ? error.message : 'unknown error'}`, { cause: error });
   } finally {
     await client.send(new TerminateMicrovmCommand({ microvmIdentifier: id }), { abortSignal: AbortSignal.timeout(15000) });
+  }
+}
+
+/** Whether the worker accepts a browser socket on `path`; closed at once, so nothing runs behind it. */
+async function routeOpens(endpoint: URL, token: string, path: '/codex-login' | '/claude-login'): Promise<boolean> {
+  const url = new URL(path, endpoint);
+  url.protocol = 'wss:';
+  const Socket = WebSocket as unknown as new (url: URL, options: { protocols: string[]; headers: Record<string, string> }) => WebSocket;
+  const ws = new Socket(url, {
+    protocols: ['lambda-microvms', `lambda-microvms.authentication.${token}`, 'lambda-microvms.port.8081'],
+    headers: { Origin: 'null' },
+  });
+  try {
+    return await new Promise<boolean>((resolve, reject) => {
+      AbortSignal.timeout(30000).addEventListener('abort', () => reject(new Error(`timed out opening ${path}`)));
+      ws.addEventListener('open', () => resolve(true), { once: true });
+      ws.addEventListener('error', () => resolve(false), { once: true });
+      ws.addEventListener('close', () => resolve(false), { once: true });
+    });
+  } finally {
+    ws.close();
   }
 }
 

@@ -39,13 +39,20 @@ export interface RefusalNotice {
   /** The keys that are not set; empty when the refusal is about something else (an agent no longer run, an unknown set of keys). */
   missing: string[];
   configVersion: number;
+  /** Not a key: the deployment's worker image cannot run Codex on the ChatGPT plan yet (#125). */
+  kind?: 'codex_unsupported';
 }
 
 /** One per subject, configuration version and set of keys: a relabel or a redelivery finds it. */
-export const refusalMarker = (n: Pick<RefusalNotice, 'configVersion' | 'missing'>) =>
-  `<!-- updraft-refused: missing_key v${n.configVersion} ${n.missing.length ? [...n.missing].sort().join(',') : 'config'} -->`;
+export const refusalMarker = (n: Pick<RefusalNotice, 'configVersion' | 'missing' | 'kind'>) =>
+  n.kind === 'codex_unsupported' ? `<!-- updraft-refused: codex_unsupported v${n.configVersion} -->`
+    : `<!-- updraft-refused: missing_key v${n.configVersion} ${n.missing.length ? [...n.missing].sort().join(',') : 'config'} -->`;
 
 export function refusalComment(n: RefusalNotice, consoleOrigin?: string): string {
+  if (n.kind === 'codex_unsupported') {
+    const again = n.pullRequest ? 'then submit the review again or push a commit.' : 'then remove the label and add it again.';
+    return [`Updraft could not start work on this ${n.pullRequest ? 'pull request' : 'issue'}: it runs Codex on your ChatGPT plan, and this deployment's subscription worker image does not support Codex yet. It was not run on an API key. An Updraft operator needs to publish a worker image verified with Codex; ${again}`, '', refusalMarker(n)].join('\n');
+  }
   const keys = consolePage(consoleOrigin, n.installationId, '/keys');
   const config = consolePage(consoleOrigin, n.installationId, '/config');
   const where = n.missing.length ? (keys ? ` Please [add ${n.missing.length > 1 ? 'them' : 'it'} under Agent keys](${keys}),` : ' Please add it under Agent keys in Updraft,') : config ? ` Please [fix the configuration](${config}),` : ' Please fix the configuration in Updraft,';

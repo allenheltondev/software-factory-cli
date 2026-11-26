@@ -137,7 +137,10 @@ export function claudeArgs(input, mcpConfig, { egress = false } = {}) {
 
 /**
  * Codex features switched off for every isolated session (codex-rs/features/src/lib.rs at
- * openai/codex 8727186). Audit: every feature that is on by default and adds a model-visible tool,
+ * openai/codex rust-v0.172.0, 3d86e43, the release the image pins: NATIVE_CODEX_VERSION in
+ * cloud/server/scripts/job-image-context.ts). Every key here is a FeatureSpec of that release:
+ * `--strict-config` rejects any other, and the image build runs the real pinned binary with these
+ * arguments to prove it (native-claude-image-check.ts, codex-config-check.mjs). Audit: every feature that is on by default and adds a model-visible tool,
  * a tool or MCP call path, an extra MCP server (the ChatGPT `codex_apps` connectors, plugins),
  * sub-agents, hooks, browser or computer use, image generation or an approval reviewer; plus the
  * off-by-default ones that would add such a tool if a later release turned them on. Infrastructure
@@ -152,9 +155,10 @@ export const CODEX_DISABLED_FEATURES = [
   'goals', 'tool_call_mcp_elicitation', 'auth_elicitation', 'guardian_approval', 'workspace_dependencies',
   // Off by default, pinned off.
   'multi_agent_v2', 'code_mode', 'code_mode_only', 'standalone_web_search', 'web_search_request', 'web_search_cached',
-  'web_search_indexed_default', 'request_permissions_tool', 'exec_permission_approvals', 'memories', 'recommended_plugins',
+  // With web_search="disabled", this one would let a host-requested search mode win (core/src/model_search.rs).
+  'hosted_search_policy', 'request_permissions_tool', 'exec_permission_approvals', 'memories', 'recommended_plugins',
   'agent_message_board', 'agent_message_board_mcp', 'enable_mcp_apps', 'deferred_executor', 'send_message_to_user_async',
-  'artifact', 'statsig_gates',
+  'artifact',
 ];
 
 /**
@@ -185,9 +189,9 @@ export function codexInstructions(egress = false) {
 }
 /**
  * Models the isolated session can use. A model the bundled catalog marks `tool_mode:
- * code_mode_only` (codex-rs/models-manager/models.json at openai/codex 8727186: the gpt-5.6, gpt-6.x
+ * code_mode_only` (codex-rs/models-manager/models.json at openai/codex rust-v0.172.0: the gpt-5.6, gpt-6.x
  * and daybreak models, codex-auto-review) reaches MCP tools only through code mode, which is
- * switched off here, so it would have no usable tool. At 8727186 the only listed direct-mode model
+ * switched off here, so it would have no usable tool. At rust-v0.172.0 the only listed direct-mode model
  * is gpt-5.5, which is also the default. Unknown models are refused rather than guessed. Re-check
  * against models.json for every pinned Codex version; src/agents/native-codex-args.ts holds the
  * same list for `updraft validate`.

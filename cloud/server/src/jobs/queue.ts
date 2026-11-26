@@ -6,6 +6,7 @@ import type { Quotas, Store } from '../store/store.js';
 import type { WorkflowRecorder } from '../workflows/recorder.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
 import type { LaunchRequest, LaunchResult } from './launch.js';
+import { providerOfWorker } from '../native/provider.js';
 import { isWaiting, type QueueEntry, type QueueState, type QueueStore, type QueueWaitReason } from './queue-store.js';
 import { mayReplace, parseStatusMarker, renderStatusComment, STATUS_STAGE, statusLinkLine } from '../../../../src/publish/status-marker.js';
 
@@ -92,6 +93,9 @@ const minutes = (ms: number) => {
   return m < 120 ? `${m} minute${m === 1 ? '' : 's'}` : `${Math.round(m / 60)} hours`;
 };
 
+/** Whose subscription a queued job's route is: Codex (ChatGPT) for a Codex session's worker, else Claude, as before. */
+const subscriptionName = (route: string) => providerOfWorker(route) === 'codex' ? 'Codex (ChatGPT)' : 'Claude';
+
 /** The acknowledgement on the issue or pull request, as the entry stands. No ETA, no claimed agent. */
 export function queueComment(e: QueueEntry, consoleOrigin?: string, now = Date.now()): string {
   const link = jobLink(consoleOrigin, e);
@@ -109,8 +113,9 @@ export function queueComment(e: QueueEntry, consoleOrigin?: string, now = Date.n
   const o = e.outcome;
   if (e.state === 'admitted' && o?.reason.startsWith('native_waiting')) {
     // Handed to the subscription's own wait: nothing has started yet, and this says so.
-    return lines('Waiting for the Claude subscription', [
-      `Capacity is available, and the job now waits for the connected Claude subscription (${o.reason === 'native_waiting_for_sign_in' ? 'a sign-in' : o.reason === 'native_waiting_for_reconnect' ? 'a reconnect' : 'its environment to be ready'}) before it starts. The job page says what is needed.`,
+    const sub = subscriptionName(e.route);
+    return lines(`Waiting for the ${sub} subscription`, [
+      `Capacity is available, and the job now waits for the connected ${sub} subscription (${o.reason === 'native_waiting_for_sign_in' ? 'a sign-in' : o.reason === 'native_waiting_for_reconnect' ? 'a reconnect' : 'its environment to be ready'}) before it starts. The job page says what is needed.`,
     ]);
   }
   if (e.state === 'admitted') {
@@ -145,7 +150,8 @@ export function quietQueueComment(e: QueueEntry, consoleOrigin?: string): { body
   if (isWaiting(e)) {
     status = { title: 'Queued', text: `Updraft queued this issue. ${waitMessage(e.reason)} It starts automatically when capacity is free; no action is needed.`, stage: STATUS_STAGE.queued };
   } else if (e.state === 'admitted' && o?.reason.startsWith('native_waiting')) {
-    status = { title: 'Waiting for Claude', text: 'Capacity is free; the job now waits for the connected Claude subscription before it starts.', stage: STATUS_STAGE.waiting };
+    const sub = subscriptionName(e.route);
+    status = { title: `Waiting for ${sub}`, text: `Capacity is free; the job now waits for the connected ${sub} subscription before it starts.`, stage: STATUS_STAGE.waiting };
   } else if (e.state === 'admitted' && o?.launchFailed) {
     // No runner took it over: its launch failed. Said as an end, until a retry's run takes the comment over.
     status = { title: 'Not started', text: 'Updraft could not start a worker for this work; the job page says why and can retry it.', stage: STATUS_STAGE.ended };
@@ -773,7 +779,7 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
       case 'not_dispatched': {
         if (r.reason === 'native_waiting_for_sign_in' || r.reason === 'native_waiting_for_reconnect' || r.reason === 'native_waiting_for_worker') {
           // The subscription's own durable wait took it over, under the same id.
-          await end(e, 'admitted', { reason: r.reason, message: r.message ?? 'Waiting for the Claude subscription.', ...(r.jobId ? { jobId: r.jobId } : {}) });
+          await end(e, 'admitted', { reason: r.reason, message: r.message ?? `Waiting for the ${subscriptionName(e.route)} subscription.`, ...(r.jobId ? { jobId: r.jobId } : {}) });
           return 'admitted';
         }
         if (r.reason === 'native_worker_unavailable') {

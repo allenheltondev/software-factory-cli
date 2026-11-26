@@ -42,7 +42,7 @@ export function codexSubscriptionEnvProblem(env: Record<string, string> | undefi
 /**
  * Models the isolated native worker can run (deploy/aws-microvm/native-worker/policy.mjs keeps the
  * same list). The worker switches Codex's code mode off, and a model whose bundled catalog entry
- * has `tool_mode: code_mode_only` (codex-rs/models-manager/models.json at openai/codex 8727186:
+ * has `tool_mode: code_mode_only` (codex-rs/models-manager/models.json at openai/codex rust-v0.172.0:
  * gpt-5.6-*, gpt-6*, the daybreak models, codex-auto-review) reaches MCP tools only through code
  * mode, so it would have no usable tool there. gpt-5.5 is the one direct-mode model listed, and the
  * worker's default. Unknown models are refused rather than guessed. Re-check for every pinned Codex.

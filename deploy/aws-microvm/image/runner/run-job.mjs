@@ -20,7 +20,11 @@ function integerFrom(name) {
 
 async function main() {
   const nativeWorker = process.env.UPDRAFT_NATIVE_WORKER === '1';
+  // Which CLI the session's subscription is for (#125): set by the native worker's root
+  // dispatcher from its run hook, never by the job. Absent: Claude, as before.
+  const nativeProvider = nativeWorker && process.env.UPDRAFT_NATIVE_PROVIDER === 'codex' ? 'codex' : 'claude';
   delete process.env.UPDRAFT_NATIVE_WORKER;
+  delete process.env.UPDRAFT_NATIVE_PROVIDER;
   // server.mjs validated this already; parsing again keeps this file usable on its own.
   const raw = JSON.parse(process.env.UPDRAFT_RUN_REQUEST ?? 'null');
   const request = parseRunRequest({ microvmId: raw?.microvmId, runHookPayload: JSON.stringify(raw?.payload ?? null) });
@@ -63,6 +67,7 @@ async function main() {
       hookPort,
       filter: createNftFilter({ endpoints, hookPort }),
       nativeWorker,
+      ...(nativeProvider === 'codex' ? { nativeProvider } : {}),
     };
   } catch (error) {
     isolation = { setupProblem: error?.message ?? String(error) };
@@ -100,7 +105,7 @@ async function main() {
 
   const result = await runJob(job.request, {
     ...job.aws,
-    ...(nativeWorker ? { configureJob: configureNativeJob } : {}),
+    ...(nativeWorker ? { configureJob: (stateDir) => configureNativeJob(stateDir, nativeProvider) } : {}),
     isolation,
     stateRoot,
     updraftCommand: [process.env.UPDRAFT_COMMAND ?? 'updraft'],

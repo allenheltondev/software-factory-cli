@@ -5,6 +5,7 @@ import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCom
 import { nativePartition, type NativeMode, type Worker } from './store.js';
 import { STARTUP_MS } from './admission.js';
 import type { LaunchRequest } from '../jobs/launch.js';
+import { managedWorkerId, providerKeys, type NativeProvider } from './provider.js';
 
 export type RetirementReason = 'reconnect' | 'idle' | 'lifetime' | 'vm-ended' | 'expired' | 'suspended' | 'worker-lost' | 'disabled' | 'startup-failed' | 'image-revoked' | 'image-blocked';
 
@@ -37,16 +38,28 @@ export interface WaitingClaudeJob {
   subject?: { repository: string; repositoryId: number; issue: number };
   /** When the one sign-in notice for this job was claimed (at park, or later by waiting-notice.ts). */
   noticeAt?: number;
+  /** A Codex session's wait (#125); absent on Claude's, and on every record written before it. */
+  provider?: 'codex';
 }
 
-export const managedWorkerId = (id: number) => `managed-${id}`;
+export { managedWorkerId };
 const partition = (id: number) => `TENANT#${id}`;
-const waitKey = (id: number, job: string) => ({ pk: partition(id), sk: `CLAUDE_WAIT#${job}` });
-const sessionKey = (id: number) => ({ pk: partition(id), sk: 'CLAUDE_SESSION' });
-export const waitingId = (installationId: number, deliveryId: string) =>
-  `job_${createHash('sha256').update(JSON.stringify([installationId, deliveryId, 'claude-wait'])).digest('base64url').slice(0, 16)}`;
+/** The session record's key: `CLAUDE_SESSION` for Claude exactly as before, `CODEX_SESSION` beside it. */
+export const sessionKeyOf = (id: number, provider: NativeProvider = 'claude') => ({ pk: partition(id), sk: providerKeys(provider).sessionSk });
+/** A waiting job's stable id; Claude's is unchanged, so a redelivery finds a job parked before providers existed. */
+export const waitingId = (installationId: number, deliveryId: string, provider: NativeProvider = 'claude') =>
+  `job_${createHash('sha256').update(JSON.stringify([installationId, deliveryId, providerKeys(provider).waitSalt])).digest('base64url').slice(0, 16)}`;
 
-export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.from(new DynamoDBClient({}), { marshallOptions: { removeUndefinedValues: true } })) {
+/** Claude's managed sessions, exactly as before providers (the default everywhere). */
+export function createClaudeSessions(table: string, db?: DynamoDBDocumentClient) {
+  return createManagedSessions(table, db, 'claude');
+}
+
+export function createManagedSessions(table: string, db = DynamoDBDocumentClient.from(new DynamoDBClient({}), { marshallOptions: { removeUndefinedValues: true } }), provider: NativeProvider = 'claude') {
+  const keys = providerKeys(provider);
+  const waitKey = (id: number, job: string) => ({ pk: partition(id), sk: `${keys.waitPrefix}${job}` });
+  const sessionKey = (id: number) => sessionKeyOf(id, provider);
+  const workerOf = (id: number) => managedWorkerId(id, provider);
   async function putIf(input: ConstructorParameters<typeof PutCommand>[0]) {
     try { await db.send(new PutCommand(input)); return true; }
     catch (error) { if (error instanceof ConditionalCheckFailedException) return false; throw error; }
@@ -56,6 +69,7 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
     return Item as T | undefined;
   }
   return {
+    provider,
     session: (id: number) => read<ManagedSession>(sessionKey(id)),
     async requestSession(id: number, previous: ManagedSession | undefined, imageVersion: string, now = Date.now()) {
       const session: ManagedSession = { generation: randomUUID(), imageVersion, requestedAt: now, startupDeadline: now + STARTUP_MS, admissionRequired: true };
@@ -81,7 +95,7 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
     /** Seal the exact generation AND its dispatch revision, including a missing worker row. */
     async retire(id: number, session: ManagedSession, mode: NativeMode, worker: Worker | null, reason: NonNullable<ManagedSession['retirementReason']> = 'reconnect', emergency?: ImagePolicy) {
       if (emergency && (emergency.state !== 'revoked' || emergency.imageVersion !== session.imageVersion || emergency.revision < 1)) return false;
-      const fenced: Worker = { ...(worker ?? { version: 0, installationId: id, workerId: managedWorkerId(id), session: session.generation,
+      const fenced: Worker = { ...(worker ?? { version: 0, installationId: id, workerId: workerOf(id), session: session.generation,
         imageVersion: session.imageVersion, workerVersion: 'unregistered', auth: 'unavailable', heartbeatAt: 0 }),
         microvmId: session.microvmId ?? 'mvm-pending', version: (worker?.version ?? 0) + 1, fenced: true };
       try {
@@ -89,11 +103,11 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
           { Update: { TableName: table, Key: sessionKey(id), UpdateExpression: 'SET retiring = :yes, retirementReason = :reason',
             ConditionExpression: 'generation = :g AND attribute_not_exists(retiring)',
             ExpressionAttributeValues: { ':g': session.generation, ':yes': true, ':reason': reason } } },
-          { Update: { TableName: table, Key: { pk: nativePartition(id, managedWorkerId(id)), sk: 'MODE' },
+          { Update: { TableName: table, Key: { pk: nativePartition(id, workerOf(id)), sk: 'MODE' },
             UpdateExpression: 'SET revision = :next, routingVersion = :routing',
             ConditionExpression: mode.revision === 0 ? 'attribute_not_exists(revision) OR revision = :revision' : 'revision = :revision',
             ExpressionAttributeValues: { ':revision': mode.revision, ':next': mode.revision + 1, ':routing': (mode.routingVersion ?? 0) + 1 } } },
-          { Put: { TableName: table, Item: { pk: nativePartition(id, managedWorkerId(id)), sk: 'WORKER', ...fenced },
+          { Put: { TableName: table, Item: { pk: nativePartition(id, workerOf(id)), sk: 'WORKER', ...fenced },
             ConditionExpression: worker ? (emergency ? '#v = :v' : '#v = :v AND attribute_not_exists(active) AND attribute_not_exists(settling)') : 'attribute_not_exists(pk)',
             ...(worker ? { ExpressionAttributeNames: { '#v': 'version' }, ExpressionAttributeValues: { ':v': worker.version } } : {}) } },
           ...(emergency ? [{ ConditionCheck: { TableName: table, Key: imagePolicyKey(session.imageVersion),
@@ -134,16 +148,16 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
         const page = await db.send(new QueryCommand({ TableName: table, ConsistentRead: true, KeyConditionExpression: 'pk = :p AND begins_with(sk, :q)',
           FilterExpression: '#status = :waiting AND expiresAt > :now AND attribute_not_exists(noticeAt) AND attribute_exists(subject)', Limit: 100, ExclusiveStartKey: cursor,
           ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':p': partition(id), ':q': 'CLAUDE_WAIT#', ':waiting': 'waiting', ':now': now } }));
+          ExpressionAttributeValues: { ':p': partition(id), ':q': keys.waitPrefix, ':waiting': 'waiting', ':now': now } }));
         found.push(...(page.Items ?? []) as WaitingClaudeJob[]);
         cursor = page.LastEvaluatedKey;
       } while (cursor && ++pages < 10 && found.length < 25);
       return found.slice(0, 25);
     },
     async park(request: WaitingClaudeJob['request'], eventKey: string, now = Date.now(), subject?: WaitingClaudeJob['subject']) {
-      const id = waitingId(request.installationId, request.deliveryId);
+      const id = waitingId(request.installationId, request.deliveryId, provider);
       const expiresAt = now + 24 * 60 * 60_000;
-      const item: WaitingClaudeJob = { id, request, eventKey, expiresAt, status: 'waiting', ...(subject ? { subject } : {}) };
+      const item: WaitingClaudeJob = { id, request, eventKey, expiresAt, status: 'waiting', ...(subject ? { subject } : {}), ...(provider === 'codex' ? { provider } : {}) };
       const created = await putIf({ TableName: table, Item: { ...waitKey(request.installationId, id), ...item, ttl: Math.ceil(expiresAt / 1000) },
         ConditionExpression: 'attribute_not_exists(pk)' });
       return { id, created };
@@ -156,7 +170,7 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
         const page = await db.send(new QueryCommand({ TableName: table, ConsistentRead: true, KeyConditionExpression: 'pk = :p AND begins_with(sk, :q)',
           FilterExpression: '#status = :waiting AND expiresAt > :now', Limit: 50, ExclusiveStartKey: cursor,
           ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: { ':p': partition(id), ':q': 'CLAUDE_WAIT#', ':waiting': 'waiting', ':now': Date.now() } }));
+          ExpressionAttributeValues: { ':p': partition(id), ':q': keys.waitPrefix, ':waiting': 'waiting', ':now': Date.now() } }));
         pending.push(...(page.Items ?? []) as WaitingClaudeJob[]);
         cursor = page.LastEvaluatedKey;
       } while (cursor && pending.length === 0);
@@ -172,4 +186,5 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
   };
 }
 
-export type ClaudeSessions = ReturnType<typeof createClaudeSessions>;
+export type ManagedSessions = ReturnType<typeof createManagedSessions>;
+export type ClaudeSessions = ManagedSessions;

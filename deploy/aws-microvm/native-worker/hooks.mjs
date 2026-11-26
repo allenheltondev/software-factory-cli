@@ -7,7 +7,7 @@ import { loadConfig } from './policy.mjs';
 import { assertEphemeralHome, startService } from './service.mjs';
 import { startBrowserLogin } from './browser-login.mjs';
 import { startProbe } from './probe.mjs';
-import { cloudConfig, startCloudWorker } from './cloud.mjs';
+import { cloudConfig, cloudProvider, startCloudWorker } from './cloud.mjs';
 
 export function bootPayload(text) {
   const p = JSON.parse(text);
@@ -68,7 +68,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
           try {
             phase = 'health-listener';
             probe = await startProbe(config);
-            if (ephemeral && cloudSettings) { phase = 'browser-login-listener'; login = await startBrowserLogin(config); }
+            if (ephemeral && cloudSettings) { phase = 'browser-login-listener'; login = await startBrowserLogin(config, cloudProvider(cloudSettings)); }
           } catch (error) { await probe?.close(); await service.close(); throw error; }
           if (cloudSettings) {
             phase = 'cloud-registration';

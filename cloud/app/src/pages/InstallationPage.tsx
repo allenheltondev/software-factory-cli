@@ -490,7 +490,10 @@ function DeliveriesList({ deliveries, base }: { deliveries: Delivery[]; base: st
                     <a className="auth-link" href={d.message} target="_blank" rel="noreferrer">View Claude session</a>
                   )}
                   {d.jobId && d.reason === 'native_waiting_for_sign_in' && (
-                    <Link className="auth-link" to={`${base}/claude?request=${encodeURIComponent(d.jobId)}`}>Open Claude sign-in request</Link>
+                    // A Codex wait is recorded as one (server jobs/deliveries.ts); every other is Claude's.
+                    d.provider === 'codex'
+                      ? <Link className="auth-link" to={`${base}/codex?request=${encodeURIComponent(d.jobId)}`}>Open ChatGPT sign-in request</Link>
+                      : <Link className="auth-link" to={`${base}/claude?request=${encodeURIComponent(d.jobId)}`}>Open Claude sign-in request</Link>
                   )}
                   {d.jobId && d.disposition === 'launched' && (
                     <Link className="auth-link" to={`${base}/jobs/${d.jobId}`}>

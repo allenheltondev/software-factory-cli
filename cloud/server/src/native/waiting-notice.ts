@@ -2,6 +2,7 @@ import { readinessAction, signInWait, waitingComment, type NativeLaunch, type Na
 import type { Store } from '../store/store.js';
 import type { WorkflowRecorder } from '../workflows/recorder.js';
 import type { ClaudeSessions, WaitingClaudeJob } from './sessions.js';
+import { providerKeys, type NativeProvider } from './provider.js';
 
 /**
  * The late sign-in notice (#176). A job parked on a wait that ends by itself (a starting worker,
@@ -46,26 +47,31 @@ export function createWaitingNotifier(deps: {
   workflows?: Pick<WorkflowRecorder, 'waiting'>;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
+  /** Whose waits these are (Claude when absent): the comment, the console page and the timeline name it. */
+  provider?: NativeProvider;
 }) {
   const now = deps.now ?? Date.now;
+  const provider = deps.provider ?? 'claude';
+  const keys = providerKeys(provider);
   const log = deps.log ?? ((entry) => console.log(JSON.stringify(entry)));
 
   async function tenant(installationId: number, report: WaitingNoticeReport) {
     const jobs = (await deps.sessions.unnoticed(installationId, now())).filter((j): j is WaitingClaudeJob & { subject: NonNullable<WaitingClaudeJob['subject']> } => !!j.subject);
     if (!jobs.length) return;
     const native = await deps.resolveNative(installationId);
-    if (!native?.readiness) return;
+    // An image that cannot run this provider has no sign-in to ask for.
+    if (!native?.readiness || native.unavailable) return;
     const readiness: NativeReadiness = await native.readiness();
     const action = readinessAction(readiness);
     if (action !== 'sign-in' && action !== 'reconnect') return;
     const retirement = readiness === 'environment-retiring' ? await native.retirement?.().catch(() => undefined) : undefined;
     for (const job of jobs) {
-      const link = deps.consoleOrigin ? new URL(`/installations/${installationId}/claude?request=${job.id}`, deps.consoleOrigin).href : undefined;
-      const body = link ? waitingComment(link, readiness, retirement) : undefined;
+      const link = deps.consoleOrigin ? new URL(`/installations/${installationId}/${keys.consolePage}?request=${job.id}`, deps.consoleOrigin).href : undefined;
+      const body = link ? waitingComment(link, readiness, retirement, provider) : undefined;
       if (!body) continue;
       const at = now();
       if (!await deps.sessions.claimNotice(installationId, job.id, at)) continue;
-      const wait = signInWait(action, { readiness, ...(retirement ? { retirement } : {}) });
+      const wait = signInWait(action, { readiness, ...(retirement ? { retirement } : {}) }, provider);
       const record = (why: typeof wait) => deps.workflows?.waiting({
         installationId, repository: job.subject.repository, repositoryId: job.subject.repositoryId, issue: job.subject.issue,
         eventName: job.request.eventName ?? 'issues', deliveryId: job.request.deliveryId, jobId: job.id,
@@ -77,18 +83,18 @@ export function createWaitingNotifier(deps: {
           // The claim stays: retrying every run for the wait's whole life cannot help. The wait
           // and why no comment was posted go on the timeline instead.
           report.unpostable++;
-          log({ claudeWaiting: 'notice unpostable', installationId, jobId: job.id, status: (error as { status?: number }).status });
+          log({ claudeWaiting: 'notice unpostable', installationId, jobId: job.id, status: (error as { status?: number }).status, ...(provider === 'codex' ? { provider } : {}) });
           await record({ ...wait, message: `${wait.message} No comment could be posted on the issue (GitHub refused it: ${(error as { status?: number }).status}).`,
-            code: `${wait.code ?? 'claude_sign_in'}_uncommented` });
+            code: `${wait.code ?? `${keys.code}_sign_in`}_uncommented` });
           continue;
         }
         await deps.sessions.releaseNotice(installationId, job.id, at).catch(() => undefined);
         report.failed++;
-        log({ claudeWaiting: 'notice failed', installationId, jobId: job.id, name: (error as Error)?.name });
+        log({ claudeWaiting: 'notice failed', installationId, jobId: job.id, name: (error as Error)?.name, ...(provider === 'codex' ? { provider } : {}) });
         continue;
       }
       report.noticed++;
-      log({ claudeWaiting: 'noticed', installationId, jobId: job.id, readiness, ...(retirement ? { retirementReason: retirement } : {}) });
+      log({ claudeWaiting: 'noticed', installationId, jobId: job.id, readiness, ...(retirement ? { retirementReason: retirement } : {}), ...(provider === 'codex' ? { provider } : {}) });
       await record(wait);
     }
   }
@@ -102,7 +108,7 @@ export function createWaitingNotifier(deps: {
         await tenant(t.installationId, report);
       } catch (error) {
         report.failed++;
-        log({ claudeWaiting: 'notice check failed', installationId: t.installationId, name: (error as Error)?.name });
+        log({ claudeWaiting: 'notice check failed', installationId: t.installationId, name: (error as Error)?.name, ...(provider === 'codex' ? { provider } : {}) });
       }
     }
     return report;

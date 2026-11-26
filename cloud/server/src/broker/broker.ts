@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { NATIVE_SLOT_HOLD_UNTIL } from '../native/route.js';
+import { providerKeys, providerOfWorker } from '../native/provider.js';
 import { GitHubError, type GitHubApi } from '../github/client.js';
 import { appJwt } from '../github/jwt.js';
 import type { LoadSettings } from '../github/settings.js';
@@ -103,14 +104,19 @@ export interface PolicyContext {
 /**
  * The agent keys a job is handed, by variable name: what its workflow can need, as the launcher
  * recorded it (`agentKeys`: every enabled agent of every pool the workflow can route to, the
- * reviewer's included; a revision or CI fix inherits its origin's). A native job runs Claude on
- * the subscription, so never the Anthropic key; a native job with none recorded gets none.
+ * reviewer's included; a revision or CI fix inherits its origin's). A native job runs its
+ * provider's CLI on the subscription, so never that provider's key (a Claude session's job no
+ * ANTHROPIC_API_KEY, a Codex session's job no CODEX_API_KEY, #125); a native job with none
+ * recorded gets none.
  * null: an ordinary job recorded without them (launched before keys were recorded, or a pull
  * request job whose workflow is not known here), handed every key the tenant may have set.
  */
 export function jobAgentKeys(job: Pick<Job, 'native' | 'agentKeys' | 'benchmark'>): string[] | null {
   if (job.benchmark) return job.agentKeys ?? [];
-  if (job.native) return (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY');
+  if (job.native) {
+    const own = providerKeys(providerOfWorker(job.native.workerId)).apiKey;
+    return (job.agentKeys ?? []).filter((k) => k !== own);
+  }
   return job.agentKeys ?? null;
 }
 

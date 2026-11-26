@@ -1,4 +1,5 @@
 import { waitingId } from '../native/sessions.js';
+import { isManagedWorkerId, parseManagedWorkerId, providerKeys, providerOfWorker, type NativeProvider } from '../native/provider.js';
 import type { RefusalNotice } from './notices.js';
 import { retirementCode, retirementWords } from '../native/retirement.js';
 import { workflowIsPaused } from './stop.js';
@@ -116,6 +117,8 @@ export interface RunMicrovmInput {
 
 export interface NativeLaunch {
   route: NativeRoute;
+  /** The subscription CLI of this worker; absent: Claude (a pinned route, or a binding from before #125). */
+  provider?: NativeProvider;
   secret(): Promise<string>;
   enabled?(): Promise<boolean>;
   mode?(): Promise<NativeMode>;
@@ -124,6 +127,12 @@ export interface NativeLaunch {
   readiness?(): Promise<NativeReadiness>;
   /** A managed session that is sealed (`environment-retiring`): why it was retired, as recorded. */
   retirement?(): Promise<string | undefined>;
+  /**
+   * Set when this route cannot run at all on the deployed image (Codex on an image not verified
+   * with it, #125): why, for people. Its mode and triggers still route the delivery here, so it is
+   * refused as unavailable, never moved to an API key; readiness is never asked.
+   */
+  unavailable?: string;
 }
 
 /** Why a subscription worker is not taking a job now; see readinessAction for what it asks of the owner. */
@@ -145,9 +154,9 @@ export function readinessAction(reason: NativeReadiness): 'none' | 'sign-in' | '
 }
 export const needsSignIn = (reason: NativeReadiness) => readinessAction(reason) === 'sign-in';
 /** Why an environment that can never serve again stopped, in words (a sealed one says its own reason). */
-export function endedWords(reason: NativeReadiness, retirement?: string): string {
+export function endedWords(reason: NativeReadiness, retirement?: string, provider: NativeProvider = 'claude'): string {
   switch (reason) {
-    case 'environment-retiring': return retirementWords(retirement);
+    case 'environment-retiring': return retirementWords(retirement, provider);
     case 'environment-suspended': return 'its VM was suspended, and it is never resumed';
     case 'environment-ended': return 'its VM stopped running';
     case 'fenced': return 'it was stopped';
@@ -162,12 +171,31 @@ export function endedWords(reason: NativeReadiness, retirement?: string): string
 }
 
 /** The timeline's code for a wait only a person ends: the sealed session's own reason, or the readiness. */
-export const waitCode = (reason: NativeReadiness, retirement?: string) =>
-  reason === 'environment-retiring' ? retirementCode(retirement) : `claude_${reason.replace(/-/g, '_')}`;
+export const waitCode = (reason: NativeReadiness, retirement?: string, provider: NativeProvider = 'claude') =>
+  reason === 'environment-retiring' ? retirementCode(retirement, provider) : `${providerKeys(provider).code}_${reason.replace(/-/g, '_')}`;
 
 /** What a workflow waiting for a person (a sign-in) says, with the specific cause as its event's code (#176). */
-export function signInWait(action: 'sign-in' | 'reconnect', why?: { readiness: NativeReadiness; retirement?: string }) {
-  const code = why ? { code: waitCode(why.readiness, why.retirement) } : {};
+export function signInWait(action: 'sign-in' | 'reconnect', why?: { readiness: NativeReadiness; retirement?: string }, provider: NativeProvider = 'claude') {
+  const code = why ? { code: waitCode(why.readiness, why.retirement, provider) } : {};
+  if (provider === 'codex') {
+    return action === 'sign-in'
+      ? {
+          reason: 'sign_in_required',
+          message: 'The job waits for Codex to be signed in with ChatGPT before it can start.',
+          nextAction: 'Open the Codex page of this installation and sign in with ChatGPT; the job then starts on its own.',
+          provider: 'codex' as const,
+          ...code,
+        }
+      : {
+          reason: 'reconnect_required',
+          message: why
+            ? `The job waits for a new Codex session: the previous one ended because ${endedWords(why.readiness, why.retirement, provider)}. A new session needs a ChatGPT sign-in.`
+            : 'The job waits for Codex to be reconnected to ChatGPT before it can start.',
+          nextAction: 'Open the Codex page of this installation and sign in with ChatGPT again; the job then starts on its own.',
+          provider: 'codex' as const,
+          ...code,
+        };
+  }
   return action === 'sign-in'
     ? {
         reason: 'sign_in_required',
@@ -194,10 +222,14 @@ export function signInWait(action: 'sign-in' | 'reconnect', why?: { readiness: N
  * at park: the job starts on its own, and should that wait turn into one for a sign-in (the
  * session is sealed, the login lapses), native/waiting-notice.ts posts this comment then, once.
  */
-export function waitingComment(link: string, reason?: NativeReadiness, retirement?: string): string | undefined {
+export function waitingComment(link: string, reason?: NativeReadiness, retirement?: string, provider: NativeProvider = 'claude'): string | undefined {
   const action = reason === undefined ? 'sign-in' : readinessAction(reason);
   // A please-act comment (#173): one sentence, what to do, the console link.
   if (action === 'wait' || action === 'none') return undefined;
+  if (provider === 'codex') {
+    if (action === 'reconnect') return `Codex needs you to sign in with ChatGPT again because the previous Codex session ended (${endedWords(reason!, retirement, provider)}): [sign in from Updraft](${link}) and this job starts on its own.`;
+    return `Codex needs you to sign in with ChatGPT before this job can start: [sign in from Updraft](${link}) and it starts on its own.`;
+  }
   if (action === 'reconnect') return `Claude needs you to sign in again because the previous Claude session ended (${endedWords(reason!, retirement)}): [sign in from Updraft](${link}) and this job starts on its own.`;
   return `Claude needs you to sign in before this job can start: [sign in from Updraft](${link}) and it starts on its own.`;
 }
@@ -208,8 +240,11 @@ export interface LaunchDeps {
   benchmarkInstallationId?: number;
   native?: NativeLaunch;
   resolveNative?(installationId: number): Promise<NativeLaunch | undefined>;
-  parkedClaude?(request: LaunchRequest): Promise<string | undefined>;
-  waitForClaude?(request: LaunchRequest, repository: string, repositoryId: number, issue: number, reason?: NativeReadiness, retirement?: string): Promise<string>;
+  /** The installation's Codex session (ChatGPT plan, #125). Absent: no Codex subscription routing. */
+  resolveCodex?(installationId: number): Promise<NativeLaunch | undefined>;
+  /** A job already parked for this delivery on the provider's wait (Claude when absent). */
+  parkedClaude?(request: LaunchRequest, provider?: NativeProvider): Promise<string | undefined>;
+  waitForClaude?(request: LaunchRequest, repository: string, repositoryId: number, issue: number, reason?: NativeReadiness, retirement?: string, provider?: NativeProvider): Promise<string>;
   store: Store;
   settings: LaunchSettings;
   /** The published image version; null while jobs are off (no image built yet). */
@@ -294,6 +329,8 @@ export interface LaunchResult {
   errorClass?: string;
   /** coalesced: the job of the same pull request this event was folded into. */
   coveredBy?: string;
+  /** A subscription wait (native_waiting_*) on Codex's session (#125). Absent: Claude's, as before. */
+  provider?: 'codex';
 }
 
 // A GitHub delivery id is a GUID; it becomes part of an S3 key, so nothing else is accepted.
@@ -366,6 +403,25 @@ export function createLauncher(deps: LaunchDeps) {
     const binding = benchmark ? undefined : deps.native?.route.installationId === req.installationId ? deps.native : await deps.resolveNative?.(req.installationId);
     const mode = await binding?.mode?.();
     const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
+    // Codex on a ChatGPT plan (#125): its own session and its own explicit triggers, never legacy ones.
+    // A failure to read Codex's routing never holds up Claude work, nor a workflow that cannot be
+    // Codex's: it is logged, and only a delivery that could be Codex's fails, retryably (below).
+    // Codex work never falls back to an API key.
+    let codexBinding: NativeLaunch | undefined;
+    let codexMode: NativeMode | undefined;
+    let codexFailure: unknown;
+    if (!benchmark && deps.resolveCodex) {
+      try {
+        codexBinding = await deps.resolveCodex(req.installationId);
+        codexMode = await codexBinding?.mode?.();
+      } catch (err) {
+        codexFailure = err;
+        codexBinding = undefined;
+        codexMode = undefined;
+        log({ delivery: req.deliveryId, installationId: req.installationId, warning: 'codex routing unavailable', name: (err as Error)?.name ?? 'error' });
+      }
+    }
+    const codexTriggers = codexMode?.triggers ?? [];
     let workerId = req.retryRuntime?.workerId;
     let workflowIssue = req.workflowIssue;
     if (isIssue) {
@@ -417,7 +473,9 @@ export function createLauncher(deps: LaunchDeps) {
         const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
         const originJob = origin ? await deps.store.getJob(origin.jobId) : null;
         // A failed read is retryable; a missing record is unknown, never evidence of API origin.
-        if (!originJob && (mode?.triggers !== undefined || triggers.some((t) => sameNativeRepository(t, d)))) {
+        // With Codex's routing unreadable, an unknown origin could be Codex's: fail, retryably.
+        if (!originJob && codexFailure !== undefined) throw codexFailure;
+        if (!originJob && (mode?.triggers !== undefined || triggers.some((t) => sameNativeRepository(t, d)) || codexTriggers.some((t) => sameNativeRepository(t, d)))) {
           return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this pull request runtime' });
         }
         workerId = originJob?.native?.workerId ?? workerId;
@@ -457,16 +515,47 @@ export function createLauncher(deps: LaunchDeps) {
       reason: 'workflow_paused', message: 'An owner stopped this workflow. Resume automation or explicitly retry the stopped job to continue.',
     });
 
+    // Pinned to the Codex worker while its routing could not be read: retry, never reroute.
+    if (codexFailure !== undefined && parseManagedWorkerId(workerId)?.provider === 'codex') throw codexFailure;
     const selected = isIssue && !req.retryRuntime && (mode?.triggers === undefined || decision.keys?.includes('ANTHROPIC_API_KEY')) && triggers.some((t) => sameNativeTrigger(t, decision));
     const candidate = binding && (selected || workerId === binding.route.workerId) ? binding : undefined;
-    const native = candidate && (mode?.enabled ?? await candidate.enabled?.() ?? true) ? candidate : undefined;
+    const claudeNative = candidate && (mode?.enabled ?? await candidate.enabled?.() ?? true) ? candidate : undefined;
+    // Codex's routing unreadable, for an issue Claude does not take whose workflow needs Codex's
+    // key: it may be a ChatGPT-plan trigger, so it fails retryably rather than run on the API key.
+    if (codexFailure !== undefined && !claudeNative && isIssue && decision.keys?.includes('CODEX_API_KEY')) throw codexFailure;
+    // One route per delivery, never two jobs: Claude's subscription is decided first, exactly as
+    // before. Only when it does not take the delivery may Codex's: a workflow that needs Codex's
+    // key, on a trigger the owner chose for the ChatGPT plan, or work whose runtime (a pull
+    // request's origin, a console retry) is that Codex worker. Work pinned to another worker
+    // never moves to Codex, and nothing falls back from Codex to an API key or back.
+    const codexWanted = !!codexBinding && !claudeNative && (workerId !== undefined
+      ? workerId === codexBinding.route.workerId
+      : isIssue && !req.retryRuntime && !!decision.keys?.includes('CODEX_API_KEY') && codexTriggers.some((t) => sameNativeTrigger(t, decision)));
+    const codexNative = codexWanted && (codexMode?.enabled ?? await codexBinding!.enabled?.() ?? false) ? codexBinding : undefined;
+    const native = claudeNative ?? codexNative;
+    const nativeMode = claudeNative ? mode : codexNative ? codexMode : undefined;
+    const provider: NativeProvider = native?.provider ?? providerOfWorker(native?.route.workerId);
+    const named = providerKeys(provider).name;
     // Queued work keeps the route it was queued for: a change of routing (subscription mode
     // turned on or off, another worker) refuses it, never silently moves it to API keys or back.
     if (req.queued && req.queued.route !== (native?.route.workerId ?? 'standard')) {
-      return skip('not_dispatched', { reason: 'route_changed', message: 'The execution route for this workflow changed while the job was queued (Claude subscription or API key)' });
+      return skip('not_dispatched', { reason: 'route_changed', message: 'The execution route for this workflow changed while the job was queued (Claude or Codex subscription, or API key)' });
     }
-    if (req.resumeClaude && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'This workflow no longer uses Claude subscription routing' });
+    if (req.resumeClaude && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'This workflow no longer uses subscription routing' });
     if (workerId && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'The subscription worker is disabled; reconnect it to continue this job' });
+    // A Codex route on an image that cannot run Codex (never verified with it, or rolled back):
+    // the owner chose the ChatGPT plan, so it is never moved to the API key. It waits, and the
+    // issue is told once why (jobs/notices.ts). Nothing is reserved or started.
+    if (native?.unavailable) {
+      const message = native.unavailable;
+      log({ delivery: req.deliveryId, installationId: req.installationId, nativeDispatch: 'refuse', provider, reason: 'image_unsupported' });
+      if (!req.queued && !req.retry && !req.retryRuntime && deps.notifyRefused) {
+        await deps.notifyRefused({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, number: (decision.issue ?? decision.pullRequest)!,
+          pullRequest: !isIssue, message, missing: [], configVersion, kind: 'codex_unsupported' })
+          .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the refusal: ${(err as Error)?.name ?? 'error'}` }));
+      }
+      return skip('not_dispatched', { reason: 'native_worker_unavailable', message });
+    }
     const imageVersion = native?.route.imageVersion ?? await deps.imageVersion();
     if (!imageVersion) return skip('jobs_off');
     if (await killSwitch.engaged()) {
@@ -475,16 +564,22 @@ export function createLauncher(deps: LaunchDeps) {
     }
 
     /** The issue's workflow waits for the sign-in (workflows/recorder.ts); it is blocked if no one signs in. */
-    const waitingForSignIn = (jobId: string, action: 'sign-in' | 'reconnect' = 'sign-in', why?: { readiness: NativeReadiness; retirement?: string }) =>
+    const waitingForSignIn = (jobId: string, action: 'sign-in' | 'reconnect' = 'sign-in', why?: { readiness: NativeReadiness; retirement?: string }, waitProvider: NativeProvider = provider) =>
       deps.workflows?.waiting(
         { installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, eventName, deliveryId: req.deliveryId, jobId, ...(decision.issue !== undefined ? { issue: decision.issue } : {}), ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}) },
-        signInWait(action, why),
+        signInWait(action, why, waitProvider),
       );
-    if (binding?.route.workerId.startsWith('managed-') && !req.resumeClaude && !req.retry) {
-      const jobId = await deps.parkedClaude?.(req);
-      if (jobId) {
-        await waitingForSignIn(jobId);
-        return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Open the Claude sign-in request for this delivery', jobId };
+    // A redelivery of a delivery already parked on a sign-in wait answers with that wait. Claude's
+    // wait is looked up exactly as before; Codex's only where a Codex session is deployed.
+    if (!req.resumeClaude && !req.retry) {
+      for (const [parkedOn, waitProvider] of [[binding, 'claude'], [codexBinding, 'codex']] as const) {
+        if (!parkedOn || !isManagedWorkerId(parkedOn.route.workerId)) continue;
+        const jobId = await (waitProvider === 'claude' ? deps.parkedClaude?.(req) : deps.parkedClaude?.(req, waitProvider));
+        if (jobId) {
+          await waitingForSignIn(jobId, 'sign-in', undefined, waitProvider);
+          return { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: `Open the ${providerKeys(waitProvider).name} sign-in request for this delivery`, jobId,
+            ...(waitProvider === 'codex' ? { provider: waitProvider } : {}) };
+        }
       }
     }
     const readiness: NativeReadiness | undefined = native?.readiness ? await native.readiness()
@@ -495,22 +590,26 @@ export function createLauncher(deps: LaunchDeps) {
     if (native && readiness) {
       // One line per dispatch decision, with no credential or account detail (#144).
       log({ delivery: req.deliveryId, installationId: req.installationId, nativeDispatch: readiness === 'ready' ? 'reuse' : 'wait',
-        readiness, ownerAction: readinessAction(readiness), generation: native.route.generation, microvmId: native.route.microvmId, imageVersion: native.route.imageVersion,
+        ...(provider === 'codex' ? { provider } : {}), readiness, ownerAction: readinessAction(readiness), generation: native.route.generation, microvmId: native.route.microvmId, imageVersion: native.route.imageVersion,
         ...(retirement ? { retirementReason: retirement } : {}) });
     }
     if (native && readiness && readiness !== 'ready') {
-      if (native.route.workerId.startsWith('managed-') && decision.issue !== undefined && !req.resumeClaude && !req.retry && deps.waitForClaude) {
-        const jobId = await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness, retirement);
+      if (isManagedWorkerId(native.route.workerId) && decision.issue !== undefined && !req.resumeClaude && !req.retry && deps.waitForClaude) {
+        const jobId = provider === 'codex'
+          ? await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness, retirement, provider)
+          : await deps.waitForClaude(req, decision.repository, decision.repositoryId, decision.issue, readiness, retirement);
         const action = readinessAction(readiness);
         // A wait only a person can end (a sign-in, a reconnect) is the workflow's too.
         if (action === 'sign-in' || action === 'reconnect') await waitingForSignIn(jobId, action, { readiness, ...(retirement ? { retirement } : {}) });
+        // Whose wait it is, explicitly (Claude's results are unchanged): the console and records use it.
+        const whose = provider === 'codex' ? { provider: 'codex' as const } : {};
         return action === 'sign-in'
-          ? { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: 'Waiting for Claude subscription sign-in', jobId }
+          ? { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_sign_in', message: provider === 'codex' ? 'Waiting for Codex to be signed in with ChatGPT' : 'Waiting for Claude subscription sign-in', jobId, ...whose }
           : action === 'reconnect'
-            ? { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_reconnect', message: `Waiting for Claude to be reconnected (${readiness})`, jobId }
-            : { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_worker', message: `Waiting for the connected Claude environment (${readiness})`, jobId };
+            ? { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_reconnect', message: `Waiting for ${named} to be reconnected (${readiness})`, jobId, ...whose }
+            : { status: 202, disposition: 'not_dispatched', reason: 'native_waiting_for_worker', message: `Waiting for the connected ${named} environment (${readiness})`, jobId, ...whose };
       }
-      return skip('not_dispatched', { reason: 'native_worker_unavailable', message: 'The Claude subscription worker is offline or needs sign-in. Reconnect it before retrying this delivery.' });
+      return skip('not_dispatched', { reason: 'native_worker_unavailable', message: `The ${named} subscription worker is offline or needs sign-in. Reconnect it before retrying this delivery.` });
     }
 
     // Bring your own key (#64): the agents this trigger's workflows run need their keys set.
@@ -547,7 +646,9 @@ export function createLauncher(deps: LaunchDeps) {
     if (needed === null) return refuse('Updraft could not tell which agent keys this workflow needs: publish the configuration again', { unknown: true });
     // A key no supported agent uses (a version published by an older release that named an agent
     // since removed): its job would get no key. Refused with what to change.
-    if (native) needed = needed.filter((k) => k !== 'ANTHROPIC_API_KEY');
+    // A subscription job never gets its own provider's API key (#186 scoping): Claude's no
+    // ANTHROPIC_API_KEY, Codex's no CODEX_API_KEY. Another agent's key stays BYOK.
+    if (native) needed = needed.filter((k) => k !== providerKeys(provider).apiKey);
     const supported = new Set<string>(Object.values(SUPPORTED_AGENT_KEY_ENV));
     const unsupported = needed.filter((k) => !supported.has(k));
     if (unsupported.length > 0 && !decision.unchecked) {
@@ -563,8 +664,8 @@ export function createLauncher(deps: LaunchDeps) {
 
     const launchedAt = now();
     const durationMs = s.maximumDurationSeconds * 1000;
-    const jobId = req.jobId ?? (isIssue && native?.route.workerId.startsWith('managed-')
-      ? waitingId(req.installationId, req.deliveryId)
+    const jobId = req.jobId ?? (isIssue && native && isManagedWorkerId(native.route.workerId)
+      ? waitingId(req.installationId, req.deliveryId, provider)
       : newJobId());
     // Secret retrieval can fail transiently. Do it before claiming a delivery or quota,
     // so a failure leaves the event immediately retryable and owns no capacity.
@@ -694,7 +795,7 @@ export function createLauncher(deps: LaunchDeps) {
       ...(benchmark ? { benchmark: benchmark.identity, benchmarkAgent: benchmark.agent, benchmarkWorkflow: benchmark.workflow } : {}),
       deliveryId: req.deliveryId,
       eventName,
-      ...(native ? { native: { workerId: native.route.workerId, ...(native.route.generation ? { generation: native.route.generation } : {}), ...(mode?.routingVersion !== undefined ? { routingVersion: mode.routingVersion } : {}), ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) } } : {}),
+      ...(native ? { native: { workerId: native.route.workerId, ...(native.route.generation ? { generation: native.route.generation } : {}), ...(nativeMode?.routingVersion !== undefined ? { routingVersion: nativeMode.routingVersion } : {}), ...(notBefore !== undefined ? { notBefore } : {}), ...(req.retry ? { retry: true } : {}) } } : {}),
       status: 'launched',
       createdAt: new Date(launchedAt).toISOString(),
       expiresAt: launchedAt + durationMs,

@@ -55,6 +55,7 @@ function toDelivery(i: Record<string, unknown>): DeliveryRecord {
   }
   if (typeof i.issue === 'number') d.issue = i.issue;
   if (typeof i.pullRequest === 'number') d.pullRequest = i.pullRequest;
+  if (i.provider === 'codex') d.provider = 'codex';
   return d;
 }
 

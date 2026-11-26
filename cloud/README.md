@@ -211,6 +211,15 @@ Both workflows call `.github/workflows/cloud-deploy-env.yaml`, which runs these 
    release job. CloudFormation deploys the verified version in Staging and in Production
    when an operator enables the pilot. Each installation selects its own subscription triggers. See the
    [Claude subscription release and acceptance criteria](../deploy/aws-microvm/native-worker/CLOUD.md).
+   The same image also runs Codex on a ChatGPT plan ([docs/codex-subscription.md](../docs/codex-subscription.md)):
+   after the Claude smoke passes, the job also runs a Codex session smoke and records Codex for that
+   version. A failed Codex smoke never fails the job: the version still goes out for Claude, Codex
+   stays off on it, and the run says so in a warning and in its step summary.
+   **Capacity:** Claude and Codex sessions are admitted separately, each against the same
+   `NATIVE_MANAGED_*` limits (concurrent sessions, runtime hours and launches per day), so Codex can
+   never take a Claude slot, and the platform can run up to twice `NATIVE_MANAGED_CONCURRENT_SESSIONS`
+   subscription VMs at once. The account's Lambda MicroVM quota must cover both providers' sessions
+   plus the job runners (`PlatformConcurrentJobs`).
 
 There is no `sam build`. `ApiFunction`'s `CodeUri` is the bundled `server/dist`, which `sam deploy` zips and uploads itself.
 
