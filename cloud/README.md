@@ -261,8 +261,9 @@ POST /api/v1/admin/tenants/<installation-id>/job-finished-events/replay
   call it; anyone else gets a `403`, the same as the other admin routes.
 - Each tenant can run one replay per 15 minutes. The lock is the item `TENANT#<id>` /
   `JOB_FINISHED_REPLAY`. A second call inside that time gets a `429`, and its `Retry-After`
-  header gives the seconds left. A call refused for its window or opt-in gives the lock back.
-  A replay that sent anything, fully or partly, keeps it.
+  header gives the seconds left. The window is checked before the lock is taken, so an invalid
+  one gets its `400` even while the lock is held, and takes no lock. A call refused for opt-in
+  gives the lock back. A replay that sent anything, fully or partly, keeps it.
 - The call is synchronous. It answers `200 {"replayed": <count>, "since": ..., "until": ...}`
   with the window it used. Entries that `PutEvents` rejects are retried once. If any still fail,
   the call answers `502` with `sent` and `failed` counts. Run the same replay again after the

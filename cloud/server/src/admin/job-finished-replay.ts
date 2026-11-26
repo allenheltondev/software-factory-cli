@@ -11,9 +11,10 @@ import { EVENT_DETAIL_TYPE, EVENT_SOURCE, PUT_BATCH, jobFinishedDetail, type Job
  * same bus with the same source and detail type. Consumers deduplicate on stack, tenantId and
  * jobId, so replaying a job that was already delivered is harmless.
  *
- * One replay per tenant per 15 minutes, held by a conditional write on a lock item. The lock is
- * given back only when the replay is refused before it sends anything (an invalid window, an
- * unknown or opted-out tenant); a replay that ran, fully or partly, keeps it.
+ * One replay per tenant per 15 minutes, held by a conditional write on a lock item. The window is
+ * checked before the lock is taken, so an invalid one never takes it. The lock is given back only
+ * when the replay is refused before it sends anything (an unknown or opted-out tenant); a replay
+ * that ran, fully or partly, keeps it.
  */
 
 export const REPLAY_LOCK_MS = 15 * 60_000;
@@ -111,6 +112,10 @@ export function createJobFinishedReplay({
   return {
     async replay(installationId: number, by: string, body: { since?: unknown; until?: unknown }): Promise<ReplayResult> {
       const at = now();
+      // An invalid window is refused before the lock is taken, so it answers 400 even while a
+      // replay holds the lock, and takes nothing that would need giving back.
+      const window = replayWindow(body, at);
+      if (typeof window === 'string') throw new FlowError('invalid_window', 400, window);
       const expiresAt = at + REPLAY_LOCK_MS;
       const taken = await lock.acquire(installationId, at, expiresAt);
       if (!taken.ok) {
@@ -121,8 +126,6 @@ export function createJobFinishedReplay({
         await lock.release(installationId, expiresAt);
         return error;
       };
-      const window = replayWindow(body, at);
-      if (typeof window === 'string') throw await refuse(new FlowError('invalid_window', 400, window));
       const tenant = await store.getTenant(installationId, { consistent: true });
       if (!tenant) throw await refuse(new FlowError('not_found', 404, `There is no tenant for installation ${installationId}`));
       // The live publisher's opt-in check (job-finished-lambda.ts).

@@ -159,6 +159,16 @@ describe('replaying Job Finished events', () => {
     expect((await post(last7)).status).toBe(200);
   });
 
+  it('refuses an invalid window with 400 even while a replay holds the lock', async () => {
+    const { post, calls } = await setup({ items: [summary('job_a', NOW - DAY)] });
+    expect((await post(last7)).status).toBe(200);
+    const res = await post({ since: iso(NOW - 31 * DAY), until: iso(NOW) });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: 'invalid_window' });
+    expect((await post(last7)).status).toBe(429);
+    expect(calls).toHaveLength(1);
+  });
+
   it('accepts exactly 30 days', async () => {
     const { post } = await setup();
     expect((await post({ since: iso(NOW - 30 * DAY), until: iso(NOW) })).status).toBe(200);
