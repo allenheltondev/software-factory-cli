@@ -170,6 +170,47 @@ describe('managed connection reservation', () => {
     expect(logs.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual(expect.objectContaining({ reason: 'worker-lost', vmState: 'RUNNING' }));
     logs.mockRestore();
   });
+  it.each([
+    ['vm-ended', 'its VM stopped running early', 10 * 60_000, 'TERMINATED'],
+    ['lifetime', 'it reached the eight-hour hard lifetime', 8 * 60 * 60_000 + 60_000, 'RUNNING'],
+  ] as const)('seals with the most specific reason: %s when %s (#176)', async (reason, _why, after, vmState) => {
+    let stopped = false;
+    let state = 'RUNNING';
+    mocks.vm.mockImplementation(async (command) => {
+      if (command instanceof RunMicrovmCommand) return { microvmId: 'mvm-fixture' };
+      if (command.constructor.name === 'TerminateMicrovmCommand') { stopped = true; return {}; }
+      return { state: stopped ? 'TERMINATED' : state };
+    });
+    await managed().start(55);
+    row = connectedWorker();
+    await managed().lifecycle(55);
+    clock += after;
+    state = vmState;
+    row = { ...row, heartbeatAt: clock, lastWorkAt: clock };
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await managed().reconcile()).toEqual({ released: 1, failed: 0 });
+    expect(current).toMatchObject({ retiring: true, retirementReason: reason });
+    expect(logs.mock.calls.map(([line]) => JSON.parse(String(line)))).toContainEqual(expect.objectContaining({ claudeSession: 'retire', reason, imageVersion: '10' }));
+    logs.mockRestore();
+  });
+  it('records a bootstrap approval before launching, and a revocation that won the race stops the launch (#176)', async () => {
+    const bootstrap = { imageVersion: '10', revision: 0, state: 'approved', protocol: 'tenant-browser-1', reason: 'Latest verified image' };
+    mocks.imagePolicy.mockImplementation(async () => ({ ...bootstrap }));
+    const durable = vi.fn(async () => ({ ...bootstrap, revision: 1, reason: 'Launched as the latest verified image' }));
+    Object.assign(mocks.imagePolicy, { durable });
+    try {
+      await managed().start(55);
+      expect(durable).toHaveBeenCalledWith(expect.objectContaining({ imageVersion: '10', revision: 0 }));
+      expect(mocks.vm.mock.calls.some(([command]) => command instanceof RunMicrovmCommand)).toBe(true);
+      current = undefined;
+      mocks.vm.mockClear();
+      durable.mockResolvedValue({ ...bootstrap, revision: 1, state: 'revoked', reason: 'Critical issue' });
+      await expect(managed().start(55)).rejects.toThrow(/Critical issue/);
+      expect(mocks.vm.mock.calls.some(([command]) => command instanceof RunMicrovmCommand)).toBe(false);
+    } finally {
+      delete (mocks.imagePolicy as { durable?: unknown }).durable;
+    }
+  });
   it('keeps a worker that heartbeats after cleanup read it as lost, and it stays routable (#144)', async () => {
     let recovered = false;
     mocks.vm.mockImplementation(async (command) => {

@@ -44,12 +44,18 @@ export interface OrgMembership {
 
 export class GitHubError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /** GitHub refused for a rate limit (a 429, or a 403 with Retry-After or no requests left): worth retrying later. */
+  readonly rateLimited: boolean;
+  constructor(status: number, message: string, rateLimited = false) {
     super(message);
     this.name = 'GitHubError';
     this.status = status;
+    this.rateLimited = rateLimited;
   }
 }
+
+const rateLimitedResponse = (res: Response) =>
+  res.status === 429 || (res.status === 403 && (res.headers?.get('retry-after') != null || res.headers?.get('x-ratelimit-remaining') === '0'));
 
 export interface PullRequestHead {
   state: 'open' | 'closed';
@@ -168,7 +174,7 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
   }
 
   async function json<T>(res: Response, what: string): Promise<T> {
-    if (!res.ok) throw new GitHubError(res.status, `${what} failed (${res.status})`);
+    if (!res.ok) throw new GitHubError(res.status, `${what} failed (${res.status})`, rateLimitedResponse(res));
     return (await res.json()) as T;
   }
 

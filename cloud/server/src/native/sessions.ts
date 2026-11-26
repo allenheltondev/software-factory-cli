@@ -6,6 +6,8 @@ import { nativePartition, type NativeMode, type Worker } from './store.js';
 import { STARTUP_MS } from './admission.js';
 import type { LaunchRequest } from '../jobs/launch.js';
 
+export type RetirementReason = 'reconnect' | 'idle' | 'lifetime' | 'vm-ended' | 'expired' | 'suspended' | 'worker-lost' | 'disabled' | 'startup-failed' | 'image-revoked' | 'image-blocked';
+
 export interface ManagedSession {
   generation: string;
   imageVersion: string;
@@ -14,7 +16,12 @@ export interface ManagedSession {
   startupDeadline?: number;
   readyAt?: number;
   retiring?: boolean;
-  retirementReason?: 'reconnect' | 'idle' | 'expired' | 'suspended' | 'worker-lost' | 'disabled' | 'startup-failed' | 'image-revoked' | 'image-blocked';
+  /**
+   * Why it was sealed, as specifically as cleanup could tell (#176). `lifetime` is the eight-hour
+   * hard limit; `vm-ended` a VM that AWS no longer runs before that. `expired` is either, and is
+   * only on records sealed before the two were told apart.
+   */
+  retirementReason?: RetirementReason;
   admissionRequired?: boolean;
 }
 
@@ -26,6 +33,10 @@ export interface WaitingClaudeJob {
   status: 'waiting' | 'started' | 'canceled';
   jobId?: string;
   reason?: string;
+  /** The issue the job is for: where a later sign-in notice is commented (#176). Absent on older records. */
+  subject?: { repository: string; repositoryId: number; issue: number };
+  /** When the one sign-in notice for this job was claimed (at park, or later by waiting-notice.ts). */
+  noticeAt?: number;
 }
 
 export const managedWorkerId = (id: number) => `managed-${id}`;
@@ -96,10 +107,43 @@ export function createClaudeSessions(table: string, db = DynamoDBDocumentClient.
         throw err;
       }
     },
-    async park(request: WaitingClaudeJob['request'], eventKey: string, now = Date.now()) {
+    /**
+     * Claims the one sign-in notice of a waiting job: true for exactly one caller, while it still
+     * waits. Whoever wins comments; a failed comment gives the claim back (`releaseNotice`).
+     */
+    async claimNotice(id: number, job: string, now = Date.now()) {
+      try {
+        await db.send(new UpdateCommand({ TableName: table, Key: waitKey(id, job), UpdateExpression: 'SET noticeAt = :now',
+          ConditionExpression: '#status = :waiting AND attribute_not_exists(noticeAt) AND expiresAt > :now',
+          ExpressionAttributeNames: { '#status': 'status' }, ExpressionAttributeValues: { ':waiting': 'waiting', ':now': now } }));
+        return true;
+      } catch (error) { if (error instanceof ConditionalCheckFailedException) return false; throw error; }
+    },
+    async releaseNotice(id: number, job: string, at: number) {
+      try {
+        await db.send(new UpdateCommand({ TableName: table, Key: waitKey(id, job), UpdateExpression: 'REMOVE noticeAt',
+          ConditionExpression: 'noticeAt = :at', ExpressionAttributeValues: { ':at': at } }));
+      } catch (error) { if (!(error instanceof ConditionalCheckFailedException)) throw error; }
+    },
+    /** Waiting jobs of the installation that have no sign-in notice yet and know their issue (bounded). */
+    async unnoticed(id: number, now = Date.now()) {
+      const found: WaitingClaudeJob[] = [];
+      let cursor: ConstructorParameters<typeof QueryCommand>[0]['ExclusiveStartKey'];
+      let pages = 0;
+      do {
+        const page = await db.send(new QueryCommand({ TableName: table, ConsistentRead: true, KeyConditionExpression: 'pk = :p AND begins_with(sk, :q)',
+          FilterExpression: '#status = :waiting AND expiresAt > :now AND attribute_not_exists(noticeAt) AND attribute_exists(subject)', Limit: 100, ExclusiveStartKey: cursor,
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: { ':p': partition(id), ':q': 'CLAUDE_WAIT#', ':waiting': 'waiting', ':now': now } }));
+        found.push(...(page.Items ?? []) as WaitingClaudeJob[]);
+        cursor = page.LastEvaluatedKey;
+      } while (cursor && ++pages < 10 && found.length < 25);
+      return found.slice(0, 25);
+    },
+    async park(request: WaitingClaudeJob['request'], eventKey: string, now = Date.now(), subject?: WaitingClaudeJob['subject']) {
       const id = waitingId(request.installationId, request.deliveryId);
       const expiresAt = now + 24 * 60 * 60_000;
-      const item: WaitingClaudeJob = { id, request, eventKey, expiresAt, status: 'waiting' };
+      const item: WaitingClaudeJob = { id, request, eventKey, expiresAt, status: 'waiting', ...(subject ? { subject } : {}) };
       const created = await putIf({ TableName: table, Item: { ...waitKey(request.installationId, id), ...item, ttl: Math.ceil(expiresAt / 1000) },
         ConditionExpression: 'attribute_not_exists(pk)' });
       return { id, created };

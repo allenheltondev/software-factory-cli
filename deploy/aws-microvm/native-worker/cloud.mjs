@@ -24,7 +24,26 @@ export function runnerEnvironment(config, request, env = process.env) {
       .filter((k) => env[k]).map((k) => [k, env[k]])) };
 }
 
-/** Fail closed on any uncertain broker response: stop polling and let Cloud fence this VM.
+/** A broker call that failed in transport (timeout, throttling, a 5xx, a crashed invocation), not by Cloud's decision. */
+export const isTransient = (error) => error?.transient === true;
+/**
+ * How long a run of transient broker failures may last before the worker stops anyway. Shorter
+ * than Cloud's three-minute worker-lost grace (readiness.ts WORKER_LOST_MS): a worker either
+ * recovers before Cloud would retire its session, or stops as it always did. That is the idle
+ * worker's budget. A running job's assignment lease is only 60 s (control.ts WORKER_LEASE_MS):
+ * a heartbeat gap longer than that lets Cloud fence the assignment, the next heartbeat is then
+ * refused, and the job stops. So a running job outlives about a minute of broker failures, not two.
+ */
+export const TRANSIENT_BUDGET_MS = 2 * 60_000;
+const MAX_BACKOFF_MS = 30_000;
+
+/** Fail closed on any authoritative or uncertain broker answer: stop polling and let Cloud fence this VM.
+ * A transient transport failure of a poll or a heartbeat (a backend redeploy, a throttled or
+ * cold broker, #176) is retried with bounded backoff instead: both are idempotent, and Cloud's
+ * own state decides what the retry gets. An assignment whose poll response was lost is still
+ * held for this worker, so the retried poll is refused and the worker stops, as before.
+ * Registration retries as it always did; a settlement is never retried after an uncertain answer.
+ * A refusal (fenced, revoked, another generation or session, bad credential) always stops it.
  * Only the root dispatcher holds the control credential. A job gets its own broker token.
  */
 export async function startCloudWorker(config, microvmId, service, options = {}) {
@@ -35,9 +54,31 @@ export async function startCloudWorker(config, microvmId, service, options = {})
     let timer;
     try {
       return await Promise.race([invoke(message), new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('worker control request timed out')), options.callTimeout ?? 15_000);
+        timer = setTimeout(() => reject(Object.assign(new Error('worker control request timed out'), { transient: true })), options.callTimeout ?? 15_000);
       })]);
     } finally { clearTimeout(timer); }
+  };
+  const now = options.now ?? Date.now;
+  const budget = options.transientBudget ?? TRANSIENT_BUDGET_MS;
+  let failingSince;
+  let failures = 0;
+  /** A poll or heartbeat that may be retried: its answer, or undefined after a transient failure within budget (backed off). */
+  const retryable = async (op) => {
+    try {
+      const response = await call(message(op));
+      failingSince = undefined;
+      failures = 0;
+      return response;
+    } catch (error) {
+      if (!isTransient(error) || stopped) throw error;
+      failingSince ??= now();
+      if (now() - failingSince > budget) throw error;
+      failures++;
+      const wait = Math.min(interval * 2 ** (failures - 1), options.maxBackoff ?? MAX_BACKOFF_MS);
+      console.error(JSON.stringify({ nativeWorker: 'retry', op, reason: 'broker_transient', attempt: failures, waitMs: wait }));
+      await pause(wait, undefined, { signal: controller.signal }).catch(() => {});
+      return undefined;
+    }
   };
   const launch = options.launch ?? ((request) => spawn(process.execPath, ['/opt/updraft/runner/run-job.mjs'], {
     env: runnerEnvironment(config, request), stdio: ['ignore', 'inherit', 'inherit'],
@@ -89,7 +130,8 @@ export async function startCloudWorker(config, microvmId, service, options = {})
       while (!stopped) {
         if (egressResetFailed) throw new Error('egress policy reset failed');
         if (child) {
-          const status = await call(message('heartbeat'));
+          const status = await retryable('heartbeat');
+          if (!status) continue;
           // A cancel for a runner that already exited has nothing left to stop: settle it, and let
           // Cloud's answer decide (a lease it cannot settle still stops this worker). Ending the
           // loop here would strand a healthy shared session until its VM is fenced (#144).
@@ -112,8 +154,9 @@ export async function startCloudWorker(config, microvmId, service, options = {})
           }
         } else {
           auth = await probeAuth();
-          const response = await call(message('poll'));
+          const response = await retryable('poll');
           if (stopped) break;
+          if (!response) continue;
           if (response.request) {
             // The installation's registry hosts for exactly this assignment (#157), applied
             // before the runner starts and removed as soon as it exits. Bound to the job id the
