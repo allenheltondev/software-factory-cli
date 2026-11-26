@@ -439,7 +439,8 @@ describe('LiveExecutor (fake adapter)', { timeout: 120_000 }, () => {
     expect(log).toContain(`fake agent: base ${join(root, 'base')} scratch ${join(root, 'scratch')}`);
     // The base commit's files only: no .git, and not the agent's change.
     expect(log).toContain('fake agent: base holds ["README.md"]');
-    expect(log).toContain('fake agent: base README.md "# widgets\\n"');
+    // Converted on the way out as a checkout of the clone would be (core.autocrlf on Windows).
+    expect(log).toMatch(/fake agent: base README\.md "# widgets(\\r)?\\n"/);
     expect(log).toMatch(/base checkout: .*base \(commit [0-9a-f]{40}, no git metadata;/);
     expect(log).toContain(`base checkout: ${root} was removed`);
     expect(existsSync(root)).toBe(false);

@@ -53,7 +53,10 @@ Isolation:
 - **No git metadata and no credentials.** The files are written by the worker with a
   temporary index outside the clone (`git read-tree` and `git checkout-index --prefix`): no
   `.git`, no hooks, no config, no refs, no token. The clone's own index, HEAD, refs and
-  worktrees are unchanged, and no hook runs. Submodules are not checked out.
+  worktrees are unchanged, and no hook runs. Submodules are not checked out. The files are
+  converted as `git checkout` in the clone converts them (line endings by `core.autocrlf` and
+  `.gitattributes`, and the clone's filters), so they match the worktree byte for byte where
+  the commits do.
 - **Removed when the run ends**, whatever the outcome, and `run.log` says so. The verify
   commands do not get it. If the base commit cannot be written, the run goes ahead without it
   (`base checkout: none (...)` in `run.log`) and the prompt does not mention it.
