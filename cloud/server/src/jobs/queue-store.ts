@@ -69,6 +69,14 @@ export interface QueueEntry {
   /** Deliveries folded into it (the first, then relabels, redeliveries and later pull request events). */
   deliveries: number;
   lastDeliveryAt?: number;
+  /**
+   * What the queue says on GitHub (repositories.R.notifications, #173). quiet: the issue's one
+   * live status comment, which the run takes over, and a separate comment only when a person has
+   * to act. verbose, or absent (an entry queued before #173): the separate acknowledgement.
+   */
+  notifications?: 'quiet' | 'verbose';
+  /** Quiet: the separate "please act" comment of a refused or expired entry was posted. */
+  actPosted?: true;
   /** The acknowledgement comment on GitHub, and the state it last showed. */
   commentId?: number;
   commentState?: QueueState;

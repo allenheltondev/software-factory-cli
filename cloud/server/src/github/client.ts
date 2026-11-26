@@ -148,6 +148,8 @@ export interface GitHubApi {
   postIssueComment?(installationToken: string, repository: string, issue: number, body: string): Promise<number>;
   /** Replaces a comment's body (PATCH /repos/{owner}/{repo}/issues/comments/{id}). */
   updateIssueComment?(installationToken: string, repository: string, commentId: number, body: string): Promise<void>;
+  /** A comment's body (GET /repos/{owner}/{repo}/issues/comments/{id}), or null when it is gone. */
+  issueCommentBody?(installationToken: string, repository: string, commentId: number): Promise<string | null>;
   /** The id of the App's own comment on the issue whose body carries `marker`, or null (newest first, a bounded search). */
   findIssueComment?(installationToken: string, repository: string, issue: number, marker: string, author?: string): Promise<number | null>;
 }
@@ -388,6 +390,14 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       const [owner = '', repo = ''] = repository.split('/');
       const path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/comments/${commentId}`;
       await json<Json>(await call(path, token, { method: 'PATCH', body: JSON.stringify({ body }), headers: { 'content-type': 'application/json' } }), 'PATCH /repos/issues/comments');
+    },
+
+    async issueCommentBody(token, repository, commentId) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const res = await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/comments/${commentId}`, token);
+      if (res.status === 404 || res.status === 410) return null;
+      const out = await json<Json>(res, 'GET /repos/issues/comments');
+      return typeof out.body === 'string' ? out.body : '';
     },
 
     async findIssueComment(token, repository, issue, marker, author) {

@@ -239,8 +239,10 @@ export interface DispatchRules {
    * `review`, `revise`: the repository's review loop is on, so events on its pull requests can
    * start a job (a review asking for changes, a push, a close). `ci`: with review, ciFix is on,
    * so a finished check suite on its pull requests can start one too.
+   * `verbose`: repositories.R.notifications is verbose: the queue posts its acknowledgement as a
+   * separate comment, as before #173. Absent: quiet (the default), one live status comment.
    */
-  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; keys?: string[]; review?: true; revise?: true; ci?: true; triggers: { label: string; actors?: string[]; keys?: string[] }[] }>;
+  repositories: Record<string, { id: number; paused?: boolean; actors?: string[]; keys?: string[]; review?: true; revise?: true; ci?: true; verbose?: true; triggers: { label: string; actors?: string[]; keys?: string[] }[] }>;
   /** The rules record each repository's review loop (`review`, `revise`); absent on versions published before pull request events started jobs. */
   loop?: true;
 }

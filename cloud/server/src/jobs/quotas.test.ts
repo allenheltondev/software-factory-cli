@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createKillSwitch, isEngagedValue } from './kill-switch.js';
-import { DEFAULT_QUOTAS, dayOf, limitProblems, monthOf, quotasFromEnv, tenantQuotas, throttleCommentPermissions, throttledComment } from './quotas.js';
+import { DEFAULT_QUOTAS, dayOf, installationPage, limitProblems, monthOf, quotasFromEnv, tenantQuotas, throttleCommentPermissions, throttledComment } from './quotas.js';
 
 describe('quotas', () => {
   it("reads the stack's defaults, falling back on anything that is not a positive whole number", () => {
@@ -40,6 +40,18 @@ describe('quotas', () => {
     expect(throttledComment('jobs_per_day', DEFAULT_QUOTAS)).toContain('its 20 Updraft jobs for today');
     expect(throttledComment('microvm_minutes', DEFAULT_QUOTAS)).toContain('1200 minutes');
     expect(throttledComment('platform_concurrency', DEFAULT_QUOTAS)).toContain('in a few minutes');
+  });
+
+  it('asks in two sentences, with the console link when the deployment has one (#173)', () => {
+    const link = installationPage('https://updraft.example.com', 55);
+    expect(link).toBe('https://updraft.example.com/installations/55');
+    expect(installationPage(undefined, 55)).toBeUndefined();
+    expect(installationPage('http://updraft.example.com', 55)).toBeUndefined();
+    const full = throttledComment('queue_full', DEFAULT_QUOTAS, false, link);
+    const ask = full.split('\n')[0]!;
+    expect(ask.split(/(?<=\.) /)).toHaveLength(3);
+    expect(ask).toContain('[Open Updraft](https://updraft.example.com/installations/55)');
+    expect(throttledComment('queue_full', DEFAULT_QUOTAS)).not.toContain('Open Updraft');
   });
 
   it("says on a pull request how to try its review or push again, with a token that may comment there", () => {

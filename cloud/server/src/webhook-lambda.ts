@@ -20,7 +20,7 @@ import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
 import { createLauncher, internetEgressConnector, noIngressConnector, waitingComment, type Launcher, type LaunchRequest } from './jobs/launch.js';
-import { quotasFromEnv, throttleCommentPermissions, throttledComment } from './jobs/quotas.js';
+import { quotasFromEnv, throttleCommentPermissions, throttledComment, installationPage } from './jobs/quotas.js';
 import { createAdmissionQueue, createGitHubRevalidator, createQueueDispatcher, dispatchMetricsLine, isQueueCancelRequest, type DispatchReport, type QueueCancelRequest, type QueueCancelResult, type QueueNotifier } from './jobs/queue.js';
 import { createDynamoQueueStore, type QueueEntry } from './jobs/queue-store.js';
 import { createRetryHandler, isRetryRequest, type RetryRequest, type RetryResult } from './jobs/retry.js';
@@ -127,6 +127,10 @@ const queueNotifier: QueueNotifier = {
     const { token } = await queueToken(entry);
     await github.updateIssueComment!(token, entry.repository, commentId, body);
   },
+  async read(entry, commentId) {
+    const { token } = await queueToken(entry);
+    return github.issueCommentBody!(token, entry.repository, commentId);
+  },
 };
 const admissionQueue = createAdmissionQueue({ store: queueStore, putEvent, notify: queueNotifier, workflows, ...(consoleOrigin ? { consoleOrigin } : {}) });
 
@@ -207,7 +211,7 @@ function launcher(): Launcher | undefined {
         repositoryIds: [repositoryId],
         permissions: throttleCommentPermissions(pullRequest),
       });
-      await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas, pullRequest));
+      await github.createIssueComment(token, repository, issue, throttledComment(limit, quotas, pullRequest, installationPage(process.env.UPDRAFT_CONSOLE_ORIGIN, installationId)));
     },
   });
 }

@@ -143,9 +143,10 @@ export const needsSignIn = (reason: NativeReadiness) => readinessAction(reason) 
 /** The issue comment for a parked job: it asks the owner for sign-in only when auth is gone. */
 export function waitingComment(link: string, reason?: NativeReadiness): string {
   const action = reason === undefined ? 'sign-in' : readinessAction(reason);
-  if (action === 'reconnect') return `This Updraft job is waiting because the connected Claude environment can no longer run jobs (${reason}). [Open the waiting job in Updraft](${link}) and reconnect Claude; the job resumes automatically once it is connected.`;
-  if (action === 'wait') return `This Updraft job is waiting for the connected Claude environment to become available (${reason}). It starts automatically when the environment is ready; no sign-in is needed. [Open the waiting job in Updraft](${link}).`;
-  return `This Updraft job is waiting for Claude subscription sign-in. [Open the waiting job in Updraft](${link}). An installation owner can sign in once and the job will resume automatically.`;
+  // A please-act comment (#173): one or two plain sentences, what to do, and the link.
+  if (action === 'reconnect') return `Updraft needs Claude reconnected before it can start this work: the connected Claude environment can no longer run jobs (${reason}). Please [reconnect Claude in Updraft](${link}), and the job resumes on its own.`;
+  if (action === 'wait') return `Updraft is waiting for the connected Claude environment to become available (${reason}); no sign-in is needed, and the job starts on its own. [Open the waiting job in Updraft](${link})`;
+  return `Updraft is waiting for Claude subscription sign-in before it can start this work. Please [sign in to Claude in Updraft](${link}) (an installation owner can do it once), and the job resumes on its own.`;
 }
 
 
@@ -570,6 +571,7 @@ export function createLauncher(deps: LaunchDeps) {
           ...(workflowIssue !== undefined ? { workflowIssue } : {}),
           ...(decision.label ? { label: decision.label } : {}),
           route: native?.route.workerId ?? 'standard', configVersion, reason,
+          notifications: config?.dispatch?.repositories[decision.repository.toLowerCase()]?.verbose ? 'verbose' : 'quiet',
           persisted: releaseOnce,
         });
       } finally {
