@@ -65,6 +65,10 @@ export type FlowErrorCode =
   | 'uninstalled'
   | 'invalid_limits'
   | 'launch_in_progress'
+  // Replaying Job Finished events (admin/job-finished-replay.ts).
+  | 'invalid_window'
+  | 'not_opted_in'
+  | 'replay_rate_limited'
   // Configuration (tenants/config-service.ts).
   | 'invalid_config'
   | 'config_changed'

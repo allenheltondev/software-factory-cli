@@ -569,6 +569,8 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref UpdraftTable
+          # Replayed Job Finished events carry the stack name the live publisher sends (admin/job-finished-replay.ts).
+          STACK_NAME: !Ref AWS::StackName
           NATIVE_WORKER_ROUTE: !Ref NativeWorkerRoute
           NATIVE_MANAGED_IMAGE_ARN: !If [ManagedClaude, !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:microvm-image:${ManagedClaudeImageName}', ""]
           NATIVE_MANAGED_IMAGE_VERSION: !Ref ManagedClaudeImageVersion
@@ -640,6 +642,11 @@ Resources:
             ParameterName: !Sub updraft/${AWS::StackName}/job-image-version
         - DynamoDBCrudPolicy:
             TableName: !Ref UpdraftTable
+        # An admin's replay of Job Finished events (admin/job-finished-replay.ts): the default bus only.
+        - Statement:
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
         - !If
           - NativeWorkerBrowserLogin
           - Statement:

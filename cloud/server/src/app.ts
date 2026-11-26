@@ -3,6 +3,7 @@ import { Hono, type Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import type { AdminAccess } from './admin/access.js';
 import type { AdminService } from './admin/admin.js';
+import { ReplayRateLimitedError, type JobFinishedReplay } from './admin/job-finished-replay.js';
 import type { Caller } from './caller.js';
 import { safeMessage } from './tenants/redact.js';
 import { FlowError, type GitHubFlows } from './flows/github.js';
@@ -75,6 +76,9 @@ import type { RegistryPolicyService } from './native/registries.js';
  *   POST   /api/v1/admin/tenants/:id/disable         { reason? }: jobs stop at once
  *   POST   /api/v1/admin/tenants/:id/enable
  *   PUT    /api/v1/admin/tenants/:id/limits          { limits: { concurrentJobs?, jobsPerDay?, microvmMinutesPerMonth? } | null }
+ *   PUT    /api/v1/admin/tenants/:id/job-finished-events          { enabled }: the tenant's Job Finished events on or off
+ *   POST   /api/v1/admin/tenants/:id/job-finished-events/replay   { since, until }: send the events of jobs that finished
+ *                                                                 in the window again (admin/job-finished-replay.ts)
  *   POST   /api/v1/admin/jobs/:jobId/release         give back a job's capacity (its microVM is not running)
  *
  * Everything under /api/v1 needs a caller. How one is found depends on where the app runs
@@ -87,7 +91,7 @@ export type ResolveCaller = (c: Context) => Caller | null | Promise<Caller | nul
 export interface AppOptions {
   resolveCaller: ResolveCaller;
   github?: GitHubFlows;
-  admin?: { access: AdminAccess; service: AdminService };
+  admin?: { access: AdminAccess; service: AdminService; replay?: JobFinishedReplay };
   config?: ConfigService;
   agentKeys?: AgentKeyService;
   routines?: RoutineService;
@@ -130,7 +134,7 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
   });
 
   if (admin) {
-    const { access, service } = admin;
+    const { access, service, replay } = admin;
     const tenantId = (raw: string) => {
       const id = Number(raw);
       return Number.isSafeInteger(id) && id > 0 ? id : null;
@@ -180,6 +184,28 @@ export function createApp({ resolveCaller, github, admin, config, agentKeys, rou
       if (typeof body?.enabled !== 'boolean') return c.json({ error: 'bad_request' }, 400);
       return c.json(await service.setJobFinishedEvents(id, adminName(c.get('caller')), body.enabled));
     });
+    if (replay) {
+      app.post('/v1/admin/tenants/:id/job-finished-events/replay', async (c) => {
+        const id = tenantId(c.req.param('id'));
+        if (!id) return c.json({ error: 'not_found' }, 404);
+        const body = await c.req.json().catch(() => null) as { since?: unknown; until?: unknown } | null;
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return c.json({ error: 'bad_request' }, 400);
+        let result;
+        try {
+          result = await replay.replay(id, adminName(c.get('caller')), body);
+        } catch (err) {
+          if (!(err instanceof ReplayRateLimitedError)) throw err;
+          c.header('Retry-After', String(err.retryAfterSeconds));
+          return c.json({ error: err.code, message: err.message }, 429);
+        }
+        const { replayed, failed, since, until } = result;
+        if (failed > 0) {
+          return c.json({ error: 'replay_incomplete', message: `PutEvents still rejected ${failed} event(s) after a retry. Consumers deduplicate, so replay again once the 15-minute lock expires.`,
+            sent: replayed, failed, since, until }, 502);
+        }
+        return c.json({ replayed, since, until });
+      });
+    }
     app.post('/v1/admin/jobs/:jobId/release', async (c) => {
       const jobId = c.req.param('jobId');
       if (!JOB_ID.test(jobId)) return c.json({ error: 'not_found' }, 404);
