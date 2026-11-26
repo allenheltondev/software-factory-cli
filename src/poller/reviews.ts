@@ -121,9 +121,10 @@ export async function dropClaimRefs(api: GitHubApi, repo: RepoRef, prNumber: num
       if (!ref.startsWith(`${prefix}`) || !/^[0-9a-f]{7,64}\//.test(ref.slice(prefix.length))) continue;
       await drop(ref);
     }
-    // suggestions-<pr>/ exactly, with its slash: the one suggestion revision of this pull request.
-    const suggestions = revisionClaimRef(`suggestions:${prNumber}`);
-    for (const ref of await api.listMatchingRefs(repo, suggestions)) if (ref.startsWith(suggestions)) await drop(ref);
+    // suggestions-<pr>/ exactly, filtered here as above: the one suggestion revision of this pull
+    // request, never a longer pull request number with the same digits in front.
+    const suggestions = revisionClaimRef(`suggestions:${prNumber}`).replace(/\/$/, '');
+    for (const ref of await api.listMatchingRefs(repo, suggestions)) if (ref.startsWith(`${suggestions}/`)) await drop(ref);
   } catch (err) {
     log.debug('could not list claim refs', { pr: prNumber, error: err instanceof Error ? err.message : String(err) });
   }

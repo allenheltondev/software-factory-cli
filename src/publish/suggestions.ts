@@ -23,6 +23,7 @@ import { autoMergeMethod, DEFAULT_MAX_REVISIONS, reviseActive, suggestionMode, s
 import { transaction } from '../db/database.js';
 import {
   activeRevisionJob,
+  clearSuggestIssue,
   getLoopPr,
   listSuggestionCandidates,
   noteSuggestAttempt,
@@ -34,9 +35,9 @@ import {
 } from '../db/pr-reviews.js';
 import { getJob, latestRunOfJob } from '../db/queue.js';
 import { deferredSuggestions, markSettled, markThreadResolved, openSuggestions, recordResolution, type ReviewFinding, type SettledAs } from '../db/review-findings.js';
-import { countRevisions, enqueueRevision, getReviewRequest, revisionJob } from '../db/revisions.js';
+import { countRevisions, enqueueRevision, getReviewRequest, revisionJob, revisionPushOfJob } from '../db/revisions.js';
 import { GitHubError, type GitHubIssue } from '../github/api.js';
-import { workerLogin } from '../github/identity.js';
+import { sameLogin, workerLogin } from '../github/identity.js';
 import { suggestionsReviewId, suggestionsTrigger } from '../poller/review-trigger.js';
 import type { RepoRef, RevisionFinding, RevisionRequest } from '../types.js';
 import { code } from './failure-comment.js';
@@ -45,18 +46,24 @@ import { cap, inline, type PublishDeps } from './publish.js';
 import { noteStatus, quietFor, shortSha } from './status-comment.js';
 import { STATUS_STAGE } from './status-marker.js';
 import { findThread, ownComments, replyOnce, ROLE, settle, threadReplyMarker, type ThreadDeps } from './threads.js';
-import { verdictStatus } from './review.js';
+import { verdictStatus } from './verdict-status.js';
 
 export type SuggestionDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'scope' | 'console'>;
 
 /** Failed attempts to settle one head before it is let through anyway: a suggestion never holds a merge back for good. */
 export const MAX_SUGGEST_ATTEMPTS = 5;
-/** Suggestions one revision is given. */
+/** Suggestions one revision is given; the rest are deferred to the follow-up issue. */
 const MAX_REVISION_SUGGESTIONS = 25;
+/** Suggestions settled on one head at most (each is a few requests); the next head settles what is left. */
+const MAX_SETTLED = 500;
+/** GitHub's limit on an issue body is 65,536 characters. */
+const MAX_ISSUE_BODY = 60_000;
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 const short = (sha: string) => sha.slice(0, 12);
 const isTransient = (err: unknown) => err instanceof GitHubError && (err.status === 0 || err.status >= 500 || err.isRateLimit);
+/** The issue is not there to edit: deleted, transferred (a redirect) or gone. */
+const isGone = (err: unknown) => err instanceof GitHubError && [301, 404, 410].includes(err.status);
 
 /** Hidden marker on the one follow-up issue of a pull request. */
 export function followUpMarker(repoId: number, prNumber: number): string {
@@ -225,14 +232,25 @@ export function classify(f: ReviewFinding, unpushed: Map<string, { status: strin
 
 /** The body of the follow-up issue: every suggestion of the pull request deferred to it, as a task list a dispatched run can work through. */
 export function renderFollowUp(o: { repoId: number; prNumber: number; prUrl: string; issueNumber: number; label: string; reason: string; items: readonly { finding: ReviewFinding; note: string | null }[] }): string {
-  const items = o.items.flatMap(({ finding: f, note }) => {
+  const rendered = o.items.map(({ finding: f, note }) => {
     const where = f.path ? ` · ${code(f.path)}${f.line !== null ? ` line ${f.line}` : ''}` : '';
     const thread = f.commentUrl ? ` ([thread](${f.commentUrl}))` : '';
     const quoted = safeMarkdown(cap(f.suggestion ? `${f.problem}\n\nSuggested change: ${f.suggestion}` : f.problem, 2_000), 2_000)
       .split('\n')
       .map((l) => `  ${l}`);
-    return [`- [ ] **${inline(cap(f.title, 200))}**${where}${thread}`, '', ...quoted, ...(note ? ['', `  Coding agent: ${inline(cap(note, 500))}`] : []), ''];
+    return [`- [ ] **${inline(cap(f.title, 200))}**${where}${thread}`, '', ...quoted, ...(note ? ['', `  Coding agent: ${inline(cap(note, 500))}`] : []), ''].join('\n');
   });
+  // Within GitHub's limit on a body: the rest are named by count, and their threads have them.
+  const items: string[] = [];
+  let size = 0;
+  for (const [i, r] of rendered.entries()) {
+    if (size + r.length > MAX_ISSUE_BODY - 2_000) {
+      items.push(`- and ${rendered.length - i} more suggestion(s), each in its thread on pull request #${o.prNumber}`, '');
+      break;
+    }
+    items.push(r);
+    size += r.length + 1;
+  }
   return [
     `Non-blocking suggestions Updraft's reviewer made on pull request #${o.prNumber} (${o.prUrl}), for issue #${o.issueNumber}, that were not applied there: ${inline(o.reason)}.`,
     'Each one is an agent\'s suggestion about the code, not a decision: check it against the code as it is now.',
@@ -257,16 +275,6 @@ export type SuggestionStepResult =
   | { status: 'fixing'; jobId: string }
   | { status: 'settled'; reason: string };
 
-/** The revision of the PR's suggestion job has not settled: its push may still come. */
-function pushUnsettled(deps: SuggestionDeps, jobId: string): { pending: boolean; pushedSha: string | null } {
-  const row = deps.db
-    .prepare('SELECT state, retryable, attempts, head_sha, pushed_at FROM revisions WHERE job_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
-    .get(jobId) as { state: string; retryable: number; attempts: number; head_sha: string | null; pushed_at: string | null } | undefined;
-  if (!row) return { pending: false, pushedSha: null };
-  const pending = row.state === 'publishing' || (row.state === 'failed' && row.retryable === 1 && row.attempts < 5);
-  return { pending, pushedSha: row.pushed_at ? row.head_sha : null };
-}
-
 /**
  * Take the suggestion step for one PR whose current head was found ready. Never throws. GitHub is
  * asked only to settle a head: whether the pull request is still there, its threads, the issue.
@@ -288,8 +296,9 @@ export async function evaluateSuggestions(deps: SuggestionDeps, repo: RepoRef, c
     if (pr.suggestState === 'fixing') {
       const job = pr.suggestJobId ? getJob(db, pr.suggestJobId) : null;
       if (job && (job.status === 'queued' || job.status === 'running')) return { status: 'waiting', reason: `the suggestion revision (job ${job.id}) is ${job.status}` };
-      const push = pr.suggestJobId ? pushUnsettled(deps, pr.suggestJobId) : { pending: false, pushedSha: null };
-      if (push.pending) return { status: 'waiting', reason: 'the suggestion revision is being pushed' };
+      // The queue's own rule: a push the worker will still retry by itself is pending; one it gave up on is not.
+      const push = (pr.suggestJobId ? revisionPushOfJob(db, pr.suggestJobId, now) : null) ?? { unsettled: false, pushedSha: null };
+      if (push.unsettled) return { status: 'waiting', reason: 'the suggestion revision is being pushed' };
       // Pushed: the pull request moves to that head, which gets its own review.
       if (push.pushedSha && push.pushedSha !== sha) return { status: 'waiting', reason: `the suggestion revision pushed ${short(push.pushedSha)}` };
       released = true;
@@ -312,7 +321,7 @@ export async function evaluateSuggestions(deps: SuggestionDeps, repo: RepoRef, c
       }
       reason = noRevisionWords(decision.why, max);
     }
-    const done = await settleHead(deps, repo, pr, sha, reason, log);
+    const done = await settleHead(deps, repo, cfg, pr, sha, reason, log);
     if (done.status === 'settled' && released && quietFor(deps.config, { repoId: pr.repoId, repoFullName: repo.fullName })) {
       // Back to where the review left the head: ready, with its checks or its merge to come.
       const status = verdictStatus(deps.config, cfg, 'ready', pr.prNumber, sha);
@@ -339,12 +348,78 @@ export async function evaluateSuggestions(deps: SuggestionDeps, repo: RepoRef, c
 }
 
 /**
+ * The follow-up issue the suggestions deferred now go into, as a task list. An issue is only
+ * reused while it is open, the worker's own (its author is checked here, whatever GitHub's filter
+ * said), and not taken up yet: once it carries one of the repository's trigger labels its run is
+ * dispatched, and an edit by the worker would read as an edit of the issue (and stop that run), so
+ * the new deferrals go into a new follow-up issue instead. The recorded issue is read first; else
+ * the worker's issues are looked through for the marker. One that is closed, gone or transferred
+ * is forgotten, and a new one opened in the same attempt.
+ */
+async function fileFollowUp(
+  deps: SuggestionDeps,
+  repo: RepoRef,
+  cfg: RepositoryConfig,
+  pr: LoopPr,
+  login: string,
+  reason: string,
+  deferred: readonly Settlement[],
+  log: SuggestionDeps['log'],
+): Promise<{ number: number; url: string }> {
+  const { db, api } = deps;
+  const now = deps.now ?? Date.now;
+  const marker = followUpMarker(pr.repoId, pr.prNumber);
+  const triggers = new Set(cfg.workflows.map((w) => w.trigger.label.toLowerCase()));
+  const usable = (i: GitHubIssue) => i.state === 'open' && !i.isPullRequest && i.body.includes(marker) && !i.labels.some((l) => triggers.has(l.toLowerCase()));
+  let target: GitHubIssue | null = null;
+  if (pr.suggestIssueNumber) {
+    try {
+      const recorded = await api.getIssue(repo, pr.suggestIssueNumber);
+      if (usable(recorded)) target = recorded;
+    } catch (err) {
+      if (!isGone(err)) throw err;
+    }
+    if (!target) clearSuggestIssue(db, pr.repoId, pr.prNumber, now);
+  } else if (api.listIssuesByCreator) {
+    // Fails closed: an issue whose author is not the worker is not its follow-up, whatever it says.
+    target = (await api.listIssuesByCreator(repo, login)).find((i) => sameLogin(i.author ?? null, login) && usable(i)) ?? null;
+  }
+  const render = (into: number | null) =>
+    renderFollowUp({
+      repoId: pr.repoId,
+      prNumber: pr.prNumber,
+      prUrl: pr.prUrl,
+      issueNumber: pr.issueNumber,
+      label: pr.label,
+      reason,
+      items: [...(into === null ? [] : deferredSuggestions(db, pr.repoId, pr.prNumber, into).map((finding) => ({ finding, note: finding.resolutionNote }))), ...deferred.map((s) => ({ finding: s.finding, note: s.note }))],
+    });
+  if (target) {
+    const body = render(target.number);
+    try {
+      if (target.body !== body && api.updateIssueBody) await api.updateIssueBody(repo, target.number, body);
+      const kept = { number: target.number, url: target.htmlUrl };
+      recordSuggestIssue(db, pr.repoId, pr.prNumber, kept, now);
+      return kept;
+    } catch (err) {
+      if (!isGone(err)) throw err;
+      clearSuggestIssue(db, pr.repoId, pr.prNumber, now);
+    }
+  }
+  const created = await api.openIssue!(repo, { title: cap(`Follow-up to #${pr.prNumber}: review suggestions not applied`, 200), body: render(null) });
+  const opened = { number: created.number, url: created.htmlUrl };
+  recordSuggestIssue(db, pr.repoId, pr.prNumber, opened, now);
+  log.info('filed the follow-up issue for the suggestions left open', { issue: created.htmlUrl, suggestions: deferred.length });
+  return opened;
+}
+
+/**
  * Settle every open suggestion on `sha`, which must still be the pull request's head on GitHub:
  * fixed and declined ones are resolved, the rest deferred to the follow-up issue, whose link
  * their threads get. Throws on a failure worth retrying (the next cycle settles what is left:
  * every reply is found again by its marker, and the issue by its marker).
  */
-async function settleHead(deps: SuggestionDeps, repo: RepoRef, pr: LoopPr, sha: string, reason: string, log: SuggestionDeps['log']): Promise<SuggestionStepResult> {
+async function settleHead(deps: SuggestionDeps, repo: RepoRef, cfg: RepositoryConfig, pr: LoopPr, sha: string, reason: string, log: SuggestionDeps['log']): Promise<SuggestionStepResult> {
   const { db, api } = deps;
   const now = deps.now ?? Date.now;
   const readAt = new Date(now()).toISOString();
@@ -359,31 +434,15 @@ async function settleHead(deps: SuggestionDeps, repo: RepoRef, pr: LoopPr, sha: 
   const lines: string[] = [];
   const threadDeps: ThreadDeps = { db, api, now, guard: () => {}, repoFullName: repo.fullName, runId: `suggestions-${pr.prNumber}` };
   const unpushed = unpushedReports(deps, pr.suggestJobId);
-  const settlements = openSuggestions(db, pr.repoId, pr.prNumber).map((f) => classify(f, unpushed));
+  // Every open suggestion, however many: past what one revision is given, they are deferred.
+  const settlements = openSuggestions(db, pr.repoId, pr.prNumber, MAX_SETTLED).map((f) => classify(f, unpushed));
   const deferred = settlements.filter((s) => s.as === 'deferred');
 
-  // The follow-up issue: found by its marker among the worker's own issues, or new, and listing
-  // every suggestion of the pull request deferred to it (earlier heads' too).
-  let issue: { number: number; url: string } | null = pr.suggestIssueNumber && pr.suggestIssueUrl ? { number: pr.suggestIssueNumber, url: pr.suggestIssueUrl } : null;
+  // The follow-up issue (fileFollowUp): the one the deferred suggestions go into.
+  let issue: { number: number; url: string } | null = null;
   if (deferred.length) {
-    const items = [...deferredSuggestions(db, pr.repoId, pr.prNumber).map((finding) => ({ finding, note: finding.resolutionNote })), ...deferred.map((s) => ({ finding: s.finding, note: s.note }))];
-    const body = renderFollowUp({ repoId: pr.repoId, prNumber: pr.prNumber, prUrl: pr.prUrl, issueNumber: pr.issueNumber, label: pr.label, reason, items });
-    if (!api.openIssue) {
-      lines.push('this GitHub client cannot open issues; the deferred suggestions stay open');
-    } else {
-      const marker = followUpMarker(pr.repoId, pr.prNumber);
-      let found: GitHubIssue | undefined;
-      if (!issue && api.listIssuesByCreator) found = (await api.listIssuesByCreator(repo, login)).find((i) => i.body.includes(marker));
-      if (found) issue = { number: found.number, url: found.htmlUrl };
-      if (issue) {
-        if (api.updateIssueBody && (found ? found.body !== body : true)) await api.updateIssueBody(repo, issue.number, body);
-      } else {
-        const created = await api.openIssue(repo, { title: cap(`Follow-up to #${pr.prNumber}: review suggestions not applied`, 200), body });
-        issue = { number: created.number, url: created.htmlUrl };
-        log.info('filed the follow-up issue for the suggestions left open', { issue: created.htmlUrl, suggestions: deferred.length });
-      }
-      recordSuggestIssue(db, pr.repoId, pr.prNumber, issue, now);
-    }
+    if (!api.openIssue) lines.push('this GitHub client cannot open issues; the deferred suggestions stay open');
+    else issue = await fileFollowUp(deps, repo, cfg, pr, login, reason, deferred, log);
   }
 
   // Each thread: a reply where one is owed, then resolved. Only the worker's own threads.
@@ -429,7 +488,7 @@ async function settleHead(deps: SuggestionDeps, repo: RepoRef, pr: LoopPr, sha: 
         settle(threadDeps, err, lines, `could not answer or resolve the thread of ${f.key}`);
       }
     }
-    markSettled(db, pr.repoId, pr.prNumber, f.key, s.as, now);
+    markSettled(db, pr.repoId, pr.prNumber, f.key, s.as, now, s.as === 'deferred' ? issue?.number : null);
   }
   const count = (as: SettledAs) => settlements.filter((s) => s.as === as).length;
   const summary = settlements.length

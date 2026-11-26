@@ -371,7 +371,10 @@ repositories:
 
 - **`address`** (the default): when the reviewer finds the current head ready and suggestions are
   open, Updraft queues **one** revision of the pull request for them, if the pull request has
-  revisions left (`maxRevisions`; this revision counts like any other). The coding agent applies
+  revisions left (`maxRevisions`; this revision counts like any other, and it can take the last
+  one: a pull request that then gets changes requested on the new head has no revision left for
+  them, and stops for a person as at any limit). It is given at most 25 suggestions; any more are
+  deferred to the follow-up issue. The coding agent applies
   the suggestions it agrees with. It reports each one in its `updraft-resolutions` block:
   `disagreed` with a one-line reason for a suggestion it judges wrong, `deferred` with a reason for
   one that is right but too large or out of scope. Its push is reviewed again as usual, and only
@@ -395,12 +398,22 @@ read and before a merge:
 | reported `disagreed` | The coding agent's reply gives its reason. Resolved |
 | anything else: deferred, unable, no report, the budget spent, `follow-up` | One reply links the follow-up issue. Resolved |
 
-The follow-up issue is one per pull request. Its body lists every suggestion deferred to it as a
-task list (`- [ ]` items under *Acceptance criteria*), each with its file, line and a link to its
-thread, and the coding agent's reason where it gave one. Adding the workflow's label to the issue
-dispatches it like any other. A hidden marker (`<!-- updraft-suggestions-followup: <repo id>#<pr> -->`)
-finds it again among the worker's own issues: a later head with more suggestions, a retry or a
-state database that lost the issue's number edits that issue, and never opens a second one.
+The follow-up issue is normally one per pull request. Its body lists every suggestion deferred
+to it as a task list (`- [ ]` items under *Acceptance criteria*), each with its file, line and a
+link to its thread, and the coding agent's reason where it gave one. Adding the workflow's label to
+the issue dispatches it like any other. Every open suggestion is settled, however many: past the
+50 a reviewer is shown, or the 25 a revision is given, they are deferred like the rest (at most 500
+per head; the body names any that do not fit GitHub's limit by count, and their threads link it).
+
+A later head with more suggestions, or a retry, adds them to the same issue, which is found by the
+number the state database recorded, else by a hidden marker
+(`<!-- updraft-suggestions-followup: <repo id>#<pr> -->`) among the issues the worker opened (read
+page by page, up to 1,000). An issue counts only if the worker itself opened it (its author is
+checked, so a person's issue with the marker is never adopted), it is still open, and it does not
+carry one of the repository's trigger labels. Once someone labels it, its run is dispatched, and
+an edit by the worker would read as an edit of the issue and stop that run. So a closed, deleted,
+transferred or labelled follow-up issue is never edited: the newly deferred suggestions go into a
+new follow-up issue, which lists only them.
 
 Only threads the worker started are replied to or resolved. A person's thread on the pull request
 is never touched.
@@ -524,7 +537,7 @@ while a watched PR is open, plus one GraphQL request per watched PR that changed
 - per revision of structured findings, after its push: one listing of the PR's review comments
   and one reply per finding with a thread;
 - suggestions, per ready head with open suggestions: nothing to queue the revision; to settle
-  them, one request for the PR, one listing of the worker's issues (once per pull request), one
+  them, one request for the PR, one read of the recorded follow-up issue (or, without one, up to ten pages of the worker's issues), one
   request to open or edit the follow-up issue when one is owed, one listing of the PR's review
   comments and of its threads, and one reply and one GraphQL request per thread resolved. A head
   with no open suggestion costs nothing;

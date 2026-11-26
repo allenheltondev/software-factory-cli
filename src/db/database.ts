@@ -711,6 +711,8 @@ const SUGGESTION_COLUMNS: ReadonlyArray<readonly [string, string]> = [
 const SETTLED_COLUMNS: ReadonlyArray<readonly [string, string]> = [
   ['settled_as', "TEXT CHECK (settled_as IN ('fixed','declined','deferred'))"],
   ['settled_at', 'TEXT'],
+  // the follow-up issue a deferred suggestion went into
+  ['settled_issue', 'INTEGER'],
 ];
 
 /** pr_reviews rebuilt with `value` allowed as an outcome; nothing when it already is. */

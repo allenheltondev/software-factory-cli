@@ -1038,6 +1038,11 @@ export function noteSuggestAttempt(db: Db, repoId: number, prNumber: number, sha
   return getLoopPr(db, repoId, prNumber)?.suggestAttempts ?? 0;
 }
 
+/** The recorded follow-up issue is gone, closed or taken up (labelled): the next deferral opens a new one. */
+export function clearSuggestIssue(db: Db, repoId: number, prNumber: number, now?: () => number): void {
+  db.prepare('UPDATE revision_prs SET suggest_issue_number = NULL, suggest_issue_url = NULL, updated_at = ? WHERE repo_id = ? AND pr_number = ?').run(nowIso(now), repoId, prNumber);
+}
+
 /** The pull request's follow-up issue, once it was filed (or found by its marker). */
 export function recordSuggestIssue(db: Db, repoId: number, prNumber: number, issue: { number: number; url: string }, now?: () => number): void {
   db.prepare('UPDATE revision_prs SET suggest_issue_number = ?, suggest_issue_url = ?, updated_at = ? WHERE repo_id = ? AND pr_number = ?').run(issue.number, issue.url, nowIso(now), repoId, prNumber);

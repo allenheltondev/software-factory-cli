@@ -238,6 +238,7 @@ describe('createGitHubApi', () => {
     const api = await createGitHubApi({ token: 't', fetch: fn });
     const repo = { id: 1, fullName: 'o/r' };
     expect(await api.getIssue(repo, 5)).toEqual({
+      author: null,
       number: 5,
       title: 'x',
       body: 'do it',
@@ -328,6 +329,22 @@ describe('createGitHubApi: publication writes', () => {
     expect((await api.listIssuesByCreator!(repo, 'app[bot]')).map((i) => i.number)).toEqual([9]);
     const q = new URL(calls[2]!.url).searchParams;
     expect([q.get('creator'), q.get('state'), q.get('sort'), q.get('direction'), q.get('per_page')]).toEqual(['app[bot]', 'all', 'created', 'desc', '100']);
+  });
+
+  it('reads the issues one login opened past its pull requests, page by page, up to a cap, with each one\'s author', async () => {
+    const raw = (n: number, extra: Record<string, unknown> = {}) => ({ number: n, title: 't', body: '', html_url: `h${n}`, state: 'open', labels: [], user: { login: 'app[bot]' }, ...extra });
+    const { fn, calls } = fakeFetch((url) => {
+      const page = Number(url.searchParams.get('page') ?? '1');
+      const next = `<https://api.github.com/repositories/42/issues?page=${page + 1}>; rel="next"`;
+      return json(page === 1 ? [raw(1, { pull_request: {} })] : [raw(page)], { headers: { link: next } });
+    });
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const found = await api.listIssuesByCreator!({ id: 42, fullName: 'o/r' }, 'app[bot]', { maxPages: 3 });
+    expect(found.map((i) => [i.number, i.author])).toEqual([
+      [2, 'app[bot]'],
+      [3, 'app[bot]'],
+    ]);
+    expect(calls).toHaveLength(3);
   });
 
   it('replaces the body of a comment', async () => {

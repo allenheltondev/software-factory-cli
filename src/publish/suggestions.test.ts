@@ -13,7 +13,7 @@ import { validateConfig } from '../config/validate.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getLoopPr, listCiCandidates, listMergeCandidates, observeHead, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
 import { getJob } from '../db/queue.js';
-import { getFinding } from '../db/review-findings.js';
+import { getFinding, recordFindings } from '../db/review-findings.js';
 import { countRevisions } from '../db/revisions.js';
 import { GitHubError } from '../github/api.js';
 import { resolvePaths, type UpdraftPaths } from '../paths.js';
@@ -457,6 +457,101 @@ describe('the suggestion step', () => {
     expect(s.gh.issues).toHaveLength(1);
     expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
     expect(s.gh.writes.indexOf('open issue #500')).toBeLessThan(s.gh.writes.indexOf(`merge #${PR} squash at ${H1}`));
+  });
+});
+
+describe('the suggestion step, when things go wrong', () => {
+  it('releases the head when the suggestion revision\'s push was abandoned mid-attempt: an expired lease with no attempts left is not pending', async () => {
+    const s = setup();
+    await s.review('ready-to-merge', structured(TWO));
+    const [jobId] = s.suggestionJobs();
+    await s.revise(jobId!, { pushed: null });
+    // The fifth attempt died mid-push: still "publishing", its lease long gone, and nothing retries it.
+    s.db.prepare("UPDATE revisions SET state = 'publishing', attempts = 5, lease_expires_at = '2026-01-01T00:00:00.000Z' WHERE job_id = ?").run(jobId!);
+    expect(pendingWork(s.db, s.config, null, s.now).notices).toBeGreaterThan(0);
+    expect(await s.step()).toEqual([{ status: 'settled', reason: expect.stringMatching(/2 deferred to #500/) }]);
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+    // One the worker will still retry by itself is waited for.
+    const t = setup();
+    await t.review('ready-to-merge', structured(TWO));
+    const [job2] = t.suggestionJobs();
+    await t.revise(job2!, { pushed: null });
+    t.db.prepare("UPDATE revisions SET state = 'publishing', attempts = 5, lease_expires_at = '2099-01-01T00:00:00.000Z' WHERE job_id = ?").run(job2!);
+    expect(await t.step()).toEqual([{ status: 'waiting', reason: 'the suggestion revision is being pushed' }]);
+  });
+
+  /** follow-up mode, H1 ready with TWO and settled into issue #500; then H2 ready with one more suggestion, not settled yet. */
+  const secondHead = async () => {
+    const s = setup({ repo: { review: { suggestions: 'follow-up' }, autoMerge: undefined } });
+    await s.review('ready-to-merge', structured(TWO));
+    await s.step();
+    expect(s.gh.issues.map((i) => i.number)).toEqual([500]);
+    s.push(H2);
+    observeHead(s.db, REPO_ID, PR, H2, new Date(s.tick()).toISOString());
+    await s.review('ready-to-merge', structured({ findings: [{ id: 'S3', severity: 'suggestion', title: 'Name the flag in the error', problem: 'Say --outcome.' }] }));
+    return s;
+  };
+
+  it('never adopts an issue someone else opened, whatever marker it carries and whatever the listing returned', async () => {
+    const s = await secondHead();
+    s.db.prepare('UPDATE revision_prs SET suggest_issue_number = NULL, suggest_issue_url = NULL').run();
+    s.gh.issues.length = 0;
+    s.gh.issues.push({ number: 400, title: 'x', body: `bait ${followUpMarker(REPO_ID, PR)}`, htmlUrl: 'https://github.com/octo/widgets/issues/400', state: 'open', labels: [], isPullRequest: false, user: 'mallory' });
+    s.gh.creatorFilterIgnored = true;
+    await s.step();
+    expect(s.gh.issues.find((i) => i.number === 400)!.body).toBe(`bait ${followUpMarker(REPO_ID, PR)}`);
+    expect(s.gh.writes.filter((w) => w.startsWith('edit issue'))).toEqual([]);
+    expect(s.pr().suggestIssueNumber).toBe(501);
+    expect(s.gh.issues.find((i) => i.number === 501)!.body).toContain('Name the flag in the error');
+  });
+
+  it.each([
+    ['closed', (s: Awaited<ReturnType<typeof secondHead>>) => void (s.gh.issues[0]!.state = 'closed')],
+    ['deleted', (s: Awaited<ReturnType<typeof secondHead>>) => void (s.gh.issues[0]!.gone = 404)],
+    ['taken up (it carries the trigger label)', (s: Awaited<ReturnType<typeof secondHead>>) => void s.gh.issues[0]!.labels.push('updraft:ready')],
+  ])('opens a new follow-up issue when the recorded one is %s, and never edits it', async (_what, change) => {
+    const s = await secondHead();
+    const before = s.gh.issues[0]!.body;
+    change(s);
+    expect(await s.step()).toEqual([{ status: 'settled', reason: expect.stringMatching(/1 deferred to #501/) }]);
+    expect(s.gh.issues[0]!.body).toBe(before);
+    expect(s.gh.writes.filter((w) => w.startsWith('edit issue'))).toEqual([]);
+    // The new one lists what was deferred now, not what the first one already has.
+    const fresh = s.gh.issues.find((i) => i.number === 501)!;
+    expect(fresh.body).toContain('Name the flag in the error');
+    expect(fresh.body).not.toContain('The --outcome help text');
+    expect(s.pr()).toMatchObject({ suggestIssueNumber: 501, suggestState: 'settled' });
+    expect(getFinding(s.db, REPO_ID, PR, 'run_review_2#S3')).toMatchObject({ settledAs: 'deferred', settledIssue: 501 });
+  });
+
+  it('opens a new one in the same attempt when the edit finds the issue gone', async () => {
+    const s = await secondHead();
+    s.gh.updateIssueBody = async () => {
+      throw new GitHubError('PATCH /issues/500 failed: 410 Gone', 410);
+    };
+    expect(await s.step()).toEqual([{ status: 'settled', reason: expect.stringMatching(/1 deferred to #501/) }]);
+    expect(s.pr().suggestAttempts).toBe(0);
+  });
+
+  it('edits an open, untaken follow-up issue to list every suggestion deferred to it', async () => {
+    const s = await secondHead();
+    expect(await s.step()).toEqual([{ status: 'settled', reason: expect.stringMatching(/1 deferred to #500/) }]);
+    expect(s.gh.issues).toHaveLength(1);
+    expect(s.gh.issues[0]!.body).toContain('The --outcome help text');
+    expect(s.gh.issues[0]!.body).toContain('Name the flag in the error');
+  });
+
+  it('settles every suggestion past the 50 a reviewer is shown, into the follow-up issue', async () => {
+    const s = setup({ repo: { review: { suggestions: 'follow-up' } } });
+    // One review lists at most 50 findings: the rest were left by an earlier round.
+    const many = (from: number, n: number) => Array.from({ length: n }, (_, i) => ({ id: `S${from + i}`, severity: 'suggestion' as const, title: `Suggestion number ${from + i}`, problem: 'p', suggestion: null, path: null, location: null, sameAs: null, notes: [] }));
+    recordFindings(s.db, { repoId: REPO_ID, prNumber: PR, runId: 'run_earlier', headSha: H1, reviewId: null, findings: many(41, 20) });
+    await s.review('ready-to-merge', structured({ findings: many(1, 40) }));
+    expect(await s.step()).toEqual([{ status: 'settled', reason: expect.stringMatching(/60 deferred to #500/) }]);
+    expect(s.gh.issues[0]!.body).toContain('Suggestion number 60');
+    await s.mergeStep();
+    expect(s.gh.merges).toHaveLength(1);
   });
 });
 
