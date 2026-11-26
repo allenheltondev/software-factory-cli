@@ -241,6 +241,9 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                     <Check checked={repo.commentOnFailure} onChange={(commentOnFailure) => patchRepo(name, { commentOnFailure })}>
                       Comment on the issue when a run fails
                     </Check>
+                    <Check checked={repo.notifications === 'verbose'} onChange={(v) => patchRepo(name, { notifications: v ? 'verbose' : undefined })}>
+                      Post a separate comment for each step (verbose); otherwise one status comment, and a comment only when you need to act
+                    </Check>
                     <Check checked={repo.allowedActors !== undefined} onChange={(v) => patchRepo(name, { allowedActors: v ? [...config.allowedActors] : undefined })}>
                       Only some people can start work here
                     </Check>

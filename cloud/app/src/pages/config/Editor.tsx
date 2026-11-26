@@ -203,6 +203,9 @@ function RepositoriesSection({ config, onChange, view, errors, onAskAutoMerge, g
                         <Check checked={repo.commentOnFailure} onChange={(commentOnFailure) => patch(name, { commentOnFailure })}>
                           Comment on the issue when a run fails
                         </Check>
+                        <Check checked={repo.notifications === 'verbose'} onChange={(v) => patch(name, { notifications: v ? 'verbose' : undefined })}>
+                          Post a separate comment for each step (verbose); otherwise one status comment, and a comment only when you need to act
+                        </Check>
                         <Check checked={repo.allowedActors !== undefined} onChange={(v) => patch(name, { allowedActors: v ? [...config.allowedActors] : undefined })}>
                           Use a different list of people who can start work here
                         </Check>
