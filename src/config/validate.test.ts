@@ -45,21 +45,39 @@ describe('validateConfig', () => {
   });
 
   it('refuses code-mode-only Codex models on the isolated native worker, with the reason', () => {
+    // The native worker is a Linux worker, so validate as it does. Native Windows refuses every
+    // containerized agent on its own (checked below), whatever this test runs on.
+    const linux = { platform: 'linux' as const };
     const cfg = example();
     const worker = { image: 'native-claude-worker', runtime: '/opt/updraft/bin/updraft-native-worker', network: 'none' };
     cfg.agents.codex = { enabled: true, command: 'codex', container: worker };
-    expect(validateConfig(cfg).ok).toBe(true);
+    expect(validateConfig(cfg, linux).ok).toBe(true);
     cfg.agents.codex.model = 'gpt-5.5';
-    expect(validateConfig(cfg).ok).toBe(true);
+    expect(validateConfig(cfg, linux).ok).toBe(true);
     for (const model of ['gpt-6-sol', 'gpt-5.6-terra']) {
       cfg.agents.codex.model = model;
-      const r = validateConfig(cfg);
-      expect(r.ok).toBe(false);
-      if (!r.ok) expect(r.errors).toContainEqual({ path: 'agents.codex.model', message: expect.stringMatching(/code mode/) });
+      for (const platform of ['linux', 'darwin', 'win32'] as const) {
+        const r = validateConfig(cfg, { platform });
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.errors).toContainEqual({ path: 'agents.codex.model', message: expect.stringMatching(/code mode/) });
+      }
     }
+    // On native Windows the model check still applies; the container itself is refused for its own reason.
+    cfg.agents.codex.model = 'gpt-5.5';
+    const windows = validateConfig(cfg, { platform: 'win32' });
+    expect(windows.ok).toBe(false);
+    if (!windows.ok) {
+      expect(windows.errors.map((e) => e.path)).toEqual(['agents.codex.container']);
+      expect(windows.errors[0]!.message).toMatch(/not supported on native Windows/);
+    }
+    // A Windows-style runtime path is recognized the same way.
+    cfg.agents.codex = { enabled: true, command: 'codex', model: 'gpt-6-sol', container: { ...worker, runtime: 'C:\\updraft\\bin\\updraft-native-worker' } };
+    const r = validateConfig(cfg, linux);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.errors).toContainEqual({ path: 'agents.codex.model', message: expect.stringMatching(/code mode/) });
     // Elsewhere (host-native, or another container) Codex keeps its own tools, so any model is fine.
     cfg.agents.codex = { enabled: true, model: 'gpt-6-sol' };
-    expect(validateConfig(cfg).ok).toBe(true);
+    for (const platform of ['linux', 'darwin', 'win32'] as const) expect(validateConfig(cfg, { platform }).ok).toBe(true);
   });
 
   it('accepts the shipped example and applies defaults', () => {
