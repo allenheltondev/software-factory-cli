@@ -49,6 +49,7 @@ import { createImageCapabilities, recordCodexCapability } from '../src/native/im
 import { pruneImageVersions, pruneNativeImageVersions } from './job-image-prune.js';
 import { describeInputs, fingerprintOf, IMAGE_INPUTS, imageInputFiles, imageInputFingerprint, inputsFromDescription } from './job-image-inputs.js';
 import { checkNativeClaudeImage } from './native-claude-image-check.js';
+import { ensureCodexCapability } from './native-codex-capability.js';
 import { zip } from './zip.js';
 
 const ARCHITECTURE = 'ARM_64';
@@ -120,15 +121,21 @@ async function main() {
   /**
    * Codex on a ChatGPT plan (#125) is offered only on a version recorded as able to run it. This
    * version's build already proved its pinned Codex accepts the worker's launch arguments
-   * (install.sh runs codex-config-check.mjs); here it must also start as a Codex session. Then
-   * the capability is recorded beside its image policy, and Cloud starts offering Connect ChatGPT.
+   * (install.sh runs codex-config-check.mjs); here it must also start as a Codex session. A failure
+   * here never fails the job: the version still goes out for Claude, without Codex
+   * (native-codex-capability.ts).
    */
   async function ensureCodex(version: string) {
-    if (!outputs.TableName) throw new Error('the stack has no TableName output');
-    if ((await createImageCapabilities(outputs.TableName, clients.dynamo)(version)).codex) return;
-    await checkNativeClaudeImage(microvms, smokeImage(version), 'codex');
-    await recordCodexCapability(clients.dynamo, outputs.TableName, version, NATIVE_CODEX_VERSION);
-    console.log(`==> worker version ${version} passed the Codex session smoke test; Codex ${NATIVE_CODEX_VERSION} recorded for it`);
+    await ensureCodexCapability({
+      has: async (v) => {
+        if (!outputs.TableName) throw new Error('the stack has no TableName output');
+        return (await createImageCapabilities(outputs.TableName, clients.dynamo)(v)).codex;
+      },
+      smoke: (v) => checkNativeClaudeImage(microvms, smokeImage(v), 'codex'),
+      record: (v) => recordCodexCapability(clients.dynamo, outputs.TableName!, v, NATIVE_CODEX_VERSION),
+      log: (line) => console.log(line),
+      ...(process.env.GITHUB_STEP_SUMMARY ? { summary: (line: string) => appendFileSync(process.env.GITHUB_STEP_SUMMARY!, `${line}\n`) } : {}),
+    }, version, NATIVE_CODEX_VERSION);
   }
 
   function reportVersion(version: string) {

@@ -127,6 +127,12 @@ export interface NativeLaunch {
   readiness?(): Promise<NativeReadiness>;
   /** A managed session that is sealed (`environment-retiring`): why it was retired, as recorded. */
   retirement?(): Promise<string | undefined>;
+  /**
+   * Set when this route cannot run at all on the deployed image (Codex on an image not verified
+   * with it, #125): why, for people. Its mode and triggers still route the delivery here, so it is
+   * refused as unavailable, never moved to an API key; readiness is never asked.
+   */
+  unavailable?: string;
 }
 
 /** Why a subscription worker is not taking a job now; see readinessAction for what it asks of the owner. */
@@ -398,8 +404,9 @@ export function createLauncher(deps: LaunchDeps) {
     const mode = await binding?.mode?.();
     const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
     // Codex on a ChatGPT plan (#125): its own session and its own explicit triggers, never legacy ones.
-    // A failure to read Codex's routing never holds up Claude or API-key work: it is no Codex
-    // route, and is logged. Only work pinned to the Codex worker (below) fails, retryably.
+    // A failure to read Codex's routing never holds up Claude work, nor a workflow that cannot be
+    // Codex's: it is logged, and only a delivery that could be Codex's fails, retryably (below).
+    // Codex work never falls back to an API key.
     let codexBinding: NativeLaunch | undefined;
     let codexMode: NativeMode | undefined;
     let codexFailure: unknown;
@@ -466,6 +473,8 @@ export function createLauncher(deps: LaunchDeps) {
         const origin = recent.find((j) => sameRepo(j) && typeof j.label === 'string' && (j.detail?.prNumber === d.pullRequest || j.pullRequest === d.pullRequest));
         const originJob = origin ? await deps.store.getJob(origin.jobId) : null;
         // A failed read is retryable; a missing record is unknown, never evidence of API origin.
+        // With Codex's routing unreadable, an unknown origin could be Codex's: fail, retryably.
+        if (!originJob && codexFailure !== undefined) throw codexFailure;
         if (!originJob && (mode?.triggers !== undefined || triggers.some((t) => sameNativeRepository(t, d)) || codexTriggers.some((t) => sameNativeRepository(t, d)))) {
           return skip('not_dispatched', { reason: 'native_workflow_unknown', message: 'No kept job identifies this pull request runtime' });
         }
@@ -511,6 +520,9 @@ export function createLauncher(deps: LaunchDeps) {
     const selected = isIssue && !req.retryRuntime && (mode?.triggers === undefined || decision.keys?.includes('ANTHROPIC_API_KEY')) && triggers.some((t) => sameNativeTrigger(t, decision));
     const candidate = binding && (selected || workerId === binding.route.workerId) ? binding : undefined;
     const claudeNative = candidate && (mode?.enabled ?? await candidate.enabled?.() ?? true) ? candidate : undefined;
+    // Codex's routing unreadable, for an issue Claude does not take whose workflow needs Codex's
+    // key: it may be a ChatGPT-plan trigger, so it fails retryably rather than run on the API key.
+    if (codexFailure !== undefined && !claudeNative && isIssue && decision.keys?.includes('CODEX_API_KEY')) throw codexFailure;
     // One route per delivery, never two jobs: Claude's subscription is decided first, exactly as
     // before. Only when it does not take the delivery may Codex's: a workflow that needs Codex's
     // key, on a trigger the owner chose for the ChatGPT plan, or work whose runtime (a pull
@@ -531,6 +543,19 @@ export function createLauncher(deps: LaunchDeps) {
     }
     if (req.resumeClaude && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'This workflow no longer uses subscription routing' });
     if (workerId && !native) return skip('not_dispatched', { reason: 'native_mode_disabled', message: 'The subscription worker is disabled; reconnect it to continue this job' });
+    // A Codex route on an image that cannot run Codex (never verified with it, or rolled back):
+    // the owner chose the ChatGPT plan, so it is never moved to the API key. It waits, and the
+    // issue is told once why (jobs/notices.ts). Nothing is reserved or started.
+    if (native?.unavailable) {
+      const message = native.unavailable;
+      log({ delivery: req.deliveryId, installationId: req.installationId, nativeDispatch: 'refuse', provider, reason: 'image_unsupported' });
+      if (!req.queued && !req.retry && !req.retryRuntime && deps.notifyRefused) {
+        await deps.notifyRefused({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, number: (decision.issue ?? decision.pullRequest)!,
+          pullRequest: !isIssue, message, missing: [], configVersion, kind: 'codex_unsupported' })
+          .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the refusal: ${(err as Error)?.name ?? 'error'}` }));
+      }
+      return skip('not_dispatched', { reason: 'native_worker_unavailable', message });
+    }
     const imageVersion = native?.route.imageVersion ?? await deps.imageVersion();
     if (!imageVersion) return skip('jobs_off');
     if (await killSwitch.engaged()) {

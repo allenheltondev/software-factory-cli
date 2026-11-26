@@ -6,6 +6,7 @@ import { dispatchRules } from '../tenants/dispatch.js';
 import { createMemoryWorkflowStore } from '../workflows/store.js';
 import { createWorkflowRecorder } from '../workflows/recorder.js';
 import { deliveryFromLaunch } from './deliveries.js';
+import { refusalComment, refusalMarker } from './notices.js';
 import { createLauncher, signInWait, waitingComment, type LaunchDeps, type LaunchRequest, type NativeLaunch, type NativeReadiness } from './launch.js';
 
 // Codex on a ChatGPT plan routes to its own managed session (#125): exclusive with Claude's session
@@ -221,21 +222,89 @@ describe('Codex routing failures and explicit providers', () => {
     };
   });
 
-  it('treats a failed Codex lookup as no Codex route: Claude and API-key work go on, and it is logged', async () => {
-    await publish(['ANTHROPIC_API_KEY']);
-    deps.resolveNative = async () => binding('claude');
-    deps.resolveCodex = async () => { throw Object.assign(new Error('throttled'), { name: 'ProvisionedThroughputExceededException' }); };
-    const claude = await createLauncher(deps)(request('claude-1'));
-    expect((await store.getJob(claude.jobId!))!.native?.workerId).toBe('managed-55');
+  const throttled = () => Object.assign(new Error('throttled'), { name: 'ProvisionedThroughputExceededException' });
+  const review = (deliveryId: string, number = 40) => {
+    const payload = { action: 'submitted', review: { state: 'changes_requested' }, pull_request: { number, head: { ref: `updraft/issue-12-job_abc${number}` } }, sender: { login: 'pat' }, repository: { id: 9, full_name: 'acme/web' } };
+    return { installationId: 55, deliveryId, eventName: 'pull_request_review', body: JSON.stringify(payload), payload } as LaunchRequest;
+  };
+  async function publishWithReview(keys: string[]) {
+    const version = await store.createConfigVersion(55, { sha256: `r${keys.join()}`, files: [], publishedBy: 's', publishedAt: '', dispatch: dispatchRules({
+      dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' } }] } },
+    }, { keysFor: () => keys }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+  }
+
+  it('never runs a Codex-keyed issue on the API key while Codex routing cannot be read: it fails retryably', async () => {
     await publish(['CODEX_API_KEY']);
     await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'pat' });
-    const byok = await createLauncher(deps)(request('api-1'));
+    deps.resolveNative = async () => binding('claude');
+    deps.resolveCodex = async () => { throw throttled(); };
+    await expect(createLauncher(deps)(request('codex-1'))).rejects.toThrow('throttled');
+    // A mode read that fails is the same.
+    deps.resolveCodex = async () => ({ ...binding('codex'), mode: async () => { throw throttled(); } });
+    await expect(createLauncher(deps)(request('codex-2'))).rejects.toThrow('throttled');
+    expect(await store.listActiveJobs()).toEqual([]);
+    expect(logs).toContainEqual(expect.objectContaining({ warning: 'codex routing unavailable', name: 'ProvisionedThroughputExceededException' }));
+    // Nothing was claimed: the redelivery, once Codex routing reads again, starts it on Codex.
+    deps.resolveCodex = async () => binding('codex');
+    const result = await createLauncher(deps)(request('codex-1'));
+    expect((await store.getJob(result.jobId!))!.native?.workerId).toBe('managed-codex-55');
+  });
+
+  it('keeps Claude work, and workflows that never need Codex\'s key, going while Codex routing cannot be read', async () => {
+    await publish(['ANTHROPIC_API_KEY', 'CODEX_API_KEY']);
+    deps.resolveNative = async () => binding('claude');
+    deps.resolveCodex = async () => { throw throttled(); };
+    // Claude takes it (decided first): Codex's routing does not matter. Its Codex reviewer stays BYOK.
+    await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    const claude = await createLauncher(deps)(request('claude-1'));
+    expect((await store.getJob(claude.jobId!))!.native?.workerId).toBe('managed-55');
+    // A Kiro-only workflow runs on its own key as before.
+    await publish(['KIRO_API_KEY']);
+    await store.putAgentKeyMeta(55, { name: 'KIRO_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    const kiro = await createLauncher(deps)(request('kiro-1'));
+    expect(kiro).toMatchObject({ disposition: 'launched' });
+    expect((await store.getJob(kiro.jobId!))!.native).toBeUndefined();
+  });
+
+  it('fails a pull request event whose origin is unknown while Codex routing cannot be read, never handing it every key', async () => {
+    await publishWithReview(['CODEX_API_KEY']);
+    deps.resolveCodex = async () => { throw throttled(); };
+    await expect(createLauncher(deps)(review('review-1'))).rejects.toThrow('throttled');
+    expect(await store.listActiveJobs()).toEqual([]);
+    // Known to be an API-key job's: it goes on.
+    deps.resolveCodex = async () => binding('codex', { triggers: [] });
+    await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    const origin = await createLauncher(deps)(request('issue-1'));
+    expect((await store.getJob(origin.jobId!))!.native).toBeUndefined();
+    await store.finishJob(origin.jobId!, 'succeeded', { at: NOW, detail: { prNumber: 40, prUrl: 'https://github.com/acme/web/pull/40' } });
+    deps.resolveCodex = async () => { throw throttled(); };
+    expect(await createLauncher(deps)(review('review-2'))).toMatchObject({ disposition: 'launched' });
+  });
+
+  it('refuses a Codex-selected trigger as unavailable on an image without Codex, with one notice, never the API key', async () => {
+    await publish(['CODEX_API_KEY']);
+    await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    const codex = { ...binding('codex'), unavailable: "this deployment's worker image does not support Codex yet" };
+    deps.resolveNative = async () => binding('claude');
+    deps.resolveCodex = async () => codex;
+    deps.waitForClaude = vi.fn();
+    const notices: unknown[] = [];
+    deps.notifyRefused = async (n) => { notices.push(n); };
+    const reserve = vi.spyOn(store, 'reserveJob');
+    const result = await createLauncher(deps)(request());
+    expect(result).toMatchObject({ disposition: 'not_dispatched', reason: 'native_worker_unavailable', message: expect.stringContaining('does not support Codex yet') });
+    expect(notices).toEqual([expect.objectContaining({ kind: 'codex_unsupported', number: 12, pullRequest: false, missing: [] })]);
+    expect(codex.readiness).not.toHaveBeenCalled();
+    expect(deps.waitForClaude).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled();
+    expect(await store.listActiveJobs()).toEqual([]);
+    // A workflow that is not on the ChatGPT plan is unaffected.
+    deps.resolveCodex = async () => ({ ...codex, mode: async () => ({ enabled: true, revision: 1, triggers: [{ ...trigger, label: 'other' }] }) });
+    const byok = await createLauncher(deps)(request('byok-1'));
     expect(byok).toMatchObject({ disposition: 'launched' });
     expect((await store.getJob(byok.jobId!))!.native).toBeUndefined();
-    expect(logs).toContainEqual(expect.objectContaining({ warning: 'codex routing unavailable', name: 'ProvisionedThroughputExceededException' }));
-    // A mode read that fails is the same.
-    deps.resolveCodex = async () => ({ ...binding('codex'), mode: async () => { throw new Error('mode read failed'); } });
-    expect(await createLauncher(deps)(request('api-2'))).toMatchObject({ disposition: 'launched' });
   });
 
   it('fails work pinned to the Codex worker retryably when Codex routing cannot be read, never rerouting it', async () => {
@@ -274,5 +343,14 @@ describe('Codex routing failures and explicit providers', () => {
     expect(result).not.toHaveProperty('provider');
     expect(deliveryFromLaunch({ at: 't', deliveryId: 'd', event: 'issues' }, result)).not.toHaveProperty('provider');
     expect(await workflows.getWorkflow(55, '9-i12')).not.toHaveProperty('signInProvider');
+  });
+});
+
+describe('the image-unsupported notice', () => {
+  it('says the image cannot run Codex yet and that no API key was used, once per version', () => {
+    const n = { installationId: 55, repository: 'acme/web', repositoryId: 9, number: 12, pullRequest: false, message: 'x', missing: [], configVersion: 3, kind: 'codex_unsupported' as const };
+    expect(refusalComment(n)).toContain("this deployment's subscription worker image does not support Codex yet. It was not run on an API key.");
+    expect(refusalMarker(n)).toBe('<!-- updraft-refused: codex_unsupported v3 -->');
+    expect(refusalMarker({ ...n, kind: undefined, missing: ['CODEX_API_KEY'] })).toBe('<!-- updraft-refused: missing_key v3 CODEX_API_KEY -->');
   });
 });

@@ -76,3 +76,6 @@ export const providerOfWorker = (workerId: string | undefined): NativeProvider =
 
 /** What an owner is told when this deployment's worker image cannot run Codex yet (#125). */
 export const CODEX_UNAVAILABLE = "Connect ChatGPT is not available on this deployment's worker image yet. An operator needs to publish a subscription worker image verified with Codex.";
+
+/** Why a Codex-routed delivery is not started while the deployed image cannot run Codex (#125). */
+export const CODEX_IMAGE_UNSUPPORTED = "This workflow runs Codex on the ChatGPT plan, and this deployment's subscription worker image does not support Codex yet. It is not run on an API key.";

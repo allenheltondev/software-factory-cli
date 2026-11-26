@@ -59,7 +59,8 @@ export function createWaitingNotifier(deps: {
     const jobs = (await deps.sessions.unnoticed(installationId, now())).filter((j): j is WaitingClaudeJob & { subject: NonNullable<WaitingClaudeJob['subject']> } => !!j.subject);
     if (!jobs.length) return;
     const native = await deps.resolveNative(installationId);
-    if (!native?.readiness) return;
+    // An image that cannot run this provider has no sign-in to ask for.
+    if (!native?.readiness || native.unavailable) return;
     const readiness: NativeReadiness = await native.readiness();
     const action = readinessAction(readiness);
     if (action !== 'sign-in' && action !== 'reconnect') return;

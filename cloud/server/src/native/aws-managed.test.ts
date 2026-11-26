@@ -107,12 +107,17 @@ describe('managed route to dispatch readiness', () => {
     expect(aws.managedOf('codex')).toBe(aws.managedCodex);
     expect(aws.managedOf('claude')).toBe(aws.managed);
   });
-  it('has no Codex route while the deployed image is not verified with Codex', async () => {
+  it('marks the Codex route unavailable, mode and triggers kept, while the deployed image is not verified with Codex', async () => {
     mocks.session.mockResolvedValue(session({ microvmId: 'mvm-a', readyAt: now - 30_000 }));
     mocks.worker.mockResolvedValue(worker());
     mocks.capability.mockResolvedValue({ codex: false });
     const aws = nativeAws({} as never);
-    expect(await aws.resolveCodex!(55)).toBeUndefined();
+    const codex = (await aws.resolveCodex!(55))!;
+    expect(codex.route.workerId).toBe('managed-codex-55');
+    expect(codex.unavailable).toMatch(/does not support Codex yet/);
+    expect(await codex.mode!()).toMatchObject({ enabled: true });
+    mocks.capability.mockResolvedValue({ codex: true });
+    expect((await aws.resolveCodex!(55))!.unavailable).toBeUndefined();
     expect(mocks.capability).toHaveBeenCalledWith('10');
     expect((await aws.resolveNative!(55))!.route.workerId).toBe('managed-55');
   });

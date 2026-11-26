@@ -272,7 +272,9 @@ that version passed the Claude smoke check and a Codex session smoke check (the 
 the Codex run hook, serves `/codex-login` and refuses `/claude-login`). Without it, an older image,
 or the window between a backend deploy and the image build, the Connect ChatGPT card is hidden,
 `/codex-subscription/connect` says the image cannot run Codex yet, the managed Codex stack refuses
-to start or launch a session, and dispatch has no Codex route.
+to start or launch a session, and dispatch refuses a ChatGPT-plan trigger as unavailable (below).
+A failed Codex smoke never blocks a Claude rollout: the version is published and approved for
+Claude, no capability is recorded, and the image job warns in its log and step summary.
 
 **Worker.** A Codex session's run hook adds `"provider": "codex"` to the cloud settings; Claude's
 run hook is byte-for-byte as before, so an existing Claude VM on an older image is unaffected. Each
@@ -291,8 +293,14 @@ once, to one place:
    the ChatGPT page chose, with Codex routing on.
 3. Otherwise the API-key path, as before.
 
-A failure to read Codex's routing is no Codex route (logged): Claude and API-key work go on. Work
-pinned to the Codex worker fails retryably then. Work pinned to a worker (a pull request's revision
+Codex work never falls back to an API key. If Codex's routing cannot be read (a throttled session,
+mode or capability read), a delivery that could be Codex's fails retryably (the webhook answers 500
+and GitHub redelivers it): an issue Claude does not take whose workflow needs `CODEX_API_KEY`, any
+pull request event whose origin job is not kept, and work pinned to the Codex worker. Claude work
+and workflows that never need Codex's key go on. On an image without the Codex capability the Codex
+route still resolves, with its mode and triggers, marked unavailable: a ChatGPT-plan trigger is
+refused (`native_worker_unavailable`) with one comment saying the worker image does not support
+Codex yet and that no API key was used. Work pinned to a worker (a pull request's revision
 or CI fix, a console retry) stays on that worker or is refused; it never moves between Claude, Codex and API keys. A trigger taken by one
 subscription is not offered on the other's page. The delivery claim and the stable waiting job id
 make a label start one job at most, whatever the route.

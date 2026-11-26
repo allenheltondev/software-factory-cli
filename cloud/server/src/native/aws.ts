@@ -4,12 +4,12 @@ import type { Store } from '../store/store.js';
 import { createNativeControl } from './control.js';
 import { managedClaude } from './managed.js';
 import { nativeRoute, type NativeRoute } from './route.js';
-import type { NativeReadiness } from '../jobs/launch.js';
+import type { NativeLaunch, NativeReadiness } from '../jobs/launch.js';
 import { createNativeModeStore, createNativeStore } from './store.js';
 import { classifyReadiness, needsVmState, sessionPhase } from './readiness.js';
 import { createImagePolicies } from './image-policy.js';
 import { STARTUP_MS } from './admission.js';
-import { parseManagedWorkerId, type NativeProvider } from './provider.js';
+import { CODEX_IMAGE_UNSUPPORTED, parseManagedWorkerId, type NativeProvider } from './provider.js';
 
 export { classifyReadiness, HEARTBEAT_FRESH_MS, WORKER_LOST_MS } from './readiness.js';
 
@@ -109,8 +109,13 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
     /** The installation's Codex session (ChatGPT plan), as dispatch sees it. */
     // Only where the deployed image was verified with Codex: otherwise there is no Codex route, so
     // dispatch never selects a session that cannot start.
-    resolveCodex: managedCodex ? async (id: number) => (await managedCodex.available())
-      ? forLaunch(await managedCodex.route(id), managedCodex.imageVersion) : undefined : undefined,
+    // On an image not verified with Codex, the route is still resolved with its mode and triggers,
+    // marked unavailable: a ChatGPT-plan trigger is refused as unavailable, never moved to an API
+    // key, and no session is ever started for it.
+    resolveCodex: managedCodex ? async (id: number): Promise<NativeLaunch> => {
+      const launch = forLaunch(await managedCodex.route(id), managedCodex.imageVersion);
+      return (await managedCodex.available()) ? launch : { ...launch, unavailable: CODEX_IMAGE_UNSUPPORTED };
+    } : undefined,
     managed,
     managedCodex,
     managedOf,
