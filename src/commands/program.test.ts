@@ -45,6 +45,18 @@ describe('commander wiring', () => {
     expect(codes).toEqual([5, 5, 0]);
   });
 
+  it('parses controls with its defaults and options, and lists it in --help', async () => {
+    const controls = vi.fn(async () => 0);
+    const { parse, codes } = setup({ controls });
+    await parse('controls', 'octo/widgets');
+    expect(controls).toHaveBeenLastCalledWith(expect.anything(), 'octo/widgets', { limit: '50' });
+    await parse('controls', 'octo/widgets#7', '--json', '--limit', '5', '--outcome', 'refused');
+    expect(controls).toHaveBeenLastCalledWith(expect.anything(), 'octo/widgets#7', { json: true, limit: '5', outcome: 'refused' });
+    expect(codes).toEqual([0, 0]);
+    const help = buildProgram({ version: '9.9.9' }).helpInformation();
+    expect(help).toMatch(/^\s+controls \[options\] <ref>\s+List the recorded mention/m);
+  });
+
   it('parses add with defaults and repeatable routes', async () => {
     const add = vi.fn(async () => 0);
     const { parse, codes } = setup({ add });
