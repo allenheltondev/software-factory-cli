@@ -101,13 +101,31 @@ export interface PolicyContext {
 }
 
 /**
- * The session policy for one job. AWS intersects it with the data role's own policy, so the
- * credentials can never reach more than this, whatever the role allows.
+ * The agent keys a job is handed, by variable name: what its workflow can need, as the launcher
+ * recorded it (`agentKeys`: every enabled agent of every pool the workflow can route to, the
+ * reviewer's included; a revision or CI fix inherits its origin's). A native job runs Claude on
+ * the subscription, so never the Anthropic key; a native job with none recorded gets none.
+ * null: an ordinary job recorded without them (launched before keys were recorded, or a pull
+ * request job whose workflow is not known here), handed every key the tenant may have set.
  */
-export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersion' | 'deliveryId' | 'native' | 'agentKeys' | 'benchmark'>, ctx: PolicyContext) {
+export function jobAgentKeys(job: Pick<Job, 'native' | 'agentKeys' | 'benchmark'>): string[] | null {
+  if (job.benchmark) return job.agentKeys ?? [];
+  if (job.native) return (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY');
+  return job.agentKeys ?? null;
+}
+
+/**
+ * The session policy for one job. AWS intersects it with the data role's own policy, so the
+ * credentials can never reach more than this, whatever the role allows. The secrets are exactly
+ * the job's agent keys (jobAgentKeys) and, when it sends telemetry, the telemetry key; a job with
+ * no recorded keys (null) keeps the grant on the tenant's whole key prefix.
+ */
+export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersion' | 'deliveryId' | 'native' | 'agentKeys' | 'benchmark'>, ctx: PolicyContext, opts: { telemetry?: boolean } = {}) {
   const p = jobPaths(job);
   const bucketArn = `arn:${ctx.partition}:s3:::${ctx.bucket}`;
   const statePrefix = p.stateKey.slice(0, p.stateKey.lastIndexOf('/') + 1);
+  const keys = jobAgentKeys(job);
+  const secretArn = (name: string) => `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${name}`;
   return {
     Version: '2012-10-17',
     Statement: [
@@ -119,11 +137,11 @@ export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersio
       {
         Effect: 'Allow',
         Action: 'secretsmanager:GetSecretValue',
-        Resource: job.benchmark
-          ? (job.agentKeys ?? []).map((k) => `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretName(job.installationId, k)}-*`)
-          : job.native
-          ? (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY').map((k) => `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretName(job.installationId, k)}-*`)
-          : `arn:${ctx.partition}:secretsmanager:${ctx.region}:${ctx.accountId}:secret:${agentKeySecretPrefix(job.installationId)}*`,
+        // Secrets Manager appends a hyphen and six random characters to a secret's name in its ARN:
+        // `-??????` is that one secret, never another whose name starts with this one's.
+        Resource: keys === null
+          ? secretArn(`${agentKeySecretPrefix(job.installationId)}*`)
+          : [...keys, ...(opts.telemetry ? [TELEMETRY_KEY_NAME] : [])].map((k) => secretArn(`${agentKeySecretName(job.installationId, k)}-??????`)),
       },
     ].filter((statement) => !Array.isArray(statement.Resource) || statement.Resource.length > 0),
   };
@@ -377,8 +395,9 @@ export function createBroker(deps: BrokerDeps) {
     if (action === 'start' || action === 'credentials') {
       // The tenant's key secrets by variable name; the runner reads them with the credentials (a
       // missing one is a key the tenant has not set).
-      // Every supported agent's key (AGENT_KEY_NAMES), whichever agent the job runs.
-      const agentKeySecrets = Object.fromEntries((job.benchmark ? job.agentKeys ?? [] : job.native ? (job.agentKeys ?? []).filter((k) => k !== 'ANTHROPIC_API_KEY') : AGENT_KEY_NAMES).map((name) => [name, agentKeySecretName(job.installationId, name)]));
+      // Only the keys the job's workflow can need (jobAgentKeys); a job recorded without them,
+      // every supported agent's key (AGENT_KEY_NAMES).
+      const agentKeySecrets = Object.fromEntries((jobAgentKeys(job) ?? AGENT_KEY_NAMES).map((name) => [name, agentKeySecretName(job.installationId, name)]));
       // Telemetry is never in agentKeySecrets: those become the agent's environment, and the
       // telemetry key is the runner's alone. The first `start` decides it, from the settings then,
       // and keeps it with the job with that destination's link settings: every later `start` (a
@@ -408,7 +427,7 @@ export function createBroker(deps: BrokerDeps) {
       const telemetry = snapshot.descriptor;
       const credentials = await deps.assumeRole({
         sessionName: `job-${job.jobId}`.slice(0, 64),
-        policy: JSON.stringify(jobSessionPolicy(job.native && telemetry ? { ...job, agentKeys: [...(job.agentKeys ?? []), TELEMETRY_KEY_NAME] } : job, deps.policy)),
+        policy: JSON.stringify(jobSessionPolicy(job, deps.policy, { telemetry: Boolean(telemetry) })),
         durationSeconds: SESSION_SECONDS,
       });
             return { ok: true, descriptor: { ...jobPaths(job), bucket: deps.policy.bucket, region: deps.policy.region, agentKeySecrets, ...(job.benchmark ? { benchmark: job.benchmark } : {}), ...(telemetry ? { telemetry } : {}) }, credentials };
