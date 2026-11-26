@@ -254,7 +254,11 @@ export function createWorkflowRecorder(o: {
         const at = now();
         // Another stop's pause that still holds one of the workflow's subjects: it stays paused, by that one.
         const current = await o.store.getWorkflow(where.installationId, id);
+        // The pauses are read after the record: an overlay recorded since (a pause landing during
+        // this read) is not one this read can vouch for, so it is never lifted as free.
+        const readAt = now();
         const found = current ? await otherPause(current, pause) : null;
+        const seen = current?.controlPause;
         const other: PauseRef | null = found && found !== 'unknown' ? { jobId: found.jobId, at: found.at, by: found.by, ...withControl((found as { control?: unknown }).control) } : null;
         await updateWorkflow(o.store, where.installationId, id, (w) => {
           if (!w) return null;
@@ -262,7 +266,8 @@ export function createWorkflowRecorder(o: {
           const waited = waitFrom('pause', w.controlPause && ours ? Math.min(w.controlPause.at, pause.at) : pause.at, at);
           // An overlay of another pause (a stop's, recorded before a command took the pause over) is
           // lifted too, but only once the pauses were read and none holds the workflow any more.
-          const free = !ours && !!o.pauses && found === null && !!w.controlPause;
+          const free = !ours && !!o.pauses && found === null && !!w.controlPause && !!seen &&
+            w.controlPause.jobId === seen.jobId && w.controlPause.at === seen.at && w.controlPause.at < readAt;
           const next = free
             ? resumedWorkflow(w, at)
             : !ours

@@ -329,3 +329,41 @@ describe('retention and history', () => {
     expect(historyOf({ createdAt: new Date(now - 91 * 86_400_000).toISOString() }, { shown: 1, omitted: 0, complete: true }, now).expiredEarlier).toBe(true);
   });
 });
+
+describe('a pause landing while a resume reads the pauses', () => {
+  it('is never lifted as free: the workflow stays paused under it', async () => {
+    const store = createMemoryWorkflowStore();
+    let clock = T0;
+    let landed = false;
+    // Y's PAUSE record is not visible to this read; its overlay is written while the read runs.
+    const pauses = {
+      getWorkflowPause: async () => {
+        if (!landed) {
+          landed = true;
+          await updateWorkflow(store, 55, '99-i7', (w) => ({ workflow: pausedWorkflow(w!, { jobId: 'control-y', at: clock, by: 'github:sam', control: { kind: 'pause', source: '123' } }, clock) }));
+        }
+        return null;
+      },
+    };
+    const recorder = createWorkflowRecorder({ store, pauses, now: () => clock, log: () => {} });
+    await recorder.started(job());
+    // Overlay of a stop X, recorded before a command C took the pause over.
+    await recorder.stopRequested(job(), { requestedAt: T0, by: 'pat' });
+    clock += 60_000;
+    await recorder.resumed({ installationId: 55, workflowId: '99-i7' }, { jobId: 'control-c', at: T0 + 1 }, 'github:olive');
+    const w = (await store.getWorkflow(55, '99-i7'))!;
+    expect(w).toMatchObject({ status: 'blocked', reason: 'workflow_paused', controlPause: { jobId: 'control-y' } });
+    expect(w.nextCheckAt).toBeDefined();
+  });
+
+  it('lifts an overlay the read vouched for when no pause holds the workflow any more', async () => {
+    const store = createMemoryWorkflowStore();
+    let clock = T0;
+    const recorder = createWorkflowRecorder({ store, pauses: { getWorkflowPause: async () => null }, now: () => clock, log: () => {} });
+    await recorder.started(job());
+    await recorder.stopRequested(job(), { requestedAt: T0, by: 'pat' });
+    clock += 60_000;
+    await recorder.resumed({ installationId: 55, workflowId: '99-i7' }, { jobId: 'control-c', at: T0 + 1 }, 'github:olive');
+    expect(await store.getWorkflow(55, '99-i7')).toMatchObject({ status: 'active' });
+  });
+});
