@@ -1226,6 +1226,7 @@ Resources:
           PARTITION: !Ref AWS::Partition
           ACCOUNT_ID: !Ref AWS::AccountId
           KILL_SWITCH_PARAMETER: /updraft/kill-switch
+          UPDRAFT_CONSOLE_ORIGIN: !If [ManagedClaudeOriginOverride, !Ref ManagedClaudeConsoleOrigin, !If [DeployCustomDomain, !Sub 'https://${AppDomainName}', '']]
           NODE_OPTIONS: --enable-source-maps
 
   # Runtime logs of the job microVMs (one stream per microVM), with a retention period.
