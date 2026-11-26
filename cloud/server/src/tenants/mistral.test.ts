@@ -16,6 +16,8 @@ it('checks a Studio key only at the official Mistral models endpoint', async () 
 it('compiles a Vibe trigger with only its own tenant key in the sandbox', () => {
   const config = defaultConsoleConfig({ login: 'owner', keys: new Set(['MISTRAL_API_KEY']) });
   config.agents.vibe!.model = 'mistral-large-4-0';
+  // One agent codes and reviews: self-review is an explicit opt-in, never a default.
+  config.workflows.implement!.review.allowSameAgent = true;
   config.repositories['acme/site'] = { enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [] };
   const result = compileTenantConfig(toTenantSubmission(config), { appId: 1 }, new Map([['acme/site', 42]]));
   expect(result).toMatchObject({

@@ -231,8 +231,9 @@ export const REVIEWERS = 'reviewers';
 /**
  * What a new tenant starts from: an agent for every one this deployment offers, a `builders`
  * and a `reviewers` pool that each hold all of them, and one workflow, `implement`, on the label
- * `updraft`, whose pull requests the reviewers review and the builders revise. With a single
- * agent, it may review its own work (there is no other).
+ * `updraft`, whose pull requests the reviewers review and the builders revise. Self-review starts
+ * off, even with a single agent: the person allows it explicitly (or turns review off or adds a
+ * second agent) before publishing.
  */
 export function defaultConsoleConfig(options: { offered?: readonly CloudAgent[]; login?: string; keys?: ReadonlySet<string> } = {}): ConsoleConfig {
   const offered = options.offered?.length ? options.offered : CONSOLE_AGENTS.length ? CONSOLE_AGENTS : (['claude'] as CloudAgent[]);
@@ -250,7 +251,7 @@ export function defaultConsoleConfig(options: { offered?: readonly CloudAgent[];
         label: 'updraft',
         pool: BUILDERS,
         prompt: DEFAULT_PROMPTS.implement,
-        review: { enabled: true, pool: REVIEWERS, prompt: DEFAULT_PROMPTS.review, allowSameAgent: names.length < 2 },
+        review: { enabled: true, pool: REVIEWERS, prompt: DEFAULT_PROMPTS.review, allowSameAgent: false },
         revise: { enabled: true, prompt: DEFAULT_PROMPTS.revise },
       },
     },

@@ -472,7 +472,9 @@ describe('history', () => {
     );
     expect(adminVersion).toMatchObject({ ok: true, version: 1 });
     const defaults = defaultConsoleConfig({ offered: ['codex'], login: 'ivy' });
-    const codexOnly = { ...defaults, repositories: { 'globex/app': repo() } };
+    // Codex alone codes and reviews: the person opts in to self-review, which the defaults never do.
+    const implement = defaults.workflows.implement!;
+    const codexOnly = { ...defaults, workflows: { implement: { ...implement, review: { ...implement.review, allowSameAgent: true } } }, repositories: { 'globex/app': repo() } };
     expect(await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/publish', { config: codexOnly, baseVersion: 1 })).toMatchObject({ status: 200, body: { version: 2 } });
 
     const res = await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/versions/1/reactivate', {});

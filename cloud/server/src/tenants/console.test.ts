@@ -50,8 +50,10 @@ describe('defaults', () => {
     });
   });
 
-  it('with one agent, it may review its own work: there is no other', () => {
-    expect(defaultConsoleConfig({ offered: ['claude'] }).workflows.implement!.review.allowSameAgent).toBe(true);
+  it('never starts with self-review allowed, even with one agent or no keys: it is an explicit opt-in (#193)', () => {
+    expect(defaultConsoleConfig({ offered: ['claude'] }).workflows.implement!.review.allowSameAgent).toBe(false);
+    expect(defaultConsoleConfig({ offered: ['claude', 'codex'], keys: new Set() }).workflows.implement!.review.allowSameAgent).toBe(false);
+    expect(defaultConsoleConfig({ offered: ['claude', 'codex'], keys: new Set(['ANTHROPIC_API_KEY']) }).workflows.implement!.review.allowSameAgent).toBe(false);
   });
 });
 

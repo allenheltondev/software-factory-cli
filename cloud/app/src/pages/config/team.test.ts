@@ -87,6 +87,34 @@ describe('the default team and overrides', () => {
     expect(resetToDefaults(same, 'art')).toEqual(start);
   });
 
+  it('generated pool and workflow names keep their role and repository with long names (and stay valid)', () => {
+    const start = addLabel(base(), 'a-very-long-label-name-for-the-art-team-work', PROMPTS);
+    const long = Object.keys(start.workflows).find((n) => n !== 'implement')!;
+    // Label workflows are cut to 30 characters, so `-coding` used to be cut to `-codin`.
+    expect(long.length).toBe(30);
+    const coding = setOverride(start, long, 'coding', ['codex'], ADAPTERS);
+    const review = setOverride(coding, long, 'review', ['claude'], ADAPTERS);
+    const pools = [review.workflows[long]!.pool, review.workflows[long]!.review.pool];
+    expect(pools[0]).toMatch(/-coding$/);
+    expect(pools[1]).toMatch(/-review$/);
+    // A second long workflow with the same stem gets its own pool, still with the role.
+    const again = addLabel(review, 'a-very-long-label-name-for-the-art-team-work-2', PROMPTS);
+    const other = Object.keys(again.workflows).find((n) => n !== 'implement' && n !== long)!;
+    const pool = setOverride(again, other, 'coding', ['claude'], ADAPTERS).workflows[other]!.pool;
+    expect(pool).not.toBe(pools[0]);
+    expect(pool).toMatch(/-coding(-\d+)?$/);
+
+    const g = labelGroups(start).find((x) => x.primary === long)!;
+    const withRepo = { ...start, repositories: { ...start.repositories, 'acme/a-really-long-repository-name-here': repo([long]) } };
+    const custom = customizeRepo(withRepo, 'acme/a-really-long-repository-name-here', g, ADAPTERS);
+    const variant = custom.repositories['acme/a-really-long-repository-name-here']!.workflows[0]!;
+    expect(variant).not.toBe(long);
+    expect(variant).toBe('a-very-long-label-a-really-long-rep');
+    expect(custom.workflows[variant]!.pool).toMatch(/-coding$/);
+    expect(custom.workflows[variant]!.review.pool).toMatch(/-review$/);
+    for (const n of [...Object.keys(custom.workflows), ...Object.keys(custom.pools), pool, ...pools]) expect(n).toMatch(/^[a-z0-9][a-z0-9-]{0,39}$/);
+  });
+
   it('a repository exception is a workflow of its own on the same label, and resetting removes it', () => {
     const start = base();
     const g = labelGroups(start)[0]!;

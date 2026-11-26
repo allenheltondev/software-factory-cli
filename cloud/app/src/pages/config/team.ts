@@ -231,6 +231,12 @@ export function setMaxRevisions(config: ConsoleConfig, maxRevisions: number | un
 }
 
 /**
+ * `<stem>-<suffix>`, with the stem shortened first so the suffix (the role, the repository) is
+ * always kept, within the 36 characters `freeName` leaves room for a `-2` after.
+ */
+export const suffixed = (stem: string, suffix: string) => `${stem.slice(0, Math.max(1, 36 - suffix.length - 1)).replace(/-+$/, '') || 'x'}-${suffix}`;
+
+/**
  * One role of a workflow set to its own agents: an override. The first change creates the
  * workflow's own pool (`<workflow>-coding` / `<workflow>-review`); the default team is untouched.
  */
@@ -239,7 +245,7 @@ export function setOverride(config: ConsoleConfig, workflow: string, role: Role,
   let pool = poolOf(w, role);
   let next = config;
   if (pool === defaultPool(role) || !config.pools[pool]) {
-    pool = freeName(`${workflow}-${role}`, config.pools);
+    pool = freeName(suffixed(workflow, role), config.pools);
     next = { ...config, workflows: { ...config.workflows, [workflow]: withPool(w, role, pool) } };
   }
   return setPool(next, pool, list, adapters);
@@ -336,7 +342,7 @@ export function customizeRepo(config: ConsoleConfig, repo: string, group: LabelG
   if (current && current !== group.primary) return config;
   const base = config.workflows[group.primary]!;
   const team = teamOf(config, group.primary);
-  const name = freeName(`${group.primary.slice(0, 18)}-${slug(repo.split('/')[1] ?? repo).slice(0, 17) || 'repo'}`, config.workflows);
+  const name = freeName(suffixed(group.primary.slice(0, 18), slug(repo.split('/')[1] ?? repo).slice(0, 17).replace(/-+$/, '') || 'repo'), config.workflows);
   let next: ConsoleConfig = {
     ...config,
     workflows: { ...config.workflows, [name]: { ...base, pool: DEFAULT_CODING, review: { ...base.review, pool: DEFAULT_REVIEW } } },

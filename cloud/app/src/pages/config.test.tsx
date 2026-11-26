@@ -222,7 +222,6 @@ describe('the simple page', () => {
     const config = baseConfig();
     config.agents.codex!.enabled = false;
     config.pools = { builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } };
-    config.workflows.implement!.review.allowSameAgent = true;
     const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: true, required: true }], refusals: [] });
     const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(1) });
     configPage(api);
@@ -258,8 +257,8 @@ describe('the simple page', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     const sent = sentConfig(api);
     expect(sent.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['codex'] } });
-    // The consent the defaults gave a single agent stays until the person turns it off.
-    expect(sent.workflows.implement!.review.allowSameAgent).toBe(true);
+    // The defaults never consent to self-review, and an independent reviewer needs none.
+    expect(sent.workflows.implement!.review.allowSameAgent).toBe(false);
   });
 
   it('never changes a published review policy because a key went missing: the person adds it back or unticks it', async () => {
@@ -443,7 +442,6 @@ describe('connected agents, teams and exceptions (#193)', () => {
     config.agents.claude!.enabled = false;
     config.agents.codex!.enabled = false;
     config.pools = { builders: { agents: [] }, reviewers: { agents: [] } };
-    config.workflows.implement!.review.allowSameAgent = true;
     const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: false }], refusals: [] });
     const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agentKeys: {} })), setAgentKey, publishConfig: publishedOk(1) });
     configPage(api);
@@ -471,6 +469,37 @@ describe('connected agents, teams and exceptions (#193)', () => {
     expect(sent.agents).toEqual({ claude: { adapter: 'claude', enabled: true }, codex: { adapter: 'codex', enabled: false } });
     expect(sent.workflows.implement!.review.enabled).toBe(false);
     expect(await screen.findByTestId('first-publish')).toHaveTextContent('add the label updraft to an issue in acme/web');
+  });
+
+  it('a new installation with one provider that codes and reviews waits for explicit consent to self-review before publishing', async () => {
+    // As the server starts a new installation: nothing connected, and self-review off.
+    const config = baseConfig();
+    config.agents.claude!.enabled = false;
+    config.agents.codex!.enabled = false;
+    config.pools = { builders: { agents: [] }, reviewers: { agents: [] } };
+    expect(config.workflows.implement!.review.allowSameAgent).toBe(false);
+    const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: false }], refusals: [] });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agentKeys: {} })), setAgentKey, publishConfig: publishedOk(1) });
+    configPage(api);
+    const card = await screen.findByTestId('provider-claude');
+    await userEvent.click(within(card).getByRole('button', { name: 'Connect Claude Code' }));
+    await userEvent.type(within(card).getByLabelText(/Claude Console API key/), 'sk-ant-abc');
+    await userEvent.click(within(card).getByRole('button', { name: 'Save key' }));
+    await waitFor(() => expect(within(card).getByText('Connected')).toBeInTheDocument());
+
+    await userEvent.click(within(screen.getByTestId('coding-claude')).getByRole('checkbox', { name: 'Claude Code' }));
+    await userEvent.click(within(screen.getByTestId('review-claude')).getByRole('checkbox', { name: 'Claude Code' }));
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Work in acme/web' }));
+    expect(screen.getByTestId('allow-self-review')).not.toBeChecked();
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Claude Code would review its own work on "updraft": choose another review agent, or allow self-review.');
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    expect(api.publishConfig).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByTestId('allow-self-review'));
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const sent = sentConfig(api);
+    expect(sent.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } });
+    expect(sent.workflows.implement!.review).toMatchObject({ enabled: true, pool: 'reviewers', allowSameAgent: true });
   });
 
   it('labels and repository exceptions in the main page: art -> Codex, ready inherits; changing the default shows who it affects; reset restores it', async () => {
