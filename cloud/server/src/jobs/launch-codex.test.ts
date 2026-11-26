@@ -5,6 +5,7 @@ import { createMemoryStore, type Tenant } from '../store/store.js';
 import { dispatchRules } from '../tenants/dispatch.js';
 import { createMemoryWorkflowStore } from '../workflows/store.js';
 import { createWorkflowRecorder } from '../workflows/recorder.js';
+import { deliveryFromLaunch } from './deliveries.js';
 import { createLauncher, signInWait, waitingComment, type LaunchDeps, type LaunchRequest, type NativeLaunch, type NativeReadiness } from './launch.js';
 
 // Codex on a ChatGPT plan routes to its own managed session (#125): exclusive with Claude's session
@@ -188,5 +189,90 @@ describe('subscription key scoping', () => {
     // A pinned worker is Claude's, as before; a native job without recorded keys gets none.
     expect(jobAgentKeys({ native: { workerId: 'worker-1' }, agentKeys: keys })).toEqual(['CODEX_API_KEY', 'KIRO_API_KEY']);
     expect(jobAgentKeys({ native: { workerId: 'managed-codex-55' } })).toEqual([]);
+  });
+});
+
+describe('Codex routing failures and explicit providers', () => {
+  let store: ReturnType<typeof createMemoryStore>;
+  let deps: LaunchDeps;
+  const request = (deliveryId = 'delivery-1', overrides: Partial<LaunchRequest> = {}): LaunchRequest => {
+    const payload = { action: 'labeled', issue: { number: 12 }, label: { name: 'updraft' }, sender: { login: 'pat' }, repository: { id: 9, full_name: 'acme/web' } };
+    return { installationId: 55, deliveryId, body: JSON.stringify(payload), payload, ...overrides };
+  };
+  async function publish(keys: string[]) {
+    const version = await store.createConfigVersion(55, { sha256: keys.join(), files: [], publishedBy: 's', publishedAt: '', dispatch: dispatchRules({
+      dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
+    }, { keysFor: () => keys }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+  }
+  const logs: Record<string, unknown>[] = [];
+  beforeEach(async () => {
+    store = createMemoryStore();
+    logs.length = 0;
+    await store.putTenantWithMember(tenant, { installationId: 55, sub: 's', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
+    deps = {
+      store,
+      settings: { region: 'us-east-1', bucket: 'b', imageArn: 'arn:image', executionRoleArn: 'arn:role', ingressConnectorArn: 'in', egressConnectorArn: 'out',
+        logGroup: 'lg', brokerFunctionName: 'broker', maximumDurationSeconds: 10800, watchdogReserveSeconds: 600 },
+      imageVersion: async () => '3', putEvent: async () => {}, runMicrovm: async () => ({ microvmId: 'mvm-api' }),
+      quotas: { concurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 },
+      now: () => NOW, log: (entry) => logs.push(entry), retryDelayMs: 1,
+    };
+  });
+
+  it('treats a failed Codex lookup as no Codex route: Claude and API-key work go on, and it is logged', async () => {
+    await publish(['ANTHROPIC_API_KEY']);
+    deps.resolveNative = async () => binding('claude');
+    deps.resolveCodex = async () => { throw Object.assign(new Error('throttled'), { name: 'ProvisionedThroughputExceededException' }); };
+    const claude = await createLauncher(deps)(request('claude-1'));
+    expect((await store.getJob(claude.jobId!))!.native?.workerId).toBe('managed-55');
+    await publish(['CODEX_API_KEY']);
+    await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    const byok = await createLauncher(deps)(request('api-1'));
+    expect(byok).toMatchObject({ disposition: 'launched' });
+    expect((await store.getJob(byok.jobId!))!.native).toBeUndefined();
+    expect(logs).toContainEqual(expect.objectContaining({ warning: 'codex routing unavailable', name: 'ProvisionedThroughputExceededException' }));
+    // A mode read that fails is the same.
+    deps.resolveCodex = async () => ({ ...binding('codex'), mode: async () => { throw new Error('mode read failed'); } });
+    expect(await createLauncher(deps)(request('api-2'))).toMatchObject({ disposition: 'launched' });
+  });
+
+  it('fails work pinned to the Codex worker retryably when Codex routing cannot be read, never rerouting it', async () => {
+    await publish(['CODEX_API_KEY']);
+    await store.putAgentKeyMeta(55, { name: 'CODEX_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    deps.resolveNative = async () => binding('claude');
+    deps.resolveCodex = async () => { throw new Error('unavailable'); };
+    await expect(createLauncher(deps)(request('pinned', { retryRuntime: { workerId: 'managed-codex-55' } }))).rejects.toThrow('unavailable');
+    expect(await store.listActiveJobs()).toEqual([]);
+  });
+
+  it('names Codex explicitly on a wait\'s result and workflow, and on the redelivery that finds it', async () => {
+    await publish(['CODEX_API_KEY']);
+    const id = waitingId(55, 'delivery-1', 'codex');
+    let parked = false;
+    deps.resolveNative = async () => binding('claude');
+    deps.resolveCodex = async () => binding('codex', { readiness: 'auth-required' });
+    deps.waitForClaude = vi.fn(async () => { parked = true; return id; });
+    deps.parkedClaude = vi.fn(async (_req: LaunchRequest, provider?: string) => (parked && provider === 'codex' ? id : undefined));
+    const workflows = createMemoryWorkflowStore();
+    deps.workflows = createWorkflowRecorder({ store: workflows, log: () => {} });
+    const launch = createLauncher(deps);
+    expect(await launch(request())).toMatchObject({ reason: 'native_waiting_for_sign_in', provider: 'codex' });
+    expect(await workflows.getWorkflow(55, '9-i12')).toMatchObject({ stage: 'awaiting-sign-in', signInProvider: 'codex' });
+    expect(await launch(request())).toMatchObject({ reason: 'native_waiting_for_sign_in', provider: 'codex', jobId: id });
+    expect(deliveryFromLaunch({ at: 't', deliveryId: 'd', event: 'issues' }, await launch(request()))).toMatchObject({ reason: 'native_waiting_for_sign_in', jobId: id, provider: 'codex' });
+  });
+
+  it('records a Claude wait exactly as before: no provider anywhere', async () => {
+    await publish(['ANTHROPIC_API_KEY']);
+    deps.resolveNative = async () => binding('claude', { readiness: 'auth-required' });
+    deps.waitForClaude = vi.fn(async () => 'job_waiting000000000');
+    const workflows = createMemoryWorkflowStore();
+    deps.workflows = createWorkflowRecorder({ store: workflows, log: () => {} });
+    const result = await createLauncher(deps)(request());
+    expect(result).not.toHaveProperty('provider');
+    expect(deliveryFromLaunch({ at: 't', deliveryId: 'd', event: 'issues' }, result)).not.toHaveProperty('provider');
+    expect(await workflows.getWorkflow(55, '9-i12')).not.toHaveProperty('signInProvider');
   });
 });

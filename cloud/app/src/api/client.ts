@@ -221,6 +221,12 @@ export interface ClaudeWaitingRequest {
 }
 
 export interface NativeClaudeView {
+  /** Codex's page (#125); absent: Claude's. */
+  provider?: 'codex';
+  /** Codex's page: whether this deployment's worker image can run Codex yet. */
+  available?: boolean;
+  /** Claude's page: whether Connect ChatGPT can be offered on this deployment. */
+  codexAvailable?: boolean;
   /** A reserved session is booting; readiness still requires its live heartbeat. */
   preparing?: boolean;
   startupFailed?: boolean;
@@ -295,6 +301,8 @@ export interface Delivery {
   message?: string;
   errorClass?: string;
   jobId?: string;
+  /** A subscription wait for Codex's ChatGPT sign-in (#125); absent: Claude's. */
+  provider?: 'codex';
 }
 
 /** An issue's whole story across jobs (#139): what Updraft recorded, never agent text. */

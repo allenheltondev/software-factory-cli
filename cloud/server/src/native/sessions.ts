@@ -38,6 +38,8 @@ export interface WaitingClaudeJob {
   subject?: { repository: string; repositoryId: number; issue: number };
   /** When the one sign-in notice for this job was claimed (at park, or later by waiting-notice.ts). */
   noticeAt?: number;
+  /** A Codex session's wait (#125); absent on Claude's, and on every record written before it. */
+  provider?: 'codex';
 }
 
 export { managedWorkerId };
@@ -155,7 +157,7 @@ export function createManagedSessions(table: string, db = DynamoDBDocumentClient
     async park(request: WaitingClaudeJob['request'], eventKey: string, now = Date.now(), subject?: WaitingClaudeJob['subject']) {
       const id = waitingId(request.installationId, request.deliveryId, provider);
       const expiresAt = now + 24 * 60 * 60_000;
-      const item: WaitingClaudeJob = { id, request, eventKey, expiresAt, status: 'waiting', ...(subject ? { subject } : {}) };
+      const item: WaitingClaudeJob = { id, request, eventKey, expiresAt, status: 'waiting', ...(subject ? { subject } : {}), ...(provider === 'codex' ? { provider } : {}) };
       const created = await putIf({ TableName: table, Item: { ...waitKey(request.installationId, id), ...item, ttl: Math.ceil(expiresAt / 1000) },
         ConditionExpression: 'attribute_not_exists(pk)' });
       return { id, created };

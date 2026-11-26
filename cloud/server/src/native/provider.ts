@@ -73,3 +73,6 @@ export const isManagedWorkerId = (workerId: unknown) => parseManagedWorkerId(wor
 
 /** The provider of a stored worker id or queue route: Codex only for a Codex managed worker. */
 export const providerOfWorker = (workerId: string | undefined): NativeProvider => parseManagedWorkerId(workerId)?.provider ?? 'claude';
+
+/** What an owner is told when this deployment's worker image cannot run Codex yet (#125). */
+export const CODEX_UNAVAILABLE = "Connect ChatGPT is not available on this deployment's worker image yet. An operator needs to publish a subscription worker image verified with Codex.";

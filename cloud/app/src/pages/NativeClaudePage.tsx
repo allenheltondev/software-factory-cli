@@ -446,7 +446,13 @@ function SubscriptionConnectionPage({ api, source, provider: t }: { api: Subscri
       ) : !view && !pollError ? (
         <Skeleton className="h-40" />
       ) : null}
-      {view && (
+      {view && t.id === 'codex' && view.available === false && (
+        <Alert variant="info">
+          Connect ChatGPT is not available on this deployment&apos;s worker image yet. An Updraft operator needs to publish a
+          subscription worker image verified with Codex.
+        </Alert>
+      )}
+      {view && !(t.id === 'codex' && view.available === false) && (
         <>
           <Card>
             <CardHeader>
@@ -721,7 +727,7 @@ function SubscriptionConnectionPage({ api, source, provider: t }: { api: Subscri
                   </CardBody>
                 </Card>
               )}
-              {t.id === 'claude' && (
+              {t.id === 'claude' && view.codexAvailable === true && (
                 <Card>
                   <CardHeader>
                     <CardTitle>Connect ChatGPT</CardTitle>

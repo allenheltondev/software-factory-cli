@@ -1,4 +1,4 @@
-import { createImagePolicies, imageDecision } from './image-policy.js';
+import { createImageCapabilities, createImagePolicies, imageDecision, type ImageCapabilityReader } from './image-policy.js';
 import { createHmac } from 'node:crypto';
 import {
   GetMicrovmCommand,
@@ -22,7 +22,8 @@ import type { ManagedSession } from './sessions.js';
 import { FlowError } from '../flows/github.js';
 import type { NativeRoute } from './route.js';
 import { createManagedSessions } from './sessions.js';
-import { managedWorkerId, providerKeys, type NativeProvider } from './provider.js';
+import { CODEX_UNAVAILABLE, managedWorkerId, providerKeys, type NativeProvider } from './provider.js';
+export { CODEX_UNAVAILABLE } from './provider.js';
 import { createNativeModeStore, createNativeStore, type Worker } from './store.js';
 import { classifyReadiness } from './readiness.js';
 
@@ -32,7 +33,7 @@ export const SUSPENDED_STATES = ['SUSPENDING', 'SUSPENDED'];
 
 export function managedClaude(
   env = process.env,
-  options: { disabled?: () => Promise<boolean>; now?: () => number; admission?: ClaudeAdmission; provider?: NativeProvider } = {},
+  options: { disabled?: () => Promise<boolean>; now?: () => number; admission?: ClaudeAdmission; provider?: NativeProvider; capabilities?: ImageCapabilityReader } = {},
 ) {
   // One image for both CLIs (#125): a Codex session is the same image, told its provider.
   const provider = options.provider ?? 'claude';
@@ -47,6 +48,16 @@ export function managedClaude(
   if (!imageArn || !imageVersion || !controlSecretArn) return undefined;
 
   const imagePolicy = createImagePolicies(env.TABLE_NAME ?? '', imageVersion);
+  const capabilities = options.capabilities ?? createImageCapabilities(env.TABLE_NAME ?? '');
+  /**
+   * Whether this provider can run on an image version (the deployed latest by default). Claude
+   * always can. Codex only on a version the image build verified with Codex (#125): an older image
+   * would refuse the Codex run hook and never register, spending a launch and a slot for nothing.
+   */
+  async function available(version = imageVersion!): Promise<boolean> {
+    if (provider !== 'codex') return true;
+    return (await capabilities(version)).codex;
+  }
   const sessions = createManagedSessions(env.TABLE_NAME ?? '', undefined, provider);
   const workers = createNativeStore(env.TABLE_NAME ?? '');
   const mode = createNativeModeStore(env.TABLE_NAME ?? '');
@@ -282,6 +293,7 @@ export function managedClaude(
   }
 
   async function start(id: number) {
+    if (!(await available())) throw new FlowError('invalid_settings', 409, CODEX_UNAVAILABLE);
     const image = await imagePolicy(imageVersion!);
     if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `${name} image cannot start: ${image.reason}`);
     if (await disabled())
@@ -340,6 +352,11 @@ export function managedClaude(
     if (imageDecision(reservedImage) !== 'approved') {
       await retire(id, session.generation, reservedImage.state === 'revoked' ? 'image-revoked' : 'image-blocked');
       throw new FlowError('invalid_settings', 409, `Reserved ${name} image cannot start: ${reservedImage.reason}`);
+    }
+    // The reserved session's own image, too: never launch Codex on a version not verified for it.
+    if (!(await available(session.imageVersion))) {
+      await retire(id, session.generation, 'image-blocked');
+      throw new FlowError('invalid_settings', 409, CODEX_UNAVAILABLE);
     }
     await admission.reserve(id, session.generation, now(), policy);
     // Fetch the secret before the launch marker. Failure here can be sealed/released without a VM.
@@ -469,6 +486,7 @@ export function managedClaude(
 
   return {
     provider,
+    available,
     route,
     start,
     stop,

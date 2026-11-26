@@ -106,6 +106,16 @@ export function attachCodexLogin(socket, config, checkAuth, launch = spawn, repo
   return close;
 }
 
+/**
+ * The one sign-in route this VM serves (#125): its session's own provider's. A Claude session
+ * serves only `/claude-login`; a Codex session (run hook `provider: "codex"`) only `/codex-login`,
+ * and only where the image installs Codex. Anything else is refused.
+ */
+export function loginRouteFor(url, provider = 'claude', codexInstalled = false) {
+  if (provider === 'codex') return url === '/codex-login' && codexInstalled ? 'codex' : undefined;
+  return url === '/claude-login' ? 'claude' : undefined;
+}
+
 export function attachLogin(socket, config, checkAuth, launch = spawn, report = () => {}) {
   let child;
   let sentUrl = false;
@@ -167,7 +177,7 @@ export function attachLogin(socket, config, checkAuth, launch = spawn, report = 
   return close;
 }
 
-async function run(config) {
+async function run(config, provider = 'claude') {
   if (process.getuid() !== config.claudeUid) throw new Error('incorrect login identity');
   const { WebSocketServer } = await import('ws');
   const { nativeClaudeAuthFromStatus } = await import(pathToFileURL(config.authModule).href);
@@ -208,8 +218,8 @@ async function run(config) {
   httpServer.on('upgrade', (req, socket, head) => {
     // The only browser client is an opaque-origin sandbox in Updraft. AWS first
     // authenticates the connection with its short-lived, port-scoped token.
-    const codexRoute = req.url === '/codex-login' && codexAuth;
-    if (active || (req.url !== '/claude-login' && !codexRoute) || req.headers.origin !== 'null' || req.headers['sec-websocket-protocol']) {
+    const route = loginRouteFor(req.url, provider, Boolean(codexAuth));
+    if (active || !route || req.headers.origin !== 'null' || req.headers['sec-websocket-protocol']) {
       socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       return;
     }
@@ -217,15 +227,16 @@ async function run(config) {
       active = true;
       client.once('close', () => { active = false; });
       const report = (phase) => process.send?.({ loginPhase: phase });
-      if (codexRoute) attachCodexLogin(client, config, checkCodexAuth, spawn, report);
+      if (route === 'codex') attachCodexLogin(client, config, checkCodexAuth, spawn, report);
       else attachLogin(client, config, checkAuth, spawn, report);
     });
   });
   httpServer.listen(LOGIN_PORT, '0.0.0.0', () => process.send?.({ ready: true }));
 }
 
-export async function startBrowserLogin(config) {
-  const [command, argv] = identityCommand(config.claudeUid, config.claudeGid, process.execPath, [fileURLToPath(import.meta.url)]);
+export async function startBrowserLogin(config, provider = 'claude') {
+  const [command, argv] = identityCommand(config.claudeUid, config.claudeGid, process.execPath,
+    [fileURLToPath(import.meta.url), ...(provider === 'codex' ? ['--provider', 'codex'] : [])]);
   const child = spawn(command, argv, { cwd: '/', env: claudeEnv(config), stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
   let timer;
   try {
@@ -248,5 +259,6 @@ export async function startBrowserLogin(config) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await run(loadConfig('/etc/updraft-native-worker.json'));
+  const at = process.argv.indexOf('--provider');
+  await run(loadConfig('/etc/updraft-native-worker.json'), at > 0 && process.argv[at + 1] === 'codex' ? 'codex' : 'claude');
 }

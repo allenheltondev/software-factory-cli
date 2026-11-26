@@ -34,6 +34,30 @@ interface Registry {
   accountingVersion?: number;
   launches?: number;
   tenantLaunches?: Record<string, number>;
+  /**
+   * Codex's own day of accounting (#125), beside Claude's (`seconds`, `tenants`, `launches`,
+   * `tenantLaunches`, unchanged). Absent on a registry written before Codex: nothing spent.
+   */
+  codexSeconds?: number;
+  codexTenants?: Record<string, number>;
+  codexLaunches?: number;
+  codexTenantLaunches?: Record<string, number>;
+}
+/** One provider's counters in the shared registry: Claude keeps the original fields. */
+function ledger(registry: Registry, provider: NativeProvider) {
+  if (provider === 'claude') {
+    registry.tenantLaunches ??= {};
+    return {
+      seconds: () => registry.seconds, addSeconds: (n: number) => { registry.seconds += n; }, tenants: registry.tenants,
+      launches: () => registry.launches ?? 0, addLaunch: () => { registry.launches = (registry.launches ?? 0) + 1; }, tenantLaunches: registry.tenantLaunches,
+    };
+  }
+  registry.codexTenants ??= {};
+  registry.codexTenantLaunches ??= {};
+  return {
+    seconds: () => registry.codexSeconds ?? 0, addSeconds: (n: number) => { registry.codexSeconds = (registry.codexSeconds ?? 0) + n; }, tenants: registry.codexTenants,
+    launches: () => registry.codexLaunches ?? 0, addLaunch: () => { registry.codexLaunches = (registry.codexLaunches ?? 0) + 1; }, tenantLaunches: registry.codexTenantLaunches,
+  };
 }
 export interface AdmissionLimits {
   concurrent: number;
@@ -98,6 +122,10 @@ function budgetDay(registry: Registry, now: number, name = 'Claude') {
     registry.tenants = {};
     registry.launches = 0;
     registry.tenantLaunches = {};
+    registry.codexSeconds = 0;
+    registry.codexTenants = {};
+    registry.codexLaunches = 0;
+    registry.codexTenantLaunches = {};
   }
 }
 const key = { pk: 'CLAUDE_CAPACITY', sk: 'REGISTRY' };
@@ -105,10 +133,14 @@ const key = { pk: 'CLAUDE_CAPACITY', sk: 'REGISTRY' };
 /**
  * One bounded, strongly consistent CAS registry. Capacity never expires via TTL or a guessed deadline.
  *
- * The registry (`CLAUDE_CAPACITY`) is shared by every provider: the platform's concurrent
- * environments and daily budgets count Claude and Codex sessions together, and an installation
- * may hold one lease per provider. Each instance lists and reserves only its own provider's
- * leases; a lease's session check names its own provider's session record.
+ * The registry (`CLAUDE_CAPACITY`) holds every provider's leases, in one record so each change is
+ * one compare-and-swap, but each provider is accounted on its own (#125): its concurrent
+ * environments, platform and tenant runtime hours and launches count only its own leases and
+ * counters, each against the same configured limits, so Codex can never take a Claude slot or
+ * spend Claude's budget. A lease without `provider` (every lease written before Codex) is Claude's,
+ * and Claude's counters are the original fields, so existing Claude usage keeps its limits. An
+ * installation may hold one lease per provider. Each instance lists and reserves only its own
+ * provider's leases; a lease's session check names its own provider's session record.
  */
 export function createClaudeAdmission(
   table: string,
@@ -213,10 +245,8 @@ export function createClaudeAdmission(
               );
             return existing;
           }
-          if (
-            Object.keys(registry.leases).length >= limits.concurrent ||
-            Object.values(registry.leases).some((lease) => lease.installationId === installationId && mine(lease))
-          ) {
+          const own = Object.values(registry.leases).filter(mine);
+          if (own.length >= limits.concurrent || own.some((lease) => lease.installationId === installationId)) {
             throw new FlowError(
               'throttled',
               429,
@@ -224,16 +254,14 @@ export function createClaudeAdmission(
             );
           }
           budgetDay(registry, now, name);
-          const held = Object.values(registry.leases).reduce(
-            (sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS),
-            0,
-          );
-          const tenantHeld = Object.values(registry.leases)
+          const books = ledger(registry, provider);
+          const held = own.reduce((sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS), 0);
+          const tenantHeld = own
             .filter((lease) => lease.installationId === installationId)
             .reduce((sum, lease) => sum + (lease.reservedSeconds ?? SESSION_SECONDS), 0);
-          const tenantSeconds = registry.tenants[String(installationId)] ?? 0;
+          const tenantSeconds = books.tenants[String(installationId)] ?? 0;
           if (
-            registry.seconds + held + SESSION_SECONDS > limits.dailySeconds ||
+            books.seconds() + held + SESSION_SECONDS > limits.dailySeconds ||
             tenantSeconds + tenantHeld + SESSION_SECONDS > limits.tenantDailySeconds
           ) {
             throw new FlowError(
@@ -242,9 +270,9 @@ export function createClaudeAdmission(
               `The daily ${name} runtime budget is reserved or spent. Try again after an environment ends or after midnight UTC.`,
             );
           }
-          const tenantLaunches = registry.tenantLaunches![String(installationId)] ?? 0;
+          const tenantLaunches = books.tenantLaunches[String(installationId)] ?? 0;
           if (
-            (registry.launches ?? 0) >= (limits.platformLaunchesPerDay ?? DEFAULT_ADMISSION.platformLaunchesPerDay!) ||
+            books.launches() >= (limits.platformLaunchesPerDay ?? DEFAULT_ADMISSION.platformLaunchesPerDay!) ||
             tenantLaunches >= (limits.tenantLaunchesPerDay ?? DEFAULT_ADMISSION.tenantLaunchesPerDay!)
           ) {
             throw new FlowError(
@@ -253,8 +281,8 @@ export function createClaudeAdmission(
               `The daily ${name} connection launch limit has been reached. Try again after midnight UTC or contact an operator.`,
             );
           }
-          registry.launches = (registry.launches ?? 0) + 1;
-          registry.tenantLaunches![String(installationId)] = tenantLaunches + 1;
+          books.addLaunch();
+          books.tenantLaunches[String(installationId)] = tenantLaunches + 1;
           return (registry.leases[generation] = {
             installationId,
             generation,
@@ -343,9 +371,11 @@ export function createClaudeAdmission(
                     1000,
                 ),
               );
-        registry.seconds += seconds;
+        // Settled to the lease's own provider: Claude's original counters, or Codex's.
+        const books = ledger(registry, leaseProvider(lease));
+        books.addSeconds(seconds);
         const id = String(lease.installationId);
-        registry.tenants[id] = (registry.tenants[id] ?? 0) + seconds;
+        books.tenants[id] = (books.tenants[id] ?? 0) + seconds;
         delete registry.leases[generation];
       });
     },

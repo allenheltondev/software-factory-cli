@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { cloudConfig, runnerEnvironment, startCloudWorker, TRANSIENT_BUDGET_MS } from '../native-worker/cloud.mjs';
 import { brokerResponse, transientInvokeError } from '../image/runner/worker-control.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
+import { loginRouteFor } from '../native-worker/browser-login.mjs';
 import { nativeConfig, NATIVE_RUNTIME } from '../image/runner/native-config.mjs';
 import { checkAgentConfig, SANDBOX_RUNTIME, SANDBOX_IMAGE } from '../image/runner/isolation.mjs';
 
@@ -262,6 +263,19 @@ describe('a Codex session on the subscription worker image', () => {
     expect(bootPayload(JSON.stringify({ storage: 'ephemeral', cloud: { ...codex, controlSecretArn: undefined, controlToken: 'a'.repeat(43) } })).cloud.provider).toBe('codex');
     for (const provider of ['claude', 'kiro', '', null, 1]) expect(() => cloudConfig({ ...config, provider })).toThrow();
     expect(() => cloudConfig({ ...codex, chatgptToken: 'never' })).toThrow();
+  });
+  it('serves only its own provider\'s sign-in route', () => {
+    // A Claude session (no provider in its run hook): only /claude-login, even with Codex installed.
+    expect(loginRouteFor('/claude-login')).toBe('claude');
+    expect(loginRouteFor('/codex-login', 'claude', true)).toBeUndefined();
+    // A Codex session: only /codex-login, and only where the image installs Codex.
+    expect(loginRouteFor('/codex-login', 'codex', true)).toBe('codex');
+    expect(loginRouteFor('/claude-login', 'codex', true)).toBeUndefined();
+    expect(loginRouteFor('/codex-login', 'codex', false)).toBeUndefined();
+    for (const url of ['/', '/claude-login/', '/codex-login?x', undefined]) {
+      expect(loginRouteFor(url)).toBeUndefined();
+      expect(loginRouteFor(url, 'codex', true)).toBeUndefined();
+    }
   });
   it('tells the root runner its provider only for Codex, from the run hook and never the job', () => {
     expect(runnerEnvironment(config, { payload: {} })).not.toHaveProperty('UPDRAFT_NATIVE_PROVIDER');

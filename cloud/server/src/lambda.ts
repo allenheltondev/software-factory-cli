@@ -57,6 +57,7 @@ const clientId = process.env.USER_POOL_CLIENT_ID ?? '';
 if (!clientId) console.error('USER_POOL_CLIENT_ID is not set; every /api/v1 request will be refused');
 const userPoolId = process.env.USER_POOL_ID ?? '';
 const verifier = userPoolId && clientId ? CognitoJwtVerifier.create({ userPoolId, clientId, tokenUse: 'id' }) : null;
+const tableName = process.env.TABLE_NAME ?? '';
 const managedWorker = managedClaude();
 const managedCodexWorker = managedClaude(process.env, { provider: 'codex' });
 /** The triggers each subscription holds, so the other's page never offers them (settings.ts). */
@@ -68,7 +69,6 @@ const claudeTriggers = async (id: number) => {
   const mode = await createNativeModeStore(tableName).snapshot(id, workerId);
   return mode.triggers ?? (pinned?.installationId === id ? legacyNativeTriggers(pinned) : []);
 };
-const tableName = process.env.TABLE_NAME ?? '';
 const store = tableName ? createDynamoStore(tableName) : undefined;
 /** Records stops and resumes on their workflows (#139): one recorder for the stopper and the status service. */
 const workflowRecorder = tableName && store ? createWorkflowRecorder({ store: createDynamoWorkflowStore(tableName), pauses: store }) : undefined;
@@ -187,7 +187,9 @@ const app = createApp({
           route: nativeRoute(process.env.NATIVE_WORKER_ROUTE),
           loginGrant: browserLoginGrant(process.env.NATIVE_WORKER_LOGIN_IMAGE_ARN ?? '', nativeRoute(process.env.NATIVE_WORKER_ROUTE)),
           mode: createNativeModeStore(tableName), workers: createNativeStore(tableName),
-          otherTriggers: codexTriggers }),
+          otherTriggers: codexTriggers,
+          // The Connect ChatGPT card shows only where the deployed image was verified with Codex.
+          codexAvailable: async () => (await managedCodexWorker?.available()) ?? false }),
         // Codex on a ChatGPT plan (#125): a managed session only, on the same image. No pinned route.
         ...(managedCodexWorker ? { nativeCodex: createNativeSettingsService({ github, store, provider: 'codex',
           managed: { ...managedCodexWorker, grant: (route) => browserLoginGrant(managedCodexWorker.imageArn, route, '/codex-login') },

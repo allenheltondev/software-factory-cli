@@ -146,6 +146,30 @@ describe('Claude subscription mode in the installation app', () => {
     configContext.mockResolvedValue({});
   });
 
+  it('offers Codex only where the deployed image can run it, and never starts one otherwise (#125)', async () => {
+    const tenant = { installationId: 55, activeConfigVersion: 3, status: 'active' };
+    member.mockResolvedValue({ tenant, summary: { role: 'owner' } });
+    let capable = false;
+    const start = vi.fn(async () => {});
+    const codexRoute: NativeRoute = { installationId: 55, workerId: 'managed-codex-55', microvmId: 'mvm-pending', imageVersion: '4',
+      controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/root' };
+    const codex = createNativeSettingsService({ github, mode, workers, now: () => now, provider: 'codex',
+      managed: { route: async () => codexRoute, start, sessions: { get: async () => undefined }, grant: () => undefined, available: async () => capable } });
+    expect(await codex.view(caller, 55)).toMatchObject({ provider: 'codex', available: false, configured: false, worker: null });
+    await expect(codex.start(caller, 55)).rejects.toThrow("not available on this deployment's worker image yet");
+    expect(start).not.toHaveBeenCalled();
+    capable = true;
+    expect(await codex.view(caller, 55)).toMatchObject({ provider: 'codex', available: true, configured: true });
+    await codex.start(caller, 55);
+    expect(start).toHaveBeenCalledWith(55);
+    // Claude's page says whether the Connect ChatGPT card may show; a failed read hides it.
+    const claude = createNativeSettingsService({ github, route, mode, workers, now: () => now, codexAvailable: async () => { throw new Error('read failed'); } });
+    expect(await claude.view(caller, 55)).toMatchObject({ codexAvailable: false });
+    const claudeReady = createNativeSettingsService({ github, route, mode, workers, now: () => now, codexAvailable: async () => true });
+    expect(await claudeReady.view(caller, 55)).toMatchObject({ codexAvailable: true });
+    member.mockResolvedValue(undefined);
+  });
+
   it('only gives an owner a browser grant for an idle, pinned worker waiting for login', async () => {
     const loginGrant = vi.fn().mockResolvedValue({ url: 'wss://worker.on.aws/claude-login', token: 'sample', port: 8081 });
     const service = createNativeSettingsService({ github, route, mode, workers, loginGrant, now: () => now });

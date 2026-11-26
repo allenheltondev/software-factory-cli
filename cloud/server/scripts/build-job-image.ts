@@ -44,7 +44,8 @@ import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { createAdminClients } from './admin-clients.js';
 import { checkImageVersionIsolation } from './job-image-check.js';
-import { buildContext, IMAGE_DIR, NATIVE_BUILD_ENV, repoRoot } from './job-image-context.js';
+import { buildContext, IMAGE_DIR, NATIVE_BUILD_ENV, NATIVE_CODEX_VERSION, repoRoot } from './job-image-context.js';
+import { createImageCapabilities, recordCodexCapability } from '../src/native/image-policy.js';
 import { pruneImageVersions, pruneNativeImageVersions } from './job-image-prune.js';
 import { describeInputs, fingerprintOf, IMAGE_INPUTS, imageInputFiles, imageInputFingerprint, inputsFromDescription } from './job-image-inputs.js';
 import { checkNativeClaudeImage } from './native-claude-image-check.js';
@@ -106,12 +107,28 @@ async function main() {
     }
   }
 
+  const smokeImage = (version: string) => ({
+    imageArn, version, region, executionRoleArn: outputs.ManagedClaudeExecutionRoleArn!,
+    logGroup: outputs.MicrovmLogGroup!, brokerFunctionName: outputs.BrokerFunctionName!,
+  });
   async function verifyNative(version: string) {
-    await checkNativeClaudeImage(microvms, {
-      imageArn, version, region, executionRoleArn: outputs.ManagedClaudeExecutionRoleArn!,
-      logGroup: outputs.MicrovmLogGroup!, brokerFunctionName: outputs.BrokerFunctionName!,
-    });
+    await checkNativeClaudeImage(microvms, smokeImage(version));
     console.log(`==> Claude worker version ${version} passed the AWS sign-in smoke test`);
+    await ensureCodex(version);
+  }
+
+  /**
+   * Codex on a ChatGPT plan (#125) is offered only on a version recorded as able to run it. This
+   * version's build already proved its pinned Codex accepts the worker's launch arguments
+   * (install.sh runs codex-config-check.mjs); here it must also start as a Codex session. Then
+   * the capability is recorded beside its image policy, and Cloud starts offering Connect ChatGPT.
+   */
+  async function ensureCodex(version: string) {
+    if (!outputs.TableName) throw new Error('the stack has no TableName output');
+    if ((await createImageCapabilities(outputs.TableName, clients.dynamo)(version)).codex) return;
+    await checkNativeClaudeImage(microvms, smokeImage(version), 'codex');
+    await recordCodexCapability(clients.dynamo, outputs.TableName, version, NATIVE_CODEX_VERSION);
+    console.log(`==> worker version ${version} passed the Codex session smoke test; Codex ${NATIVE_CODEX_VERSION} recorded for it`);
   }
 
   function reportVersion(version: string) {
@@ -140,6 +157,8 @@ reason=${reason}
         });
       if (built?.state !== 'SUCCESSFUL' || inputsFromDescription(built.description) !== fingerprint) continue;
       if (candidate !== active) await verifyNative(candidate);
+      // Built from this checkout's inputs, so it runs Codex: record that once, after its smoke.
+      else await ensureCodex(candidate);
       reportVersion(candidate);
       return;
     }

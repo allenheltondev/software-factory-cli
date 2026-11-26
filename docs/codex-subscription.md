@@ -106,7 +106,8 @@ The controls, in order of importance:
      empty cwd: no user `config.toml`, rules, project config or project MCP servers;
    - every feature that adds a tool or a call path off (`CODEX_DISABLED_FEATURES`), under
      `--strict-config`, so a key the pinned CLI does not know fails the run instead of being
-     ignored. Audit, at `openai/codex` 8727186 (`codex-rs/features/src/lib.rs`): every
+     ignored. Audit, at `openai/codex` `rust-v0.172.0` (3d86e43, the release the image pins;
+     `codex-rs/features/src/lib.rs`): every
      `FeatureSpec` with `default_enabled: true` was listed, and each that adds a model-visible
      tool, a tool or MCP call path, an MCP server, sub-agents, hooks, browser or computer use,
      image generation or an approval reviewer is switched off: `shell_tool`, `unified_exec`,
@@ -118,10 +119,13 @@ The controls, in order of importance:
      `goals`, `tool_call_mcp_elicitation`, `auth_elicitation`, `guardian_approval`,
      `workspace_dependencies`. Off-by-default features that would add such a tool are pinned off
      too: `multi_agent_v2`, `code_mode`, `code_mode_only`, `standalone_web_search`,
-     `web_search_request`, `web_search_cached`, `web_search_indexed_default`,
-     `request_permissions_tool`, `exec_permission_approvals`, `memories`, `recommended_plugins`,
-     `agent_message_board`, `agent_message_board_mcp`, `enable_mcp_apps`, `deferred_executor`,
-     `send_message_to_user_async`, `artifact`, `statsig_gates`. `js_repl` is `Stage::Removed`
+     `web_search_request`, `web_search_cached`, `hosted_search_policy` (which would let a
+     host-requested search mode override `web_search="disabled"`), `request_permissions_tool`,
+     `exec_permission_approvals`, `memories`, `recommended_plugins`, `agent_message_board`,
+     `agent_message_board_mcp`, `enable_mcp_apps`, `deferred_executor`,
+     `send_message_to_user_async`, `artifact`. Every key is a `FeatureSpec` of that release:
+     the image build runs the real pinned binary with these arguments and fails on any key it
+     does not know (below). `js_repl` is `Stage::Removed`
      (ignored by the CLI) and not listed. Infrastructure flags (MCP startup, compression,
      retries, TUI) are left alone. Re-run this audit for every Codex version the image pins;
    - `agents.enabled=false`: the model catalog's `multi_agent_version` (v2 for most models)
@@ -130,7 +134,7 @@ The controls, in order of importance:
    - `web_search="disabled"`, `check_for_update_on_startup=false`;
    - a direct-mode model only. A model whose catalog entry has `tool_mode: code_mode_only` reaches
      MCP tools only through code mode, which is off here, so it would have no usable tool. In
-     `codex-rs/models-manager/models.json` at 8727186 that is every gpt-5.6 and gpt-6.x model, the
+     `codex-rs/models-manager/models.json` at `rust-v0.172.0` (unchanged from 8727186) that is every gpt-5.6 and gpt-6.x model, the
      daybreak models and `codex-auto-review`; the one direct-mode model listed is `gpt-5.5`, which
      is the worker's default and the only one it accepts (unknown models are refused, not
      guessed). The CLI does not expose that flag before a run, so the list is kept in
@@ -205,7 +209,8 @@ Other parts of the boundary:
 **What this does not prove:** whether the real CLI, with these flags, offers the model no
 built-in tool but `apply_patch` is a property of the pinned Codex release and must be verified
 live (below). The feature audit, the sub-agent switch and the direct-mode model list are all
-read from `openai/codex` 8727186 and must be re-checked for every Codex version the image pins.
+read from `openai/codex` `rust-v0.172.0`, the pinned release, and must be re-checked for every
+Codex version the image pins (the build guard catches a key that release does not know).
 
 ## Hosted sign-in
 
@@ -245,15 +250,34 @@ jobs `CLAUDE_WAIT#<job>`, the worker `managed-<id>` (its `WORKER`, `MODE` and `Q
 waiting job id salt `claude-wait`, image policy records `NATIVE_IMAGE#<version>`, and the timeline
 codes `claude_…`. Codex gets new keys beside them: `CODEX_SESSION`, `CODEX_WAIT#<job>`, worker
 `managed-codex-<id>`, salt `codex-wait`, codes `codex_…` (`cloud/server/src/native/provider.ts`).
-The capacity registry (`CLAUDE_CAPACITY`) is shared, so the platform's concurrent environments and
-daily budgets count both; a lease carries `provider: "codex"` only for Codex, and a lease without
-it is Claude's. Each provider's cleanup lists only its own leases, and each lease's session check
-names its own session record. A stored worker id, job or queue route that names no Codex worker is
-Claude's.
+The capacity registry (`CLAUDE_CAPACITY`) is one record holding every lease, but each provider is
+accounted on its own: concurrent environments, platform and tenant runtime hours, and platform
+and tenant launches count only that provider's leases and counters, each against the same
+configured limits (`NATIVE_MANAGED_*`). Claude's counters are the original fields (`seconds`,
+`tenants`, `launches`, `tenantLaunches`); Codex's are new (`codexSeconds`, `codexTenants`,
+`codexLaunches`, `codexTenantLaunches`). A lease carries `provider: "codex"` only for Codex; a lease
+without it, as every existing one is, is Claude's, so Claude keeps its limits and Codex can never
+take a Claude slot or budget. The platform can therefore run up to twice the configured concurrent
+environments, one set per provider. Each provider's cleanup lists only its own leases and runs on
+its own (one failing never skips the other), and each lease's session check names its own
+session record. A stored worker id, job or queue route that names no Codex worker is Claude's.
+Waits and deliveries name Codex explicitly (`provider: "codex"` on the waiting record, the delivery
+record and the workflow's `signInProvider`); a record without it is Claude's.
+
+**Only on an image verified with Codex.** Codex is offered and started only where the deployed
+subscription image (`ManagedClaudeImageVersion`) has a Codex capability record
+(`NATIVE_IMAGE#<version>` / `CAPABILITIES`, `codex: true`, beside its policy record, so a policy
+write never drops it). The image build writes it (`build-job-image.ts --native-claude`) only after
+that version passed the Claude smoke check and a Codex session smoke check (the image starts with
+the Codex run hook, serves `/codex-login` and refuses `/claude-login`). Without it, an older image,
+or the window between a backend deploy and the image build, the Connect ChatGPT card is hidden,
+`/codex-subscription/connect` says the image cannot run Codex yet, the managed Codex stack refuses
+to start or launch a session, and dispatch has no Codex route.
 
 **Worker.** A Codex session's run hook adds `"provider": "codex"` to the cloud settings; Claude's
-run hook is byte-for-byte as before, so an existing Claude VM on an older image is unaffected. The
-worker then reports Codex's login (`codex login status`) as its readiness, tells the root job runner
+run hook is byte-for-byte as before, so an existing Claude VM on an older image is unaffected. Each
+VM serves only its own provider's sign-in route (`/claude-login` or `/codex-login`). The worker
+then reports Codex's login (`codex login status`) as its readiness, tells the root job runner
 (`UPDRAFT_NATIVE_PROVIDER`, from the run hook, never from the job) to put the workflow's Codex
 profiles on the native runtime, and leaves every other agent on its sandbox and API key.
 
@@ -267,8 +291,9 @@ once, to one place:
    the ChatGPT page chose, with Codex routing on.
 3. Otherwise the API-key path, as before.
 
-Work pinned to a worker (a pull request's revision or CI fix, a console retry) stays on that worker
-or is refused; it never moves between Claude, Codex and API keys. A trigger taken by one
+A failure to read Codex's routing is no Codex route (logged): Claude and API-key work go on. Work
+pinned to the Codex worker fails retryably then. Work pinned to a worker (a pull request's revision
+or CI fix, a console retry) stays on that worker or is refused; it never moves between Claude, Codex and API keys. A trigger taken by one
 subscription is not offered on the other's page. The delivery claim and the stable waiting job id
 make a label start one job at most, whatever the route.
 
@@ -289,19 +314,24 @@ page gets only a status. The page shows the session's sanitized state (connected
 offline) and the routing choices.
 
 **Image.** One image for both CLIs (`build-job-image.ts --native-claude`): Claude Code and Codex are
-each pinned to an exact release (`NATIVE_CLAUDE_VERSION`, `NATIVE_CODEX_VERSION` in
+each pinned to an exact release (`NATIVE_CLAUDE_VERSION`, `NATIVE_CODEX_VERSION` = 0.172.0 in
 `job-image-context.ts`); `install.sh` records Codex's native binary from the pinned platform package.
-The audit above was read at `openai/codex` 8727186, a `main` commit after the last release; the image
-pins the latest release then, 0.172.0, so the feature, sub-agent and model audit must be re-checked
-against it (below).
+The feature list is audited against `rust-v0.172.0`. **Build guard:** `install.sh` then runs
+`codex-config-check.mjs`, which runs that real binary once with the worker's whole `codexArgs`
+argv under `--strict-config`, offline and signed out: a fresh empty `CODEX_HOME`, an empty cwd, no
+inherited environment, every proxy variable pointing at a closed local port, and `/bin/false` as
+the one MCP server. Codex validates every `-c` override first and then fails to start the required
+MCP server, before any thread, model or network call; that exact outcome passes, and anything else
+(above all `unknown configuration field`) fails the image build. So a feature key a new pin no
+longer knows can never ship.
 
 Still to do: a separate credential UID per CLI, the readiness checklist's Codex entry, and a
 connected-account page shared with Claude's (#123).
 
 ## Verify live, with a real ChatGPT account
 
-- The pinned Codex release (0.172.0) still matches the 8727186 audit: every flag accepted under
-  `--strict-config`, and the feature, sub-agent and direct-mode model lists unchanged.
+- With the real 0.172.0 CLI and a ChatGPT login, the model is offered only `updraft.exec` and
+  `apply_patch` (the build guard proves the flags are accepted, not what they leave on).
 - On staging: Connect ChatGPT starts a Codex session on the current image, the frame shows the page
   and the code, and the page turns connected; an existing Claude session keeps running through the
   deploy; a label on a ChatGPT-routed workflow starts one job on the Codex session with no

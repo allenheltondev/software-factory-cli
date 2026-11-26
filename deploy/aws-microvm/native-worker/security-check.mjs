@@ -111,15 +111,15 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   child.stdin.end();
 });
 `, { mode: 0o755 });
-  // Every Codex feature that adds a tool or call path (openai/codex 8727186, features/src/lib.rs),
+  // Every Codex feature that adds a tool or call path (openai/codex rust-v0.172.0, features/src/lib.rs),
   // listed here independently of policy.mjs: the stand-in refuses to start unless each is off.
   const CODEX_FEATURES_OFF = ['shell_tool', 'unified_exec', 'unified_exec_tty', 'shell_snapshot', 'view_image', 'sleep_tool', 'code_mode_host',
     'hooks', 'multi_agent', 'apps', 'tool_suggest', 'plugins', 'remote_plugin', 'plugin_sharing', 'in_app_browser', 'in_app_local_automation',
     'browser_use', 'browser_use_full_cdp_access', 'browser_use_external', 'computer_use', 'image_generation', 'skill_mcp_dependency_install',
     'goals', 'tool_call_mcp_elicitation', 'auth_elicitation', 'guardian_approval', 'workspace_dependencies', 'multi_agent_v2', 'code_mode',
-    'code_mode_only', 'standalone_web_search', 'web_search_request', 'web_search_cached', 'web_search_indexed_default', 'request_permissions_tool',
+    'code_mode_only', 'standalone_web_search', 'web_search_request', 'web_search_cached', 'hosted_search_policy', 'request_permissions_tool',
     'exec_permission_approvals', 'memories', 'recommended_plugins', 'agent_message_board', 'agent_message_board_mcp', 'enable_mcp_apps',
-    'deferred_executor', 'send_message_to_user_async', 'artifact', 'statsig_gates'];
+    'deferred_executor', 'send_message_to_user_async', 'artifact'];
   // The Codex stand-in checks the restricted launch contract, then drives the same REAL MCP bridge.
   // Its status comes from a synthetic file; `builtin` makes it act like a CLI whose built-in shell
   // is still on: it announces a command_execution item and then tries a command anyway.

@@ -190,9 +190,8 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     if (w.stage === 'awaiting-sign-in') {
       const waitedFor = at - Date.parse(w.waitingSince ?? w.updatedAt);
       if (waitedFor < SIGN_IN_LIMIT_MS) return void (await later(SIGN_IN_LIMIT_MS - waitedFor));
-      // Whose sign-in it waited for is in the wait's own words (jobs/launch.ts signInWait): a
-      // Codex wait names ChatGPT; every other wait, and every one recorded before #125, is Claude's.
-      const codex = /\bCodex\b/.test(w.message ?? '') && /\bChatGPT\b/.test(`${w.message ?? ''} ${w.nextAction ?? ''}`);
+      // Whose sign-in it waited for, as the wait recorded it; one recorded before #125 is Claude's.
+      const codex = w.signInProvider === 'codex';
       return block(
         'sign_in_expired',
         codex

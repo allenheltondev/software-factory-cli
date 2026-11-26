@@ -111,11 +111,15 @@ describe('managed session providers', () => {
     expect(session).toBeDefined();
     const { id } = await codex.park({ installationId: 55, deliveryId: 'new-delivery' }, 'key.json');
     expect(id).toBe(waitingId(55, 'new-delivery', 'codex'));
+    // The wait says whose it is; Claude's waits never carry a provider.
+    expect(rows.get(`TENANT#55|CODEX_WAIT#${id}`)).toMatchObject({ provider: 'codex' });
+    const claudeWait = await createClaudeSessions('table', db).park({ installationId: 55, deliveryId: 'claude-delivery' }, 'k.json');
+    expect(rows.get(`TENANT#55|CLAUDE_WAIT#${claudeWait.id}`)).not.toHaveProperty('provider');
     await codex.retire(55, session!, { enabled: true, revision: 0 }, null, 'reconnect');
     const touched = writes.map((w) => w.key);
     expect(touched).toEqual(expect.arrayContaining(['TENANT#55|CODEX_SESSION', `TENANT#55|CODEX_WAIT#${id}`,
       'NATIVE#55#managed-codex-55|MODE', 'NATIVE#55#managed-codex-55|WORKER']));
-    expect(touched.filter((key) => key.includes('CLAUDE') || key.includes('#managed-55|'))).toEqual([]);
+    expect(touched.filter((key) => (key.includes('CLAUDE') && !key.includes(claudeWait.id)) || key.includes('#managed-55|'))).toEqual([]);
     expect(rows.get('TENANT#55|CLAUDE_SESSION')).toEqual(live);
     expect(rows.get('NATIVE#55#managed-codex-55|WORKER')).toMatchObject({ workerId: 'managed-codex-55', fenced: true });
   });
@@ -172,10 +176,36 @@ describe('shared admission registry across providers', () => {
     expect(checked.at(-1)).toBe('CODEX_SESSION');
   });
 
-  it('shares the platform\'s concurrent environments across providers', async () => {
+  it('accounts each provider on its own: Codex never takes a Claude slot, launch or budget', async () => {
     const fixture = admissionFixture();
+    const claude = createClaudeAdmission('test', fixture.db);
+    const codex = createClaudeAdmission('test', fixture.db, 'codex');
+    const tight = { ...limits, concurrent: 1, platformLaunchesPerDay: 2, tenantLaunchesPerDay: 2 };
+    // Codex fills its own slot; Claude's slot is still free, and the reverse.
+    await codex.reserve(56, 'codex-a', now, tight);
+    await expect(codex.reserve(57, 'codex-b', now, tight)).rejects.toThrow('Codex environment capacity is full');
+    await claude.reserve(57, 'claude-a', now, tight);
+    await expect(claude.reserve(58, 'claude-b', now, tight)).rejects.toThrow('Claude environment capacity is full');
+    // Launches and runtime are Codex's own counters; Claude's original fields count only Claude.
+    await codex.launching('codex-a', now);
+    await codex.release('codex-a', now + 3600_000);
+    await codex.reserve(56, 'codex-c', now + 3600_000, tight);
+    await codex.launching('codex-c', now + 3600_000);
+    await codex.release('codex-c', now + 2 * 3600_000);
+    await expect(codex.reserve(56, 'codex-d', now + 2 * 3600_000, tight)).rejects.toThrow('daily Codex connection launch limit');
+    const registry = fixture.read()!;
+    expect(registry).toMatchObject({ launches: 1, tenantLaunches: { 57: 1 }, seconds: 0, codexLaunches: 2, codexTenantLaunches: { 56: 2 }, codexSeconds: 7200, codexTenants: { 56: 7200 } });
+    await claude.release('claude-a', now);
+    await expect(claude.reserve(58, 'claude-b', now, tight)).resolves.toMatchObject({ generation: 'claude-b' });
+  });
+
+  it('keeps counting a registry written before Codex as Claude\'s, at Claude\'s limits', async () => {
     const tight = { ...limits, concurrent: 1 };
-    await createClaudeAdmission('test', fixture.db).reserve(55, 'claude-gen', now, tight);
-    await expect(createClaudeAdmission('test', fixture.db, 'codex').reserve(56, 'codex-gen', now, tight)).rejects.toThrow('capacity is full');
+    const fixture = admissionFixture({
+      pk: 'CLAUDE_CAPACITY', sk: 'REGISTRY', revision: 1, day: '2026-11-26', seconds: 0, tenants: {}, accountingVersion: 2, launches: 1, tenantLaunches: { 55: 1 },
+      leases: { old: { installationId: 55, generation: 'old', requestedAt: now, idleAt: now + 1000, mayHaveLaunched: true, launchedAt: now, reservedSeconds: SESSION_SECONDS, idleMs: 1000 } },
+    });
+    await expect(createClaudeAdmission('test', fixture.db).reserve(56, 'claude-new', now, tight)).rejects.toThrow('Claude environment capacity is full');
+    await expect(createClaudeAdmission('test', fixture.db, 'codex').reserve(56, 'codex-new', now, tight)).resolves.toMatchObject({ provider: 'codex' });
   });
 });

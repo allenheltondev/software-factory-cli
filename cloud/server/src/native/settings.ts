@@ -6,7 +6,7 @@ import { routeWorkerVersion } from './readiness.js';
 import { legacyNativeTriggers, sameNativeTrigger, type NativeRoute, type NativeTrigger } from './route.js';
 import type { ClaudeSessions } from './sessions.js';
 import type { NativeModeStore, NativeStore } from './store.js';
-import { providerKeys, type NativeProvider } from './provider.js';
+import { CODEX_UNAVAILABLE, providerKeys, type NativeProvider } from './provider.js';
 
 /** Per-installation UI state. Claude's native credentials never enter the application. */
 export function createNativeSettingsService(d: {
@@ -23,6 +23,8 @@ export function createNativeSettingsService(d: {
     lifecycle?(id: number, generation?: string): Promise<{ preparing: boolean; startupFailed: boolean; retiring: boolean; retired?: boolean; retirementReason?: string; expiresAt?: string; idleExpiresAt?: string; idleSeconds?: number }>;
     policy?: { maxSessionSeconds: number; idleSeconds: number; concurrentSessions: number; tenantDailySeconds: number; platformDailySeconds: number; tenantLaunchesPerDay: number; platformLaunchesPerDay: number };
     retire?(id: number, generation: string): Promise<boolean>;
+    /** Whether the deployed image can run this provider (Codex: verified with Codex, #125). Absent: it can. */
+    available?(): Promise<boolean>;
     sessions: Pick<ClaudeSessions, 'get'> & Partial<Pick<ClaudeSessions, 'pending' | 'session'>>;
     grant(route: NativeRoute): (() => Promise<{ url: string; token: string; port: number; expiresAt?: string }>) | undefined;
   };
@@ -39,6 +41,8 @@ export function createNativeSettingsService(d: {
    * (dispatch decides Claude first regardless, so a label never starts two jobs).
    */
   otherTriggers?(installationId: number): Promise<NativeTrigger[]>;
+  /** Claude's page only: whether Connect ChatGPT can be offered on this deployment (#125). */
+  codexAvailable?(): Promise<boolean>;
 }) {
   const now = d.now ?? Date.now;
   const provider = d.provider ?? 'claude';
@@ -76,10 +80,18 @@ export function createNativeSettingsService(d: {
       reason: decision === 'protocol-incompatible' ? 'Worker protocol is not supported by this deployment' : policy?.reason ?? 'A newer worker image is available' };
   }
 
+  /** Whether the deployed image can run this provider; a failed read is "not yet", never a launch. */
+  const providerReady = async () => !d.managed?.available || await d.managed.available().catch(() => false);
   async function view(caller: Caller, installationId: number) {
     const membership = await d.github.member(caller, installationId);
     const r = await route(installationId);
-    if (!r || r.installationId !== installationId) return { configured: false, enabled: false, worker: null };
+    const codexAvailable = d.codexAvailable ? { codexAvailable: await d.codexAvailable().catch(() => false) } : {};
+    if (!r || r.installationId !== installationId) return { configured: false, enabled: false, worker: null, ...codexAvailable };
+    // Codex on an image that cannot run it yet: nothing to connect, and nothing is started.
+    if (provider === 'codex' && !(await providerReady())) {
+      return { provider, available: false, configured: false, enabled: false, managed: true, worker: null,
+        owner: membership?.summary?.role === 'owner' && membership?.tenant?.status === 'active' };
+    }
     const [mode, worker, available] = await Promise.all([
       d.mode.snapshot(r.installationId, r.workerId),
       d.workers.get(r.installationId, r.workerId),
@@ -99,7 +111,8 @@ export function createNativeSettingsService(d: {
     const preparing = lifecycle?.preparing ?? Boolean(awaitingWorker && (!session.microvmId || (vm !== null && vm !== 'TERMINATED' && vm !== 'TERMINATING')));
     const recovery = recovering ? { state: lifecycle?.startupFailed && !lifecycle.retiring ? 'required' as const : lifecycle?.retiring && vm !== null && vm !== 'TERMINATED' ? 'stopping' as const : replacementState(vm) } : undefined;
     return {
-      ...(provider === 'codex' ? { provider } : {}),
+      ...(provider === 'codex' ? { provider, available: true } : {}),
+      ...codexAvailable,
       preparing,
       ...(imageUpdate?.optional ? { updateAvailable: imageUpdate } : {}),
       startupFailed: lifecycle?.startupFailed ?? false,
@@ -167,6 +180,7 @@ export function createNativeSettingsService(d: {
       if (!d.managed || !r || r.installationId !== installationId || r === d.route || tenant.status !== 'active' || (requestId !== undefined && (!item || item.status !== 'waiting' || item.expiresAt <= now()))) {
         throw new FlowError('invalid_settings', 409, `This installation does not have an active ${name} sign-in request or permission to connect`);
       }
+      if (!(await providerReady())) throw new FlowError('invalid_settings', 409, CODEX_UNAVAILABLE);
       await d.managed.start(installationId);
       return view(caller, installationId);
     },

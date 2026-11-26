@@ -131,7 +131,7 @@ export function createWorkflowRecorder(o: {
      * `code` is the specific cause on the timeline event, such as which retirement ended the
      * Claude session (`claude_session_idle`, #176).
      */
-    waiting: (job: Omit<JobRef, 'jobId'> & { jobId?: string }, why: { reason: string; message: string; nextAction: string; code?: string }) =>
+    waiting: (job: Omit<JobRef, 'jobId'> & { jobId?: string }, why: { reason: string; message: string; nextAction: string; code?: string; provider?: 'codex' }) =>
       safely('wait', { ...job, jobId: job.jobId ?? 'pending' }, async () => {
         const id = await workflowOfJob(o.store, { ...job, jobId: job.jobId ?? 'pending' });
         if (!id) return;

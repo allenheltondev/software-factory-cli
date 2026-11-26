@@ -107,7 +107,10 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
     launch: pinned ? forLaunch(pinned) : undefined,
     resolveNative: managed ? async (id: number) => forLaunch(await managed.route(id), managed.imageVersion) : undefined,
     /** The installation's Codex session (ChatGPT plan), as dispatch sees it. */
-    resolveCodex: managedCodex ? async (id: number) => forLaunch(await managedCodex.route(id), managedCodex.imageVersion) : undefined,
+    // Only where the deployed image was verified with Codex: otherwise there is no Codex route, so
+    // dispatch never selects a session that cannot start.
+    resolveCodex: managedCodex ? async (id: number) => (await managedCodex.available())
+      ? forLaunch(await managedCodex.route(id), managedCodex.imageVersion) : undefined : undefined,
     managed,
     managedCodex,
     managedOf,

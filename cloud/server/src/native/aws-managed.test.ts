@@ -9,8 +9,9 @@ import type { Worker } from './store.js';
 vi.mock('./image-policy.js', async (original) => ({
   ...(await original<typeof import('./image-policy.js')>()),
   createImagePolicies: () => async (imageVersion: string) => ({ imageVersion, revision: 1, state: 'approved', protocol: 'tenant-browser-1', reason: 'test approval' }),
+  createImageCapabilities: () => mocks.capability,
 }));
-const mocks = vi.hoisted(() => ({ vm: vi.fn(), session: vi.fn(), worker: vi.fn() }));
+const mocks = vi.hoisted(() => ({ vm: vi.fn(), session: vi.fn(), worker: vi.fn(), capability: vi.fn() }));
 vi.mock('@aws-sdk/client-lambda-microvms', async (original) => ({
   ...(await original<typeof import('@aws-sdk/client-lambda-microvms')>()),
   LambdaMicrovmsClient: class { send = mocks.vm; },
@@ -43,7 +44,7 @@ const readiness = async () => (await nativeAws({} as never).resolveNative!(55))!
 const vmReads = () => mocks.vm.mock.calls.filter(([command]) => command instanceof GetMicrovmCommand).map(([command]) => command.input.microvmIdentifier);
 
 describe('managed route to dispatch readiness', () => {
-  beforeEach(() => { vi.clearAllMocks(); mocks.vm.mockResolvedValue({ state: 'RUNNING' }); mocks.worker.mockResolvedValue(null); });
+  beforeEach(() => { vi.clearAllMocks(); mocks.vm.mockResolvedValue({ state: 'RUNNING' }); mocks.worker.mockResolvedValue(null); mocks.capability.mockResolvedValue({ codex: true }); });
   it('asks a never-connected installation to sign in', async () => {
     mocks.session.mockResolvedValue(undefined);
     expect(await readiness()).toBe('not-connected');
@@ -105,6 +106,15 @@ describe('managed route to dispatch readiness', () => {
     expect(await codex.readiness!()).toBe('auth-required');
     expect(aws.managedOf('codex')).toBe(aws.managedCodex);
     expect(aws.managedOf('claude')).toBe(aws.managed);
+  });
+  it('has no Codex route while the deployed image is not verified with Codex', async () => {
+    mocks.session.mockResolvedValue(session({ microvmId: 'mvm-a', readyAt: now - 30_000 }));
+    mocks.worker.mockResolvedValue(worker());
+    mocks.capability.mockResolvedValue({ codex: false });
+    const aws = nativeAws({} as never);
+    expect(await aws.resolveCodex!(55)).toBeUndefined();
+    expect(mocks.capability).toHaveBeenCalledWith('10');
+    expect((await aws.resolveNative!(55))!.route.workerId).toBe('managed-55');
   });
   it('refuses a worker message for a managed id it cannot route, Claude\'s or Codex\'s', async () => {
     mocks.session.mockResolvedValue(session());

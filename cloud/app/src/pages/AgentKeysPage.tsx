@@ -139,7 +139,6 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
       </Link>
       <h1 className="text-2xl font-semibold">Agent keys</h1>
       <Link className="auth-link" to={'/installations/' + id + '/claude'} state={{ connectClaude: true }}>Connect Claude account →</Link>
-      <Link className="auth-link" to={'/installations/' + id + '/codex'} state={{ connectCodex: true }}>Connect ChatGPT for Codex →</Link>
 
       {load.state === 'loading' && <Skeleton className="h-40" />}
       {load.state === 'error' && (
