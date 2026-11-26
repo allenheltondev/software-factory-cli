@@ -120,7 +120,17 @@ and "needs a human" says why when the CI step stopped. Revision jobs for checks 
 `(revision of PR #n, to fix failed checks)`, and their change requests `(failed checks)`. The
 same stages are in `updraft run-event`'s summary and in Updraft Cloud's job view.
 
-On the pull request, one comment per head, headed **Updraft · CI** and the commit, says that a
+With `notifications: quiet` (the default, [assignment-comments.md](assignment-comments.md)), the
+CI step posts no comment while it fixes a head, nor when the fixed head passes and auto-merge
+takes it: the issue's status comment shows `Fixing checks` (`Fixing failed checks on abc1234 of
+PR #12 (CI fix 1)`), `Checks passed` and then `Merged after CI fix N`. A separate comment on the
+pull request appears only when the step stops and needs a person: the revision budget is used up,
+the failure isn't one the code can fix, CI repair is off, or the fixed head passed and merging is
+up to a person. It names the reason and the next step in one or two sentences, lists the failed
+checks, and links the console when hosted; the status comment says `Waiting for a person`. The
+coding agent's reply to its revision stays, as below.
+
+With `notifications: verbose`, on the pull request, one comment per head, headed **Updraft · CI** and the commit, says that a
 fix was queued (which checks failed, each linked to its run on GitHub even when its log could
 not be read, and how many automatic fixes there were) or why a person has to act. The
 revision's own reply follows its push: the **Coding agent** names the commit the checks failed
