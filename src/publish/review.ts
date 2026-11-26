@@ -50,6 +50,7 @@ import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type Revi
 import { findRepoConfig } from '../worker/executor.js';
 import { evaluateCiAll, postCiNotices } from './ci.js';
 import { noteStatus, quietFor, shortSha } from './status-comment.js';
+import { startOf } from './assignment-comment.js';
 import { STATUS_STAGE } from './status-marker.js';
 import { code } from './failure-comment.js';
 import { runDetails, selectionLine } from './run-details.js';
@@ -561,7 +562,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     // asks the person, so no comment is added here.
     const status = verdictStatus(deps.config, repo, outcome, prNumber, headSha);
     if (status && quietFor(deps.config, { repoId: job.repoId, repoFullName })) {
-      await noteStatus({ api: deps.api, log }, { repo: repoRef, issue: job.issueNumber, target: { pr: prNumber }, sha: headSha, latest: true, ...status });
+      await noteStatus({ api: deps.api, log }, { repo: repoRef, issue: job.issueNumber, target: { pr: prNumber }, sha: headSha, latest: true, ...(startOf(run) !== undefined ? { at: startOf(run)! } : {}), ...status });
     }
     await runLog([`verdict ${verdict}: ${outcome}${detail ? ` (${detail})` : ''}`]);
     log.info('review posted', { verdict, outcome, review: done.reviewUrl });

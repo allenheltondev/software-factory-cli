@@ -64,6 +64,8 @@ export interface StatusWrite {
   /** Review-loop stages: the head the stage is about, and whether it is the pull request's newest (mayReplace). */
   sha?: string;
   latest?: boolean;
+  /** Review-loop stages: when the job attempt (or step) writing it started, epoch ms (mayReplace orders one head's stages by it). */
+  at?: number;
 }
 
 export type StatusWriteResult =
@@ -129,7 +131,8 @@ async function writeOnce(deps: StatusDeps, w: StatusWrite): Promise<StatusWriteR
   // Fails closed: without the worker's own login, anyone's comment could pass for the status comment.
   const login = await workerLogin(deps.api);
   const found = findStatusComment(await deps.api.listIssueComments(w.repo, w.issue), w.target, login);
-  if (found && !mayReplace(found.mark, w.stage, { ...(w.sha ? { sha: w.sha } : {}), ...(w.latest !== undefined ? { latest: w.latest } : {}) })) {
+  const at = w.at !== undefined && Number.isFinite(w.at) ? Math.floor(w.at / 1000) : undefined;
+  if (found && !mayReplace(found.mark, w.stage, { ...(w.sha ? { sha: w.sha } : {}), ...(w.latest !== undefined ? { latest: w.latest } : {}), ...(at !== undefined ? { at } : {}) })) {
     return { status: 'skipped', comment: found.comment, reason: `the comment shows a later stage (${found.mark.stage})` };
   }
   if (!found && !('keys' in w.target && w.target.create)) return { status: 'none' };
@@ -142,7 +145,7 @@ async function writeOnce(deps: StatusDeps, w: StatusWrite): Promise<StatusWriteR
     details: w.details === undefined ? statusDetails(prev) : w.details,
     link: w.link === undefined ? statusLink(prev) : w.link,
     // A review-loop stage names its head; any other keeps none (a new stage of the run starts over).
-    mark: { key, stage: w.stage, ...(pr !== undefined ? { pr } : {}), ...(w.sha && w.stage >= STATUS_STAGE.loop && w.stage < FINAL_STAGE ? { sha: w.sha.slice(0, 40) } : {}) },
+    mark: { key, stage: w.stage, ...(pr !== undefined ? { pr } : {}), ...(w.sha && w.stage >= STATUS_STAGE.loop && w.stage < FINAL_STAGE ? { sha: w.sha.slice(0, 40), ...(at !== undefined ? { at } : {}) } : {}) },
   });
   if (found) {
     if (found.comment.body === body) return { status: 'unchanged', comment: found.comment };

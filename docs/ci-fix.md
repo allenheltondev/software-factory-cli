@@ -139,8 +139,12 @@ state database, where two runs can fix the same head at once). Three fences, non
 - two runs already under way race on the push itself: each first pushes a claim ref of its own,
   `refs/updraft/revision-claims/<review>/<run>`, at the commit it pushes, and the branch push is
   a fast-forward under a lease. The run that loses the lease finds the winner's claim at the new
-  head and gives way silently, exactly as a comment claim does in verbose mode. GitHub shows no
-  branch or tag for these refs.
+  head and gives way silently, exactly as a comment claim does in verbose mode, and deletes its
+  own claim. GitHub shows no branch or tag for these refs. The winner's claim stays until the
+  pull request is merged or closed, when the review loop deletes the pull request's claims (best
+  effort). A remote that refuses refs outside branches and tags (a ruleset, a pre-receive hook)
+  costs only the claim: the fix is pushed all the same, and a race lost without claims reads as
+  the branch moving.
 
 With `notifications: verbose`, on the pull request, one comment per head, headed **Updraft · CI** and the commit, says that a
 fix was queued (which checks failed, each linked to its run on GitHub even when its log could

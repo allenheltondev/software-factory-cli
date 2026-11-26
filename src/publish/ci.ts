@@ -352,7 +352,7 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
       // A pass with no fix before it gets no CI comment (postCiNotices): the status says it.
       if (pr.ciFixes === 0 && quietFor(deps.config, { repoId: pr.repoId, repoFullName: repo.fullName })) {
         const status = ciStatus({ ciState: 'passed', ciFixes: 0, prNumber: pr.prNumber }, sha, autoMergeMethod(deps.config, cfg));
-        if (status) await noteStatus({ api, log }, { repo, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: true, ...status });
+        if (status) await noteStatus({ api, log }, { repo, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: true, at: now(), ...status });
       }
       return { status: 'passed', reason: verdict.reason };
     }
@@ -639,7 +639,7 @@ export async function postCiNotices(deps: CiDeps, signal?: AbortSignal): Promise
       const merge = autoMergeMethod(deps.config, found.repo);
       if (quietFor(deps.config, { repoId: pr.repoId, repoFullName: found.fullName })) {
         const status = ciStatus(pr, sha, merge);
-        if (status) await noteStatus({ api: deps.api, log: deps.log }, { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: pr.headSha === sha, ...status });
+        if (status) await noteStatus({ api: deps.api, log: deps.log }, { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: pr.headSha === sha, at: (deps.now ?? Date.now)(), ...status });
         const body = renderQuietCiNotice({
           pr,
           sha,

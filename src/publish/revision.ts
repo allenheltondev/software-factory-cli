@@ -495,6 +495,8 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
   // ...and claims its push where no one sees it instead: a ref of its own on the remote
   // (revisionClaimRef), read the same way as a comment claim. One revision per review, still.
   const refClaiming = deps.claimReviews === true && silent;
+  /** Deletes this run's claim ref, once it pushed one and then stepped aside. Best effort. */
+  let dropClaim: (() => Promise<void>) | null = null;
   /**
    * The PR comment of this run: recorded, found by its marker, or new.
    *
@@ -653,10 +655,20 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       if (claiming) await comment(() => renderRevisionClaim({ runId, review: request.review, commitCount }), { headSha: localSha });
       if (refClaiming) {
         // The run's own claim ref, before the push: a run that loses the branch's lease finds it.
+        // A remote that refuses refs outside branches and tags (a ruleset, a pre-receive hook)
+        // costs only the claim: the push goes on, and a lost race reads as the branch moving.
         hold();
-        await run1(['push', '--no-verify', '--recurse-submodules=no', '--porcelain', pushUrl, `+${localSha}:${revisionClaimRef(request.review.id, runId)}`], net).catch((err: unknown) => {
-          throw err instanceof GitError ? classifyGit(err, 'push', remote, repoFullName) : err;
-        });
+        const own = revisionClaimRef(request.review.id, runId);
+        try {
+          await run1(['push', '--no-verify', '--recurse-submodules=no', '--porcelain', pushUrl, `+${localSha}:${own}`], net);
+          dropClaim = async () => {
+            await run1(['push', '--no-verify', '--porcelain', pushUrl, `:${own}`], net).catch(() => {});
+          };
+        } catch (err) {
+          if (!(err instanceof GitError)) throw err;
+          log.warn('the remote refused the revision\'s claim ref; pushing without it', { ref: own, error: redactSecret(err.stderr.trim().split(/\r?\n/).slice(-1)[0] ?? err.message, token) });
+          await runLog([`the remote refused the claim ref ${own}; pushing without it`]);
+        }
       }
       await runLog([`pushing ${short(baseSha)}..${short(localSha)} (${commitCount} commit(s)) to ${prBranch} on ${remote} (${redactRemoteUrl(pushUrl)})`]);
       hold();
@@ -722,6 +734,8 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       // Not a failure and not news for the pull request: the review has its revision. What this
       // run announced, if it got that far, is taken back; a failure to do so is retried like any.
       const { claim } = err;
+      // Its own claim is nobody's answer now.
+      await dropClaim?.();
       const reason = `${SUPERSEDED_PREFIX}another run answered this review first (${claim.url}${claim.runId ? `, run ${claim.runId}` : ''}, ${short(claim.baseSha)}..${short(claim.headSha)}); nothing was pushed`;
       try {
         if (rev.commentId) await comment(() => renderSupersededNote({ runId, review: request.review, otherUrl: claim.url }));
@@ -734,6 +748,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       }
     }
     if (err instanceof NotPushed) {
+      await dropClaim?.();
       // Say so on the PR. If that fails for now, the whole attempt is retried: the branch check
       // above refuses again, and the comment gets another try.
       const refusal = err;

@@ -75,8 +75,9 @@ comment. GitHub has no compare-and-set for comments, so the protocol
   that still waits; the review loop finds the one naming its pull request. Only assignment and
   publication ever post one; the review loop only edits.
 - A review-loop stage names the head commit it is about (`sha=`), and a write about a head that
-  is no longer the pull request's newest never replaces one about a newer head; on one head, a
-  resting stage (a person has to act) is not replaced by a late "at work" one.
+  is no longer the pull request's newest never replaces one about a newer head. On one head the
+  stage of the newer job attempt (or step) wins, by when it started (`at=`): a person's retry of a
+  failed review shows `Reviewing` again, and a stale older attempt never moves a newer stage back.
 - Without the worker's own login (or, on Updraft Cloud, the App's slug) nothing is matched or
   posted: anyone can type a marker into a comment.
 - Stages only move forward across writers: a queue stage never replaces a runner stage (the queue

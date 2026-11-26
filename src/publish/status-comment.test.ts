@@ -10,6 +10,7 @@ import { renderQuietCiNotice } from './ci.js';
 import { renderQuietMergeBlockedNotice } from './merge.js';
 import { mergePolicy, mergeSentence, renderPrBody, withMergeSentence } from './publish.js';
 import { verdictStatus } from './review.js';
+import { dropClaimRefs } from '../poller/reviews.js';
 import { renderRevisionReply } from './revision.js';
 import { findStatusComment, writeStatusComment, type StatusWrite } from './status-comment.js';
 import { mayReplace, parseStatusMarker, renderStatusComment, STATUS_STAGE, statusDetails, statusLink, statusMarker } from './status-marker.js';
@@ -504,5 +505,52 @@ describe('review of #181: truthful at every resting point', () => {
     const odd = renderPrBody({ runId: 'run_x', issueNumber: 3, agent: 'claude (opus)', commitCount: 1, mode: 'pr', summary: summary([]) });
     expect(odd).toContain('Opened by updraft from run `run_x` (agent claude (opus)).');
     expect(odd).not.toContain('updraft-agent:');
+  });
+});
+
+describe('approval follow-ups of #181', () => {
+  it('on one head, the newer job attempt wins whatever the stage; an older one never moves a newer one back', () => {
+    const H = 'd'.repeat(40);
+    const failed = { key: 'k', stage: STATUS_STAGE.person, sha: H, at: 1_000 };
+    // A person retried the failed review on the same commit: its "Reviewing" is newer.
+    expect(mayReplace(failed, STATUS_STAGE.loop, { sha: H, latest: true, at: 2_000 })).toBe(true);
+    // A stale job of an older attempt does not undo a newer resting stage.
+    expect(mayReplace({ ...failed, at: 3_000 }, STATUS_STAGE.loop, { sha: H, latest: true, at: 2_000 })).toBe(false);
+    // Without both times, resting outranks at work, as before.
+    expect(mayReplace({ key: 'k', stage: STATUS_STAGE.person, sha: H }, STATUS_STAGE.loop, { sha: H, latest: true, at: 2_000 })).toBe(false);
+    expect(parseStatusMarker(statusMarker({ key: 'k', stage: 60, sha: H, at: 1_234 }))).toEqual({ key: 'k', stage: 60, sha: H, at: 1_234 });
+  });
+
+  it('a retry of a failed review on the same commit shows "Reviewing" again', async () => {
+    const { api, c } = commenter();
+    await c.announce(job('job_1'), run('run_1'));
+    await writeStatusComment(deps(api), write({ target: { keys: ['job_1'], create: true }, stage: STATUS_STAGE.published, pr: 12 }));
+    const first = { ...run('run_r1'), startedAt: '2026-11-26T10:00:00.000Z' } as Run;
+    const retry = { ...run('run_r2'), startedAt: '2026-11-26T10:30:00.000Z' } as Run;
+    await c.announce(reviewJob(), first);
+    await c.ended!(reviewJob(), first);
+    expect(api.comments[0]!.body).toContain('**Updraft · Waiting for a person**');
+    await c.announce(reviewJob(), retry);
+    expect(api.comments[0]!.body).toContain('**Updraft · Reviewing**');
+    // The first attempt's late failure notice cannot put "retry it" back.
+    await c.ended!(reviewJob(), first);
+    expect(api.comments[0]!.body).toContain('**Updraft · Reviewing**');
+  });
+
+  it('deletes a closed pull request\'s CI-fix claim refs, and only those', async () => {
+    const refs = [
+      `refs/updraft/revision-claims/ci-failure-12-${'a'.repeat(40)}/run_1`,
+      `refs/updraft/revision-claims/ci-failure-12-${'b'.repeat(40)}/run_2`,
+      `refs/updraft/revision-claims/ci-failure-123-${'c'.repeat(40)}/run_3`,
+    ];
+    const deleted: string[] = [];
+    const api = {
+      listMatchingRefs: async (_r: unknown, prefix: string) => refs.filter((r) => r.startsWith(prefix)),
+      deleteRef: async (_r: unknown, ref: string) => void deleted.push(ref),
+    } as unknown as GitHubApi;
+    await dropClaimRefs(api, REPO, 12, silentLogger);
+    expect(deleted).toEqual(refs.slice(0, 2));
+    // Best effort: a failure is only logged.
+    await expect(dropClaimRefs({ listMatchingRefs: async () => { throw new GitHubError('nope', 403); }, deleteRef: async () => {} } as unknown as GitHubApi, REPO, 12, silentLogger)).resolves.toBeUndefined();
   });
 });

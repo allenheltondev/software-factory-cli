@@ -193,6 +193,7 @@ export function assignmentStatus(db: Db, job: Job, run: Run, ctx?: ConsoleContex
       issue: job.issueNumber,
       target: { pr: review.pullRequest.number },
       stage: STATUS_STAGE.loop,
+      at: startOf(run),
       sha: review.headSha,
       latest: isLatestHead(db, job.repoId, review.pullRequest.number, review.headSha),
       title: 'Reviewing',
@@ -208,6 +209,7 @@ export function assignmentStatus(db: Db, job: Job, run: Run, ctx?: ConsoleContex
         issue: job.issueNumber,
         target: { pr },
         stage: STATUS_STAGE.loop,
+        at: startOf(run),
         ...(sha ? { sha, latest: isLatestHead(db, job.repoId, pr, sha) } : {}),
         title: 'Fixing checks',
         text: sha ? `Fixing failed checks on \`${shortSha(sha)}\` of PR #${pr}.` : `Fixing failed checks of PR #${pr}.`,
@@ -220,7 +222,7 @@ export function assignmentStatus(db: Db, job: Job, run: Run, ctx?: ConsoleContex
       // the round is decoration
     }
     const sha = revision.reviewedSha;
-    return { repo, issue: job.issueNumber, target: { pr }, stage: STATUS_STAGE.loop, ...(sha ? { sha, latest: isLatestHead(db, job.repoId, pr, sha) } : {}), title: 'Revising', text: `Revising PR #${pr} for review round ${round}.` };
+    return { repo, issue: job.issueNumber, target: { pr }, stage: STATUS_STAGE.loop, at: startOf(run), ...(sha ? { sha, latest: isLatestHead(db, job.repoId, pr, sha) } : {}), title: 'Revising', text: `Revising PR #${pr} for review round ${round}.` };
   }
   return {
     repo,
@@ -233,6 +235,12 @@ export function assignmentStatus(db: Db, job: Job, run: Run, ctx?: ConsoleContex
     link: statusLinkFor(ctx, job.repoId, job.issueNumber),
   };
 }
+
+/** When a run's attempt started, epoch ms; undefined when not recorded. */
+export const startOf = (run: Pick<Run, 'startedAt'>): number | undefined => {
+  const t = Date.parse(run.startedAt ?? '');
+  return Number.isFinite(t) ? t : undefined;
+};
 
 /** Live implementation runs only: not log-only or prepare-only, and not reviewer or revision jobs. */
 export function assignmentApplies(config: UpdraftConfig, job: Job): boolean {
@@ -332,6 +340,7 @@ export function createAssignmentCommenter(deps: AssignmentCommentDeps): Assignme
           issue: job.issueNumber,
           target: { pr },
           stage: STATUS_STAGE.person,
+          at: startOf(run),
           ...(sha ? { sha, latest: isLatestHead(deps.db, job.repoId, pr, sha) } : {}),
           title: why === 'canceled' ? 'Stopped' : 'Waiting for a person',
           text: why === 'canceled'

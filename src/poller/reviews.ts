@@ -13,6 +13,7 @@
 //      once whatever is replayed.
 //   5. The checkpoint (ETag, newest updated_at) is stored only after every PR was processed; an
 //      API error leaves it where it was and the scan is repeated.
+import { revisionClaimRef } from '../publish/revision.js';
 import { noteStatus, quietFor } from '../publish/status-comment.js';
 import { STATUS_STAGE } from '../publish/status-marker.js';
 import { allowedActorsFor, DEFAULT_MAX_REVISIONS, reviewActive, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
@@ -109,6 +110,21 @@ function snapshotReview(review: GitHubReview, decision: Extract<ReturnType<typeo
  * a head someone else pushed gets its reviewer run. That costs no further request: the PR's
  * reviews are read whenever the PR changed, and a push changes it.
  */
+/** Deletes the CI-fix claim refs of a pull request that is closed or merged. Never throws. */
+export async function dropClaimRefs(api: GitHubApi, repo: RepoRef, prNumber: number, log: Logger): Promise<void> {
+  try {
+    if (!api.listMatchingRefs || !api.deleteRef) return;
+    const prefix = revisionClaimRef(`ci-failure:${prNumber}:`).replace(/\/$/, '');
+    for (const ref of await api.listMatchingRefs(repo, prefix)) {
+      // ci-failure-<pr>- exactly: never a longer pull request number with the same digits in front.
+      if (!ref.startsWith(`${prefix}`) || !/^[0-9a-f]{7,64}\//.test(ref.slice(prefix.length))) continue;
+      await api.deleteRef(repo, ref).catch((err: unknown) => log.debug('could not delete a claim ref', { ref, error: err instanceof Error ? err.message : String(err) }));
+    }
+  } catch (err) {
+    log.debug('could not list claim refs', { pr: prNumber, error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
 export async function pollRepoReviews(
   deps: ReviewPollDeps,
   repo: RepoRef,
@@ -183,6 +199,8 @@ export async function pollRepoReviews(
     const canceled = closeRevisionPr(db, repo.id, w.prNumber, why, deps.now);
     result.jobsCanceled += canceled.length;
     log.info('pull request no longer watched for change requests', { pr: w.prNumber, reason: why, jobsCanceled: canceled.length });
+    // Its CI fixes' hidden claim refs (publish/revision.ts) are no one's business any more. Best effort.
+    if (ended) await dropClaimRefs(api, repo, w.prNumber, log);
     // Quiet notifications: whoever merged or closed it, the issue's status comment says so last.
     if (ended && quietFor(deps.config, { repoId: repo.id, repoFullName: repo.fullName })) {
       await noteStatus(

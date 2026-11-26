@@ -327,7 +327,7 @@ export async function postMergeNotices(deps: MergeDeps, signal?: AbortSignal): P
       if (quiet) {
         await noteStatus(
           { api: deps.api, log: deps.log },
-          { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, stage: STATUS_STAGE.person, sha, latest: pr.headSha === sha, title: 'Waiting for a person', text: `PR #${pr.prNumber} is ready for a person to merge; Updraft did not merge it (see the PR).` },
+          { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, stage: STATUS_STAGE.person, sha, latest: pr.headSha === sha, at: (deps.now ?? Date.now)(), title: 'Waiting for a person', text: `PR #${pr.prNumber} is ready for a person to merge; Updraft did not merge it (see the PR).` },
         );
       }
       recordMergeNotice(deps.db, pr.repoId, pr.prNumber, sha, { commentId: posted.id, commentUrl: posted.htmlUrl }, deps.now);

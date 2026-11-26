@@ -46,10 +46,12 @@ export interface StatusMark {
   pr?: number;
   /** The review loop's stages: the head commit (7 to 40 hex) the stage is about. */
   sha?: string;
+  /** The review loop's stages: when the job attempt (or step) that wrote it started, epoch seconds. */
+  at?: number;
 }
 
 const KEY = /^[A-Za-z0-9_.-]{1,128}$/;
-const MARKER = /<!-- updraft-status: key=([A-Za-z0-9_.-]{1,128}) stage=(\d{1,3})(?: pr=(\d{1,10}))?(?: sha=([0-9a-f]{7,40}))? -->/;
+const MARKER = /<!-- updraft-status: key=([A-Za-z0-9_.-]{1,128}) stage=(\d{1,3})(?: pr=(\d{1,10}))?(?: sha=([0-9a-f]{7,40}))?(?: at=(\d{1,12}))? -->/;
 const SHA = /^[0-9a-f]{7,40}$/;
 /** What every status comment contains, whatever its key: for a search. */
 export const STATUS_MARKER_PREFIX = '<!-- updraft-status: ';
@@ -58,14 +60,15 @@ export function statusMarker(m: StatusMark): string {
   if (!KEY.test(m.key)) throw new Error(`not a status comment key: ${JSON.stringify(m.key)}`);
   const pr = m.pr !== undefined && Number.isSafeInteger(m.pr) && m.pr > 0 ? ` pr=${m.pr}` : '';
   const sha = m.sha !== undefined && SHA.test(m.sha) ? ` sha=${m.sha}` : '';
-  return `<!-- updraft-status: key=${m.key} stage=${Math.max(0, Math.min(999, Math.trunc(m.stage)))}${pr}${sha} -->`;
+  const at = sha && m.at !== undefined && Number.isSafeInteger(m.at) && m.at >= 0 ? ` at=${m.at}` : '';
+  return `<!-- updraft-status: key=${m.key} stage=${Math.max(0, Math.min(999, Math.trunc(m.stage)))}${pr}${sha}${at} -->`;
 }
 
 /** The marker of a status comment, or null for any other comment. */
 export function parseStatusMarker(body: string): StatusMark | null {
   const m = MARKER.exec(body);
   if (!m) return null;
-  return { key: m[1]!, stage: Number(m[2]), ...(m[3] ? { pr: Number(m[3]) } : {}), ...(m[4] ? { sha: m[4] } : {}) };
+  return { key: m[1]!, stage: Number(m[2]), ...(m[3] ? { pr: Number(m[3]) } : {}), ...(m[4] ? { sha: m[4] } : {}), ...(m[5] ? { at: Number(m[5]) } : {}) };
 }
 
 /** Two head SHAs name the same commit (one may be a prefix of the other). */
@@ -78,7 +81,7 @@ const sameHead = (a: string, b: string) => a.startsWith(b) || b.startsWith(a);
  * what was said about a newer one, and on one head a resting stage (a person has to act) is not
  * replaced by a late "at work" one.
  */
-export function mayReplace(current: StatusMark | null, stage: number, next: { sha?: string; latest?: boolean } = {}): boolean {
+export function mayReplace(current: StatusMark | null, stage: number, next: { sha?: string; latest?: boolean; at?: number } = {}): boolean {
   if (!current) return true;
   // The Cloud queue only ever writes over what it wrote itself.
   if (stage < RUNNER_STAGE) return current.stage < RUNNER_STAGE;
@@ -89,7 +92,10 @@ export function mayReplace(current: StatusMark | null, stage: number, next: { sh
   if (stage < STATUS_STAGE.loop) return current.stage <= stage;
   // The review loop, about one head at a time.
   if (current.stage >= STATUS_STAGE.loop && current.sha && next.sha) {
-    if (sameHead(current.sha, next.sha)) return stage >= current.stage;
+    // On one head, the newer job attempt (or step) says what is true: a person's retry of a
+    // failed review moves a resting stage on; a stale older attempt never moves a newer one back.
+    // Without both times, a resting stage outranks an "at work" one.
+    if (sameHead(current.sha, next.sha)) return current.at !== undefined && next.at !== undefined ? next.at >= current.at : stage >= current.stage;
     return next.latest === true;
   }
   return true;
