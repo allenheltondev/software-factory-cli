@@ -331,7 +331,7 @@ The manifest sets everything #67 describes:
 - **Callback URL:** `<app-url>/github/callback`, with "request user authorization during installation" on. There's no setup URL, because GitHub disables it with that setting. Existing installations are connected by linking instead.
 - **Repository permissions:** Metadata (read); Contents, Issues and Pull requests (read and write); Checks and Commit statuses (read).
 - **Organization permission:** Members (read). A user's token needs it to show their own org membership, which is how ownership of an org installation is checked.
-- **Events:** Issues, Pull request and Pull request review. Installation events always arrive.
+- **Events:** Issues, Pull request, Pull request review, Issue comment and Pull request review comment (the last two carry mention commands, [docs/controls.md](../docs/controls.md)). Installation events always arrive. An App registered before mention commands needs Issue comment (and Pull request review comment) turned on by its owner.
 
 ### Tenant config and agent keys
 

@@ -7,6 +7,8 @@
  *   - the App's JWT, and installation tokens minted from it, for the App's own view.
  */
 
+import { repoPermissionOf } from '../../../../src/control/commands.js';
+
 export interface GitHubUser {
   id: number;
   login: string;
@@ -54,6 +56,8 @@ export interface PullRequestHead {
   merged: boolean;
   headSha: string;
   headRef: string;
+  /** The head branch's repository id (a fork's differs); null when unknown or deleted. */
+  headRepoId?: number | null;
 }
 
 export interface LabeledIssue {
@@ -138,6 +142,8 @@ export interface GitHubApi {
   latestLabelEvent?(installationToken: string, repository: string, issue: number, label: string): Promise<LabelEvent | null>;
   /** Comments on an issue (POST /repos/{owner}/{repo}/issues/{number}/comments). */
   createIssueComment(installationToken: string, repository: string, issue: number, body: string): Promise<void>;
+  /** `login`'s permission on the repository now (GitHub's role name), or null when unrecognized (#135). */
+  repositoryPermission?(installationToken: string, repository: string, login: string): Promise<import('../../../../src/control/commands.js').RepoPermission | null>;
   /** The same, answering the new comment's id: for a comment edited later (the admission queue's acknowledgement). */
   postIssueComment?(installationToken: string, repository: string, issue: number, body: string): Promise<number>;
   /** Replaces a comment's body (PATCH /repos/{owner}/{repo}/issues/comments/{id}). */
@@ -252,11 +258,19 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
       return { open: out.state === 'open', labels, ...(out.pull_request ? { pullRequest: true as const } : {}) };
     },
 
+    async repositoryPermission(token, repository, login) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const out = await json<Json>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/collaborators/${encodeURIComponent(login)}/permission`, token), 'GET /repos/collaborators/permission');
+      return repoPermissionOf(out as { permission?: unknown; role_name?: unknown });
+    },
+
     async pullRequestHead(token, repository, pullRequest) {
       const [owner = '', repo = ''] = repository.split('/');
       const out = await json<Json>(await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${pullRequest}`, token), 'GET /repos/pulls');
       const head = (out.head ?? {}) as Json;
-      return { state: out.state === 'open' ? 'open' : 'closed', merged: out.merged === true, headSha: String(head.sha ?? ''), headRef: String(head.ref ?? '') };
+      const headRepo = head.repo as Json | null | undefined;
+      return { state: out.state === 'open' ? 'open' : 'closed', merged: out.merged === true, headSha: String(head.sha ?? ''), headRef: String(head.ref ?? ''),
+        headRepoId: typeof headRepo?.id === 'number' ? headRepo.id : null };
     },
 
     async commitChecks(token, repository, sha) {

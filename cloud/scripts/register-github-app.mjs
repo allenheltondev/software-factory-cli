@@ -52,7 +52,8 @@ export function manifest({ appUrl, name, port }) {
       members: 'read',
     },
     // installation and installation_repositories are delivered to every App without subscribing.
-    default_events: ['issues', 'pull_request', 'pull_request_review'],
+    // issue_comment and pull_request_review_comment carry mention commands (control/mentions.ts, #135).
+    default_events: ['issues', 'pull_request', 'pull_request_review', 'issue_comment', 'pull_request_review_comment'],
   };
 }
 

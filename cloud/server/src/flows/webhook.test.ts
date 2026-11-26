@@ -32,7 +32,7 @@ const installation = (suspendedAt: string | null): GitHubInstallation => ({
 
 /** `github` says what GitHub reports for installation 55 right now: an installation, gone (null), or an error. */
 async function setup(github: { current: GitHubInstallation | null | Error } = { current: installation(null) }, launch?: Launcher,
-  routing: Pick<Parameters<typeof createWebhookHandler>[0], 'routines' | 'benchmarkInstallationId' | 'queueEvents'> = {}) {
+  routing: Pick<Parameters<typeof createWebhookHandler>[0], 'routines' | 'benchmarkInstallationId' | 'queueEvents' | 'mentions'> = {}) {
   const store = createMemoryStore();
   await store.putTenantWithMember(tenant, {
     installationId: 55,
@@ -332,5 +332,32 @@ describe('queued work and its issue', () => {
   it('is an ordinary filtered delivery when nothing was queued', async () => {
     const { deliver } = await setup(undefined, undefined, { queueEvents: { subjectChanged: async () => false } });
     expect(await deliver('issues', issueEvent('unlabeled', 'updraft'))).toMatchObject({ body: { disposition: 'ignored' } });
+  });
+});
+
+describe('mention commands (#135)', () => {
+  const commentPayload = (body: string) => ({ action: 'created', installation: { id: 55 }, repository: { id: 9, full_name: 'acme/web' }, issue: { number: 12 }, sender: { login: 'pat' }, comment: { id: 1, body, user: { login: 'pat' } } });
+
+  it('routes a signed issue_comment to the mention handler and lists what came of it', async () => {
+    const mentions = vi.fn(async () => ({ disposition: 'handled' as const, reason: 'control_applied', message: 'pause: applied' }));
+    const { deliver, store } = await setup(undefined, undefined, { mentions });
+    const res = await deliver('issue_comment', commentPayload('@updraft pause'));
+    expect(res).toEqual({ status: 200, body: { ok: true, disposition: 'control_applied' } });
+    expect(mentions).toHaveBeenCalledWith(expect.objectContaining({ installationId: 55, eventName: 'issue_comment', deliveryId: 'd1' }));
+    expect((await store.listDeliveries(55, 10))[0]).toMatchObject({ disposition: 'filtered', reason: 'control_applied', message: 'pause: applied' });
+  });
+
+  it('never reaches the handler with a bad signature', async () => {
+    const mentions = vi.fn();
+    const { deliver } = await setup(undefined, undefined, { mentions });
+    expect((await deliver('issue_comment', commentPayload('@updraft stop'), 'wrong')).status).toBe(401);
+    expect(mentions).not.toHaveBeenCalled();
+  });
+
+  it('treats a comment that is not a command as before', async () => {
+    const mentions = vi.fn(async () => ({ disposition: 'ignored' as const, reason: 'no_command' }));
+    const { deliver, store } = await setup(undefined, undefined, { mentions });
+    await deliver('issue_comment', commentPayload('nice work'));
+    expect((await store.listDeliveries(55, 10))[0]).toMatchObject({ disposition: 'filtered', reason: 'event_not_accepted' });
   });
 });

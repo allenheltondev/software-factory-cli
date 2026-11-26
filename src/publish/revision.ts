@@ -47,7 +47,8 @@ import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
 import { runDetails, selectionLine } from './run-details.js';
 import { safeMarkdown } from './markdown.js';
-import { answerFindings } from './threads.js';
+import { answerFindings, commitUrl } from './threads.js';
+import { checkLink } from './ci.js';
 import { workerLogin } from '../github/identity.js';
 import {
   cap,
@@ -185,8 +186,35 @@ function withMarker(lines: string[], marker: string): string {
   return `${cap(lines.join('\n'), MAX_BODY - marker.length - 2)}\n\n${marker}`;
 }
 
+/**
+ * What a revision was for, in its reply's words. A CI fix was asked for by failed checks, not by a
+ * person: its "review" is the worker's own summary of them, so it is not named as a change request.
+ */
+function askedFor(review: RevisionRequest['review'], trigger: RevisionRequest['trigger'] | undefined): string {
+  if (trigger === 'ci_failure') {
+    // A CI fix's URL is a failed check's or a commit status's target, which any integration that
+    // can write statuses sets: linked only when it is a plain https link, else left out.
+    const link = checkLink(review.url);
+    return `the checks that failed on ${code(short(review.headSha ?? '?'))}${link ? ` (${link})` : ''}`;
+  }
+  return `the changes requested by ${code(review.author)} in ${review.url}`;
+}
+
 /** The reply after a push: the new commits, the verification result and the agent's final message, all inert. */
-export function renderRevisionReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary; commitCount: number; perFinding?: string[]; selection?: string }): string {
+export function renderRevisionReply(o: {
+  runId: string;
+  agent: string;
+  review: RevisionRequest['review'];
+  summary: RunSummary;
+  commitCount: number;
+  perFinding?: string[];
+  selection?: string;
+  /** What asked for the revision; a CI fix (ci_failure) is answered by the Coding agent with the commit it pushed. */
+  trigger?: RevisionRequest['trigger'];
+  /** The commit the push left the pull request at, and its page. */
+  pushed?: { sha: string; url: string | null };
+}): string {
+  const at = o.pushed ? (o.pushed.url ? `[${code(short(o.pushed.sha))}](${o.pushed.url})` : code(short(o.pushed.sha))) : null;
   return withMarker(
     [
       ...(o.perFinding?.length
@@ -198,7 +226,14 @@ export function renderRevisionReply(o: { runId: string; agent: string; review: R
             ...o.perFinding,
             '',
           ]
-        : [`Updraft pushed ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`, '']),
+        : o.trigger === 'ci_failure'
+          ? [
+              `**Coding agent** · pushed ${o.commitCount} commit(s) to fix ${askedFor(o.review, o.trigger)}${at ? `; the pull request is now at ${at}` : ''}.`,
+              '',
+              "This is the coding agent's account, not a verification: the review agent reviews the new head, and Updraft · CI reads its checks again.",
+              '',
+            ]
+          : [`Updraft pushed ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`, '']),
       `From run ${code(o.runId)} (agent ${inline(o.agent)}). Review it before merging; merging is up to a person.`,
       '',
       ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
@@ -232,10 +267,11 @@ export function renderSupersededNote(o: { runId: string; review: RevisionRequest
 }
 
 /** The reply when the run succeeded without committing anything. */
-export function renderNoChangeReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary; selection?: string }): string {
+export function renderNoChangeReply(o: { runId: string; agent: string; review: RevisionRequest['review']; summary: RunSummary; selection?: string; trigger?: RevisionRequest['trigger'] }): string {
   return withMarker(
     [
-      `Updraft ran a revision for the changes requested by ${code(o.review.author)} in ${o.review.url}, but the agent made no commits, so nothing was pushed.`,
+      `Updraft ran a revision for ${askedFor(o.review, o.trigger)}, but the agent made no commits, so nothing was pushed.`,
+      ...(o.trigger === 'ci_failure' ? ['', 'The failed checks stay failed on this commit, and Updraft will not try again for it: fixing them is up to a person.'] : []),
       '',
       `From run ${code(o.runId)} (agent ${inline(o.agent)}).`,
       '',
@@ -249,10 +285,10 @@ export function renderNoChangeReply(o: { runId: string; agent: string; review: R
 }
 
 /** The comment when the push was refused. Carries the worker's own words only: no agent output, no local paths. */
-export function renderNotPushedNotice(o: { runId: string; review: RevisionRequest['review']; reason: string; localBranch: string }): string {
+export function renderNotPushedNotice(o: { runId: string; review: RevisionRequest['review']; reason: string; localBranch: string; trigger?: RevisionRequest['trigger'] }): string {
   return withMarker(
     [
-      `Updraft ran a revision for the changes requested by ${code(o.review.author)} in ${o.review.url}, but did not push it.`,
+      `Updraft ran a revision for ${askedFor(o.review, o.trigger)}, but did not push it.`,
       '',
       '**Reason**',
       '',
@@ -261,7 +297,9 @@ export function renderNotPushedNotice(o: { runId: string; review: RevisionReques
       `Nothing on this pull request's branch was changed, and the worker will not retry or rebase on its own. The run's commits are on ` +
         `the worker's machine (branch ${code(o.localBranch)}, run ${code(o.runId)}).`,
       '',
-      'To get a revision that builds on the current head, submit a new review that requests changes.',
+      o.trigger === 'ci_failure'
+        ? 'Updraft will not fix the checks of this commit again by itself. A new commit on this branch gets a new review and new checks.'
+        : 'To get a revision that builds on the current head, submit a new review that requests changes.',
     ],
     revisionMarker(o.runId),
   );
@@ -510,7 +548,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       // 3a. Nothing to push; the reviewer is still owed an answer (one, from whichever run gets there first).
       const first = await answeredElsewhere(null);
       if (first) throw new Superseded(first);
-      await comment(() => renderNoChangeReply({ runId, agent: run.agent, review: request.review, summary: run.summary, selection: selectionOf(run) }), { headSha: baseSha });
+      await comment(() => renderNoChangeReply({ runId, agent: run.agent, review: request.review, summary: run.summary, selection: selectionOf(run), trigger: request.trigger }), { headSha: baseSha });
       const reason = `the agent made no commits on top of ${short(baseSha)}; nothing was pushed`;
       const done = finish({ state: 'skipped', error: reason });
       await runLog([`skipped: ${reason}`]);
@@ -607,7 +645,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     }
 
     // 4. The reply: recorded, found by marker, or new.
-    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run) }), { headSha: localSha });
+    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run), trigger: request.trigger, pushed: { sha: localSha, url: commitUrl(request.pullRequest.url, localSha) } }), { headSha: localSha });
 
     const done = finish({ state: 'published' });
     log.info('revision pushed', { pr: prNumber, from: baseSha, to: localSha });
@@ -635,7 +673,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       const refusal = err;
       try {
         hold({ moved: refusal.moved });
-        await comment(() => renderNotPushedNotice({ runId, review: request.review, reason: refusal.notice, localBranch: run.summary.branch }));
+        await comment(() => renderNotPushedNotice({ runId, review: request.review, reason: refusal.notice, localBranch: run.summary.branch, trigger: request.trigger }));
       } catch (commentErr) {
         if (commentErr instanceof RevisionSupersededError) err = commentErr;
         else {
@@ -667,7 +705,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       // The push was announced and is not going to happen: the announcement must not stand.
       try {
         const reason = 'the push did not go through, and the worker will not try it again by itself';
-        await deps.api.updateIssueComment(repoRef, rev.commentId, renderNotPushedNotice({ runId, review: request.review, reason, localBranch: run.summary.branch }));
+        await deps.api.updateIssueComment(repoRef, rev.commentId, renderNotPushedNotice({ runId, review: request.review, reason, localBranch: run.summary.branch, trigger: request.trigger }));
       } catch (noteErr) {
         log.warn('could not take back the announcement of a push that failed', { error: message(noteErr) });
       }
