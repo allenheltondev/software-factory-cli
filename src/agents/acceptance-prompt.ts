@@ -21,6 +21,7 @@ function criterionLines(c: AcceptanceCriterion, i: number, n: number, extra: str
     `- Mandatory: ${c.mandatory ? 'yes' : 'no (optional: it never blocks)'}`,
     `- Needs live validation: ${c.gate === 'live' ? 'yes (a real deployment, environment or screenshot; no agent can verify it alone)' : 'no'}`,
     ...(c.section ? [`- Listed under: ${JSON.stringify(c.section)}`] : []),
+    ...(c.context ? [`- Nested under the item: ${JSON.stringify(c.context)}`] : []),
     ...(c.checkedInSource ? ['- Ticked in the issue: yes (a ticked box is not evidence)'] : []),
     ...extra,
     '',
