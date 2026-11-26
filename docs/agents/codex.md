@@ -86,9 +86,10 @@ pass `--trust`. Point live mode only at repositories whose checked-in instructio
 `authentication: native-codex` runs the profile only on the CLI's own Sign in with ChatGPT,
 never an API key: sign in once with `codex login --device-auth`, check with
 `updraft native-auth --codex`, and every run checks the login again before checkout and just
-before launch, then adds `-c model_provider="openai" -c forced_login_method="chatgpt"`. An
-`OPENAI_*` or `CODEX_API_KEY` variable, or args that choose another provider or profile, fail
-the run. Design, isolation and the hosted worker: [Codex on a ChatGPT subscription](../codex-subscription.md).
+before launch, then adds `-c model_provider="openai" -c forced_login_method="chatgpt"` and the
+official `chatgpt_base_url`. An `OPENAI_*` or `CODEX_API_KEY` variable, an extra CA bundle
+(`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `CODEX_CA_CERTIFICATE`, …), a profile `env.CODEX_HOME`,
+or args that choose another provider or profile, fail the run. Design, isolation and the hosted worker: [Codex on a ChatGPT subscription](../codex-subscription.md).
 
 ## Platform notes
 

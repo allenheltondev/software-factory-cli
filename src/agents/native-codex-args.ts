@@ -26,6 +26,15 @@ export function codexSubscriptionArgProblem(args: readonly string[]): string | n
  * Appended to every subscription run (`-c` overrides win over the CLI's config.toml): the built-in
  * OpenAI provider, and a ChatGPT-only login. With `forced_login_method = "chatgpt"` the official
  * CLI itself refuses API-key auth (codex-rs/login/src/auth/manager.rs, login restrictions), so a
- * key that appears after the checks still cannot bill an API account.
+ * key that appears after the checks still cannot bill an API account. The ChatGPT backend is pinned
+ * to the CLI's own default for a ChatGPT login (`DEFAULT_CHATGPT_BASE_URL`, codex-rs/model-provider/
+ * src/chatgpt_base_url.rs), so a config.toml cannot send the login elsewhere.
  */
-export const CODEX_SUBSCRIPTION_ARGS = ['-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"'] as const;
+export const CODEX_SUBSCRIPTION_ARGS = ['-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"',
+  '-c', 'chatgpt_base_url="https://chatgpt.com/backend-api/"'] as const;
+
+/** Profile `env` names a native-codex profile may not set: the CLI's home is the worker's, not the profile's. */
+export function codexSubscriptionEnvProblem(env: Record<string, string> | undefined): string | null {
+  const name = Object.keys(env ?? {}).find((n) => n.toUpperCase() === 'CODEX_HOME');
+  return name ? `env sets ${name}; native-codex uses the CLI's own home on this worker` : null;
+}

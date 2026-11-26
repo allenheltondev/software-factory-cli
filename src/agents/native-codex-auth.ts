@@ -45,7 +45,12 @@ export interface NativeCodexStatusResponse {
  * endpoint or workload identity instead of the CLI-owned ChatGPT login (codex-rs/login/src/auth:
  * OPENAI_API_KEY, CODEX_API_KEY, CODEX_ACCESS_TOKEN, the OPENAI_* workload identity markers and
  * the auth endpoint overrides). Any OPENAI_* name counts, so a new provider variable fails closed.
- * Names only: values are never copied. CODEX_HOME is allowed; the CLI manages its contents.
+ * Also every extra TLS trust root (CODEX_CA_CERTIFICATE, SSL_CERT_FILE/DIR, NODE_EXTRA_CA_CERTS,
+ * REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE): with only the system roots trusted, a proxy in
+ * HTTPS_PROXY/ALL_PROXY sees the host it tunnels to and never the login or its traffic, so proxies
+ * stay allowed (hosts often need one) while an interception CA is always refused.
+ * Names only: values are never copied. The worker's own CODEX_HOME is allowed; the CLI manages
+ * its contents (a profile's `env` may not set it, see validate.ts).
  */
 const CODEX_OVERRIDES = [
   'CODEX_API_KEY',
@@ -56,6 +61,12 @@ const CODEX_OVERRIDES = [
   'CODEX_APP_SERVER_LOGIN_CLIENT_ID',
   'CODEX_AGENT_IDENTITY_AUTHAPI_BASE_URL',
   'CODEX_AGENT_IDENTITY_JWKS_BASE_URL',
+  'CODEX_CA_CERTIFICATE',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'NODE_EXTRA_CA_CERTS',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
 ] as const;
 
 export function hasCodexAuthOverride(env: NodeJS.ProcessEnv): boolean {

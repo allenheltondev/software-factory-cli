@@ -60,12 +60,21 @@ agents:
    `Not logged in` and anything unexpected fail the run as `start_failed` with a fixed hint and
    no CLI output.
 3. Any `OPENAI_*`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` or auth-endpoint override variable in
-   the environment fails the check without starting the CLI. A profile may not set
-   `model_provider`, `model_providers.*`, `forced_login_method`, `cli_auth_credentials_store`,
-   `chatgpt_base_url`, `openai_base_url`, `--profile`/`-p`, `--oss` or `--local-provider`
-   (`updraft validate` and the run both refuse them).
-4. Every run appends `-c model_provider="openai" -c forced_login_method="chatgpt"`, so Codex
-   itself refuses an API key that appears after the checks.
+   the environment fails the check without starting the CLI, and so does any extra TLS trust
+   root: `CODEX_CA_CERTIFICATE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`,
+   `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`. Proxy variables (`HTTPS_PROXY`, `ALL_PROXY`, …) are
+   allowed: with only the system roots trusted, a proxy sees the host it tunnels to and never the
+   login or the traffic, and hosts often need one. An interception CA is what would expose the
+   tokens, and it is always refused.
+4. A profile may not set `model_provider`, `model_providers.*`, `forced_login_method`,
+   `cli_auth_credentials_store`, `chatgpt_base_url`, `openai_base_url`, `--profile`/`-p`, `--oss`
+   or `--local-provider` in `args`, nor `CODEX_HOME` in `env` (`updraft validate` and the run
+   both refuse them).
+5. Every run appends `-c model_provider="openai" -c forced_login_method="chatgpt"
+   -c chatgpt_base_url="https://chatgpt.com/backend-api/"`, so Codex itself refuses an API key
+   that appears after the checks, and a `config.toml` cannot point the login at another backend.
+   That URL is the CLI's own default for a ChatGPT login (`DEFAULT_CHATGPT_BASE_URL`,
+   `codex-rs/model-provider/src/chatgpt_base_url.rs`), so pinning it changes nothing else.
 
 This is the mutually exclusive routing on a worker: a `native-codex` profile runs only on the
 ChatGPT login, a profile without it is the API-key (BYOK) path, and nothing falls back from one
@@ -80,47 +89,106 @@ away from repository code. Codex uses the same boundary:
 
 ```text
 root supervisor
-  ├─ official Codex CLI (credential UID 1001), private cwd
-  │    HOME = credential home, CODEX_HOME = <credential home>/.codex (auth.json, CLI-owned)
+  ├─ official Codex CLI, native binary (credential UID 1001), private cwd
+  │    HOME = CODEX_HOME = <credential home>/codex (0700; auth.json, CLI-owned)
   │    only MCP tool: updraft.exec ──► trusted shim ──► private Unix socket
   └─ bubblewrap job sandbox (UID 1000): worktree mounts only, fresh HOME,
        new PID/mount/user/network namespaces, no credential home, no network
        (registry proxy only)
 ```
 
-- The supervisor accepts `codex exec --json` with a model and a reasoning effort, nothing else
-  (`codexArgs` in `policy.mjs`), and starts the CLI with: `--skip-git-repo-check --ephemeral
-  --ignore-user-config --ignore-rules` (no user config, rules, hooks or project files);
-  `features.shell_tool=false`, `features.unified_exec=false`, `features.view_image=false`,
-  `web_search="disabled"` (no built-in tools); `--sandbox read-only` and
-  `approval_policy="never"` (should a built-in tool remain, Codex's own sandbox blocks writes
-  and network and nothing is escalated); `model_provider="openai"`,
-  `forced_login_method="chatgpt"`, `cli_auth_credentials_store="file"`; and one MCP server,
-  `updraft`, limited to its `exec` tool, which runs each command in the job sandbox exactly as
-  Claude's tool does.
-- Claude announces its tool list (`system/init`), which the supervisor checks before relaying
-  anything. `codex exec --json` announces none, so the supervisor judges **every** event
-  (`checkCodexEvent`): a turn may only reason, message, keep a to-do list and call
-  `updraft.exec`. A `command_execution`, `file_change`, `web_search`, collaboration call, another
-  MCP server or tool, or any event type it does not know kills the CLI and every child before
-  the event is relayed; the run fails with exit 125. Tool calls are served only after
-  `thread.started`.
+The controls, in order of importance:
+
+1. **Prevention: nothing but `updraft.exec` is switched on.** The supervisor accepts
+   `codex exec --json` with a model and a reasoning effort, nothing else (`codexArgs` in
+   `policy.mjs`), and starts the CLI with:
+   - `--ignore-user-config --ignore-rules --ephemeral --skip-git-repo-check`, from a private
+     empty cwd: no user `config.toml`, rules, project config or project MCP servers;
+   - every feature that adds a tool or a call path off (`CODEX_DISABLED_FEATURES`), under
+     `--strict-config`, so a key the pinned CLI does not know fails the run instead of being
+     ignored. Audit, at `openai/codex` 8727186 (`codex-rs/features/src/lib.rs`): every
+     `FeatureSpec` with `default_enabled: true` was listed, and each that adds a model-visible
+     tool, a tool or MCP call path, an MCP server, sub-agents, hooks, browser or computer use,
+     image generation or an approval reviewer is switched off: `shell_tool`, `unified_exec`,
+     `unified_exec_tty`, `shell_snapshot`, `view_image`, `sleep_tool`, `code_mode_host`, `hooks`,
+     `multi_agent`, `apps` (the ChatGPT `codex_apps` connector server, turned on for ChatGPT
+     logins), `tool_suggest`, `plugins`, `remote_plugin`, `plugin_sharing`, `in_app_browser`,
+     `in_app_local_automation`, `browser_use`, `browser_use_full_cdp_access`,
+     `browser_use_external`, `computer_use`, `image_generation`, `skill_mcp_dependency_install`,
+     `goals`, `tool_call_mcp_elicitation`, `auth_elicitation`, `guardian_approval`,
+     `workspace_dependencies`. Off-by-default features that would add such a tool are pinned off
+     too: `multi_agent_v2`, `code_mode`, `code_mode_only`, `standalone_web_search`,
+     `web_search_request`, `web_search_cached`, `web_search_indexed_default`,
+     `request_permissions_tool`, `exec_permission_approvals`, `memories`, `recommended_plugins`,
+     `agent_message_board`, `agent_message_board_mcp`, `enable_mcp_apps`, `deferred_executor`,
+     `send_message_to_user_async`, `artifact`, `statsig_gates`. `js_repl` is `Stage::Removed`
+     (ignored by the CLI) and not listed. Infrastructure flags (MCP startup, compression,
+     retries, TUI) are left alone. Re-run this audit for every Codex version the image pins;
+   - `web_search="disabled"`, `check_for_update_on_startup=false`;
+   - one MCP server, `updraft`, `required`, limited to `enabled_tools = ["exec"]`, which runs
+     each command in the job sandbox exactly as Claude's tool does;
+   - `model_provider="openai"`, `forced_login_method="chatgpt"`,
+     `cli_auth_credentials_store="file"` and the official `chatgpt_base_url` (also on every
+     `login status` and `login --device-auth`).
+2. **Second layer: Codex's own sandbox.** `--sandbox read-only` with `approval_policy="never"`:
+   should a built-in tool remain, it can neither write nor reach the network, and nothing is
+   escalated.
+3. **Third layer: the event gate.** Claude announces its tool list (`system/init`), which the
+   supervisor checks before relaying anything. `codex exec --json` announces none, so the
+   supervisor judges every event (`checkCodexEvent`): a turn may only reason, message, keep a
+   to-do list and call `updraft.exec`. A `command_execution`, `file_change`, `web_search`,
+   collaboration call, another MCP server or tool, or any item or event type it does not know
+   kills the CLI and every child before the event is relayed; the run fails with exit 125. The
+   gate is late by design: exec emits an item when a call has already been dispatched, drops
+   some item kinds, and does not forward sub-agent events. That is why prevention comes first.
+
+`apply_patch` is the one built-in Codex still offers: it comes from the model's catalog metadata
+(`apply_patch_tool_type`, `codex-rs/core/src/tools/spec_plan.rs`), and no supported config key
+removes it (replacing the whole model catalog with `model_catalog_json` would, but that changes
+much more than one tool). Codex's read-only sandbox refuses every patch
+(`codex-rs/core/src/safety.rs`), and an attempt that surfaces as `file_change` ends the session.
+So the model's instructions say to create and edit files only with shell commands through
+`updraft.exec`, never `apply_patch`, which keeps a normal run from tripping the gate.
+
+Other parts of the boundary:
+
+- **Hooks.** `CODEX_HOME/hooks.json` is still a place the CLI discovers hooks when the feature is
+  on. With `features.hooks=false` and plugins off the hook engine loads no handlers
+  (`codex-rs/hooks/src/engine/mod.rs`); on top of that the supervisor refuses to start Codex (and
+  reports it unavailable) if `hooks.json` or `hooks` exists in CODEX_HOME. Only the credential
+  identity can write there.
+- **Separate home.** Codex has its own 0700 home (`HOME = CODEX_HOME = <credential home>/codex`),
+  so it never starts in Claude's home. Both CLIs still run as one credential identity, so a
+  breakout of one CLI process could read the other's login. A separate UID per CLI (and a
+  separate EFS access point) is a follow-up.
+- **Native binary.** The worker config names the official native executable (resolved by
+  `install.sh` from the platform package, as `bin/codex.js` resolves it), and `trustedFile`
+  checks that binary and its directories; the npm wrapper is refused.
+- **Root never touches credential-writable paths.** CODEX_HOME is created by the credential
+  identity (`setpriv … mkdir -m 0700`), then only `lstat`-checked by root (a real directory it
+  owns, private); a link stops startup. The credential home's lock is taken as the credential
+  identity. Tool sockets live in a root-owned directory the CLI can only traverse; session and
+  status directories are emptied as their owner before root removes the empty directory; the
+  namespace probe directory is created and removed by the job identity.
 - `codex login status` runs before every session as the credential identity in a private
   directory; its output is classified by the same `native-codex-auth.js` and never relayed.
 - The CLI's environment is fixed (`codexEnv`): PATH, LANG, HOME and CODEX_HOME, nothing
-  inherited, so no key or endpoint override can reach it.
+  inherited, so no key, CA, proxy or endpoint override can reach it. Stderr is never relayed;
+  `error` and `turn.failed` text is relayed as one bounded line with URLs, e-mail addresses and
+  token-like values replaced (`sanitizeCodexText`), enough for usage-limit handling.
 - `security-check.mjs` (CI job "native worker credential isolation") runs the real supervisor,
-  MCP bridge, UIDs and bubblewrap with a synthetic Codex CLI and a synthetic `auth.json`. It
-  proves repository commands cannot read `auth.json` (direct read, the supervisor's
-  `/proc/<pid>/root`, a symlink, a Node subprocess, the environment), that a built-in tool event
-  ends the session with no later tool call run, that API-key, access-token, signed-out and
-  unreadable logins and caller-chosen sandbox, provider, MCP or profile options fail closed, and
-  that readiness stays a sanitized state.
+  MCP bridge, UIDs and bubblewrap with a synthetic Codex CLI and a synthetic `auth.json`. The
+  stand-in refuses to start unless every flag above is present (its own copy of the feature
+  list). It proves repository commands cannot read `auth.json` (direct read, the supervisor's
+  `/proc/<pid>/root`, a symlink, a Node subprocess, the environment); that a built-in tool event
+  ends the session with no later tool call run; that API-key, access-token, signed-out and
+  unreadable logins, a hooks file, and caller-chosen sandbox, provider, MCP or profile options
+  fail closed; that a linked CODEX_HOME stops startup with its target unchanged and a linked lock
+  file creates nothing; and that readiness stays a sanitized state.
 
-**What the event gate does not prove:** it reacts to what the CLI reports. Whether the real CLI,
-with these flags, offers the model no built-in tool at all is a property of the pinned Codex
-release and must be verified live (below). Until then the read-only Codex sandbox is the second
-layer, and the same separate-UID boundary keeps the credential home out of the job sandbox.
+**What this does not prove:** whether the real CLI, with these flags, offers the model no
+built-in tool but `apply_patch` is a property of the pinned Codex release and must be verified
+live (below).
 
 ## Hosted sign-in
 
@@ -172,10 +240,13 @@ subscription routing needs:
 - Device code sign-in on a worker (and whether the account first has to enable it), then
   `updraft native-auth --codex` reports `connected`; restart the process and the VM and it still
   does.
-- With the pinned Codex release and the supervisor's flags, the model is offered only
-  `updraft.exec`: no shell, exec, patch, image, web search or agent tools. Ask it to read
-  `auth.json` and to run commands; record that no `command_execution` or `file_change` item
-  appears, and that the gate kills the session if one does.
+- The pinned release accepts every flag under `--strict-config` (a key it does not know fails
+  the run), and with them the model is offered only `updraft.exec` and `apply_patch`: no shell,
+  exec, image, web search, apps/connectors, plugins, agent or browser tools. Ask it to read
+  `auth.json`, to run commands and to use a ChatGPT connector; record that no
+  `command_execution`, `file_change` or `mcp_tool_call` to another server appears, and that the
+  gate kills the session if one does. Check that normal runs edit files through `updraft.exec`
+  and never trip the gate with `apply_patch`.
 - MCP tool calls run without an approval prompt in `exec` with `approval_policy="never"` and
   `default_tools_approval_mode="approve"`.
 - A real issue through implementation, review, revision and CI repair on the subscription, with

@@ -3,10 +3,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { IMAGE, DEFAULT_SOCKET, MAX_FRAME, DEFAULT_TOOL_TIMEOUT_SECONDS, EGRESS_SOCKET, loadConfig, claudeEnv, codexEnv, codexHome, validateRun, claudeArgs, codexArgs, checkInventory, checkCodexEvent, trustedFile, withEgress, networkNote } from './policy.mjs';
+import { IMAGE, DEFAULT_SOCKET, MAX_FRAME, DEFAULT_TOOL_TIMEOUT_SECONDS, EGRESS_SOCKET, loadConfig, claudeEnv, codexEnv, codexHome, validateRun, claudeArgs, codexArgs, checkInventory, checkCodexEvent, sanitizeCodexEvent, CODEX_LOGIN_PINS, trustedFile, withEgress, networkNote } from './policy.mjs';
 import { createEgressProxy, mergeRules, parseEgressConfig, parseJobEgress, sanitize } from '../image/sandbox/egress-proxy.mjs';
 import { frames, send } from './protocol.mjs';
 
@@ -21,6 +21,35 @@ export function identityCommand(uid, gid, file, args) {
 function startAs(uid, gid, file, args, options) {
   const [command, argv] = identityCommand(uid, gid, file, args);
   return spawn(command, argv, { ...options, detached: true });
+}
+
+/** Run a short filesystem command as `uid`, never as root. */
+function runAs(uid, gid, file, args) {
+  const [command, argv] = identityCommand(uid, gid, file, args);
+  return spawnSync(command, argv, { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 });
+}
+
+/**
+ * Remove a directory that another identity can write in. Its contents go as that identity, so a
+ * link planted inside can never steer a root deletion; root then removes only the directory
+ * itself, non-recursively, from its own root-owned parent. A directory refilled in between stays.
+ */
+export function removeAs(uid, gid, dir) {
+  runAs(uid, gid, '/bin/rm', ['-rf', '--', dir]);
+  try { fs.rmdirSync(dir); } catch { /* still in use, or refilled: left behind, never followed */ }
+}
+
+/**
+ * Root never creates, changes or follows anything inside storage the credential identity can
+ * write. A directory there is created by that identity, then only inspected without following
+ * links: it must be a real directory it owns, private to it.
+ */
+export function ensurePrivateDir(uid, gid, dir) {
+  runAs(uid, gid, '/bin/mkdir', ['-m', '0700', '--', dir]);
+  const s = fs.lstatSync(dir);
+  if (s.isSymbolicLink() || !s.isDirectory() || s.uid !== uid || (s.mode & 0o077)) {
+    throw new Error('credential directory must be a private directory of the credential identity');
+  }
 }
 
 function kill(child) {
@@ -78,12 +107,21 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   const environment = claudeEnv(c);
   // Codex is served only when the worker config names its official executable and classifier.
   const codex = c.codex ? { env: codexEnv(c), ...(await import(pathToFileURL(c.codexAuthModule).href)) } : undefined;
-  if (codex) {
-    // The CLI requires CODEX_HOME to exist. It is created empty and private; only the CLI writes in it.
-    fs.mkdirSync(codexHome(c), { mode: 0o700, recursive: true });
-    fs.chownSync(codexHome(c), c.claudeUid, c.claudeGid);
-    fs.chmodSync(codexHome(c), 0o700);
-  }
+  // The CLI requires CODEX_HOME to exist: created by the credential identity, never by root.
+  if (codex) ensurePrivateDir(c.claudeUid, c.claudeGid, codexHome(c));
+  /**
+   * Before every Codex session: CODEX_HOME is still the CLI's private directory, and holds no
+   * hooks file. Hooks are switched off (features.hooks=false, plugins off), so the CLI does not
+   * read one; a hooks file there is refused all the same. Metadata only, links never followed.
+   */
+  const checkCodexHome = () => {
+    const s = fs.lstatSync(codexHome(c));
+    if (s.isSymbolicLink() || !s.isDirectory() || s.uid !== c.claudeUid || (s.mode & 0o077)) throw new Error('Codex home is not private');
+    for (const name of ['hooks.json', 'hooks']) {
+      try { fs.lstatSync(`${codexHome(c)}/${name}`); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      throw new Error('Codex home holds hooks; refusing to start Codex');
+    }
+  };
   const root = path.dirname(socketPath);
   fs.mkdirSync(root, { recursive: true, mode: 0o750 });
   fs.chownSync(root, 0, c.workerGid);
@@ -95,6 +133,12 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   const sandboxState = `${scratch}/sandbox`;
   fs.mkdirSync(sandboxState, { mode: 0o700 });
   fs.chownSync(sandboxState, c.workerUid, c.workerGid);
+  /** The scratch tree: identity-owned parts are removed as their owners first (removeAs). */
+  const removeScratch = () => {
+    if (fs.existsSync(sandboxState)) removeAs(c.workerUid, c.workerGid, sandboxState);
+    const foreign = fs.readdirSync(scratch).some((name) => fs.lstatSync(`${scratch}/${name}`).uid !== 0);
+    if (!foreign) fs.rmSync(scratch, { recursive: true, force: true });
+  };
   const children = new Set();
   const clients = new Set();
   const active = new Map();
@@ -131,7 +175,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       fs.chmodSync(socketFile, 0o660);
     } catch (error) {
       await egressProxy.close().catch(() => {});
-      fs.rmSync(scratch, { recursive: true, force: true });
+      removeScratch();
       throw error;
     }
     egress = { dir, shim: policy.shim, node: process.execPath };
@@ -141,13 +185,14 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   // The credential home lock excludes a second supervisor in either storage mode.
   // This file contains no credentials. Never use an expiring directory lock that can
   // strand a login after termination, or permit two refresh-token writers after expiry.
-  const lease = spawn('/usr/bin/flock', ['--nonblock', `${c.credentialHome}/.updraft-worker.lock`,
+  // Taken as the credential identity: root never opens a path in storage that identity can write.
+  const lease = startAs(c.claudeUid, c.claudeGid, '/usr/bin/flock', ['--nonblock', `${c.credentialHome}/.updraft-worker.lock`,
     '/bin/sh', '-c', 'printf ready; exec cat >/dev/null'], { env: { PATH: '/usr/bin:/bin' }, stdio: ['pipe', 'pipe', 'ignore'] });
   await new Promise((resolve, reject) => {
     lease.once('error', reject);
     lease.once('exit', () => reject(new Error('credential home already leased or lock unavailable')));
     lease.stdout.once('data', (data) => data.toString() === 'ready' ? resolve() : reject(new Error('credential lease failed')));
-  }).catch(async (error) => { lease.stdin.destroy(); await closeEgress(); fs.rmSync(scratch, { recursive: true, force: true }); throw error; });
+  }).catch(async (error) => { lease.stdin.destroy(); await closeEgress(); removeScratch(); throw error; });
   let closing = false;
   lease.once('exit', () => { if (!closing) { for (const client of clients) client.destroy(); for (const child of children) kill(child); server.close(); void closeEgress(); } });
   const releaseLease = async () => {
@@ -164,8 +209,9 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     if (provider === 'codex') {
       if (!codex) throw new Error('Codex is not installed on this worker');
       // `codex login status` reads the CLI's own auth store; only its fixed sentence is classified.
+      checkCodexHome();
       const result = await captureAs(c.claudeUid, c.claudeGid, c.codex,
-        ['-c', 'cli_auth_credentials_store="file"', 'login', 'status'], { cwd, env: codex.env }, tracked, { stderr: true });
+        [...CODEX_LOGIN_PINS, 'login', 'status'], { cwd, env: codex.env }, tracked, { stderr: true });
       status = codex.nativeCodexAuthFromStatus({ code: result.code, output: result.stdout }, codex.env);
     } else {
       // Even the status probe never starts in a repository or loads its settings/helpers.
@@ -213,7 +259,11 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     const dir = fs.mkdtempSync(`${scratch}/${provider}-`);
     fs.chownSync(dir, c.claudeUid, c.claudeGid);
     fs.chmodSync(dir, 0o700);
-    const toolSocket = `${dir}/tools.sock`;
+    // The tool socket lives in a root-owned directory the CLI can only traverse, so the CLI
+    // identity cannot swap it for a link before root sets its owner and mode.
+    const socketDir = fs.mkdtempSync(`${scratch}/tools-`);
+    fs.chmodSync(socketDir, 0o711);
+    const toolSocket = `${socketDir}/tools.sock`;
     const sessionChildren = new Set();
     const toolClients = new Set();
     let busy = false;
@@ -254,7 +304,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       await new Promise((resolve, reject) => { tools.once('error', reject); tools.listen(toolSocket, resolve); });
       // Cancellation can arrive while the socket starts, before a child exists to kill.
       if (client.destroyed || failed) return 125;
-      fs.chownSync(toolSocket, c.claudeUid, c.claudeGid);
+      fs.lchownSync(toolSocket, c.claudeUid, c.claudeGid);
       fs.chmodSync(toolSocket, 0o600);
       child = track(startAs(c.claudeUid, c.claudeGid, provider === 'codex' ? c.codex : c.claude, args,
         { cwd: dir, env: provider === 'codex' ? codex.env : environment, stdio: ['pipe', 'pipe', 'pipe'] }));
@@ -271,7 +321,9 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
             if (!checkInventory(event)) return;
             initialized = true;
           }
-          send(client, { stream: 'stdout', data: Buffer.from(`${JSON.stringify(event)}\n`).toString('base64') });
+          // Codex error text is bounded and stripped of URLs, addresses and token-like values.
+          const relayed = provider === 'codex' ? sanitizeCodexEvent(event) : event;
+          send(client, { stream: 'stdout', data: Buffer.from(`${JSON.stringify(relayed)}\n`).toString('base64') });
         } catch { cancel.stop(); }
       }, () => cancel.stop());
       // CLI startup errors can contain identity/auth context; return a fixed error instead.
@@ -282,7 +334,8 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       cancel.stop();
       for (const socket of toolClients) socket.destroy();
       await new Promise((resolve) => tools.close(resolve));
-      fs.rmSync(dir, { recursive: true, force: true });
+      removeAs(c.claudeUid, c.claudeGid, dir);
+      fs.rmSync(socketDir, { recursive: true, force: true });
     }
   }
 
@@ -314,7 +367,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
         try {
           if (run.command.length === 2 && run.command[0] === 'codex' && run.command[1] === '--version') {
             if (!codex) return 125;
-            const version = await captureAs(c.claudeUid, c.claudeGid, c.codex, ['--version'], { cwd: '/', env: codex.env },
+            const version = await captureAs(c.claudeUid, c.claudeGid, c.codex, [...CODEX_LOGIN_PINS, '--version'], { cwd: '/', env: codex.env },
               (child) => { cancel.stop = () => kill(child); return track(child); });
             if (version.code !== 0 || !/^codex-cli \d+\.\d+\.\d+\S*\s*$/.test(version.stdout)) return 125;
             output(version.stdout); return 0;
@@ -329,6 +382,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
           if (run.command[0] === 'claude') return await agentSession('claude', runArgs, run, prompt, client, cancel);
           if (run.command[0] === 'codex') {
             if (!codex) throw new Error('Codex is not installed on this worker');
+            checkCodexHome();
             return await agentSession('codex', runArgs, run, prompt, client, cancel);
           }
           // Updraft verification invocations are allowed arbitrary commands, always sandboxed,
@@ -353,8 +407,11 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
 
   try {
     // Real namespace probe, including network isolation. A failed probe prevents listening.
-    const probeDir = fs.mkdtempSync(`${c.workRoot}/.native-probe-`);
-    fs.chownSync(probeDir, c.workerUid, c.workerGid);
+    // Created by the job identity in its own workRoot; root never chowns a path there.
+    const made = runAs(c.workerUid, c.workerGid, '/bin/mktemp', ['-d', `${c.workRoot}/.native-probe-XXXXXXXX`]);
+    const probeDir = made.status === 0 ? made.stdout.trim() : '';
+    const probeStat = probeDir && path.dirname(probeDir) === c.workRoot ? fs.lstatSync(probeDir) : undefined;
+    if (!probeStat?.isDirectory() || probeStat.isSymbolicLink() || probeStat.uid !== c.workerUid) throw new Error('native worker namespace probe failed');
     // The supervisor can be PID 1 in the MicroVM. /proc/1 also exists inside
     // an isolated PID namespace, so compare namespace identities instead.
     const pidNamespace = fs.readlinkSync('/proc/self/ns/pid');
@@ -366,7 +423,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     probe.stdin.end();
     probe.stdout.resume(); probe.stderr.resume();
     const code = await new Promise((resolve) => { probe.once('error', () => resolve(125)); probe.once('close', resolve); });
-    fs.rmSync(probeDir, { recursive: true, force: true });
+    runAs(c.workerUid, c.workerGid, '/bin/rm', ['-rf', '--', probeDir]);
     if (code !== 0) throw new Error('native worker namespace probe failed');
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
     fs.chownSync(socketPath, 0, c.workerGid);
@@ -375,7 +432,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     for (const child of children) kill(child);
     await closeEgress();
     await releaseLease();
-    fs.rmSync(scratch, { recursive: true, force: true });
+    removeScratch();
     throw error;
   }
   /**
@@ -413,7 +470,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       fs.chownSync(cwd, c.claudeUid, c.claudeGid);
       try { return await auth(cwd, new Set(), true, provider); }
       catch { return 'unavailable'; }
-      finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+      finally { removeAs(c.claudeUid, c.claudeGid, cwd); }
     },
     async close() {
       const ended = [...children].map((child) => new Promise((resolve) => child.once('close', resolve)));
@@ -423,7 +480,7 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
       await new Promise((resolve) => server.close(resolve));
       await closeEgress();
       await releaseLease();
-      fs.rmSync(scratch, { recursive: true, force: true });
+      removeScratch();
     },
   };
 }

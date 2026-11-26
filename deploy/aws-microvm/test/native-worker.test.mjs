@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, EGRESS_TARGET, CODEX_SERVER, CODEX_TOOL, claudeArgs, claudeEnv, codexArgs, codexEnv, checkCodexEvent, checkInventory, validateRun, resolveRunEnvironment, withEgress, networkNote } from '../native-worker/policy.mjs';
+import { IMAGE, TOOL, MAX_FRAME, GIT_IDENTITY, EGRESS_TARGET, CODEX_SERVER, CODEX_TOOL, CODEX_DISABLED_FEATURES, claudeArgs, claudeEnv, codexArgs, codexEnv, checkCodexEvent, sanitizeCodexEvent, sanitizeCodexText, checkInventory, validateRun, resolveRunEnvironment, withEgress, networkNote } from '../native-worker/policy.mjs';
 import { parseRunArgs } from '../image/sandbox/updraft-sandbox.mjs';
 import { frames, readPrompt } from '../native-worker/protocol.mjs';
 import { bootPayload } from '../native-worker/hooks.mjs';
@@ -77,7 +77,7 @@ describe('disposable worker Codex sign-in (official device code)', () => {
       await vi.waitFor(() => expect(launch).toHaveBeenCalledOnce());
       const [file, args, options] = launch.mock.calls[0];
       expect(file).toBe('/trusted/codex');
-      expect(args).toEqual(['-c', 'cli_auth_credentials_store="file"', '-c', 'forced_login_method="chatgpt"', 'login', '--device-auth']);
+      expect(args).toEqual(['-c', 'cli_auth_credentials_store="file"', '-c', 'forced_login_method="chatgpt"', '-c', 'chatgpt_base_url="https://chatgpt.com/backend-api/"', 'login', '--device-auth']);
       expect(options.env).toEqual({ ...codexEnv({ credentialHome: '/private/home' }), BROWSER: '/bin/false' });
       expect(options.stdio[0]).toBe('ignore'); // nothing from the browser ever reaches the CLI
       const [first, second] = [devicePrompt().slice(0, 200), devicePrompt().slice(200)];
@@ -119,6 +119,10 @@ describe('disposable worker Codex sign-in (official device code)', () => {
   });
 });
 
+const REQUIRED_OFF = ['shell_tool', 'unified_exec', 'unified_exec_tty', 'view_image', 'sleep_tool', 'code_mode_host', 'code_mode', 'code_mode_only',
+  'hooks', 'apps', 'plugins', 'remote_plugin', 'tool_suggest', 'multi_agent', 'multi_agent_v2', 'image_generation', 'browser_use', 'computer_use',
+  'in_app_browser', 'standalone_web_search', 'request_permissions_tool', 'memories', 'goals', 'agent_message_board', 'enable_mcp_apps'];
+
 describe('native Codex worker policy', () => {
   const mcp = { command: '/usr/local/bin/node', args: ['/opt/updraft/native-worker/mcp.mjs', '/run/updraft-native/s/codex-x/tools.sock'] };
   const pair = (args, key) => args.find((a, n) => args[n - 1] === '-c' && a.startsWith(`${key}=`));
@@ -126,10 +130,10 @@ describe('native Codex worker policy', () => {
   it('replaces the bypass default with a restricted, configuration-free, ChatGPT-only launch and one MCP tool', () => {
     const args = codexArgs(['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5-codex', '-c', 'model_reasoning_effort="high"',
       '-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"'], mcp);
-    expect(args.slice(0, 8)).toEqual(['exec', '--json', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only']);
+    expect(args.slice(0, 9)).toEqual(['exec', '--json', '--strict-config', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only']);
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
     for (const expected of ['approval_policy="never"', 'model_provider="openai"', 'forced_login_method="chatgpt"', 'cli_auth_credentials_store="file"',
-      'features.shell_tool=false', 'features.unified_exec=false', 'features.view_image=false', 'web_search="disabled"',
+      'chatgpt_base_url="https://chatgpt.com/backend-api/"', 'web_search="disabled"', ...REQUIRED_OFF.map((f) => `features.${f}=false`),
       `mcp_servers.${CODEX_SERVER}.required=true`, `mcp_servers.${CODEX_SERVER}.enabled_tools=["${CODEX_TOOL}"]`]) {
       expect(args[args.indexOf(expected) - 1]).toBe('-c');
     }
@@ -138,6 +142,7 @@ describe('native Codex worker policy', () => {
     expect(args.filter((a) => a.startsWith('model_provider='))).toEqual(['model_provider="openai"']);
     expect(args.slice(-4)).toEqual(['--model', 'gpt-5-codex', '-c', 'model_reasoning_effort="high"']);
     expect(pair(args, 'developer_instructions')).toContain('Network access is disabled.');
+    expect(pair(args, 'developer_instructions')).toContain('Never use apply_patch');
     expect(pair(codexArgs(['exec', '--json'], mcp, { egress: true }), 'developer_instructions')).toContain('limited to package registries');
   });
 
@@ -175,8 +180,29 @@ describe('native Codex worker policy', () => {
     expect(() => checkCodexEvent(event)).toThrow(/isolation rejected/);
   });
 
-  it('gives Codex only its private home: no inherited keys, tokens or endpoints', () => {
-    expect(codexEnv({ credentialHome: '/mnt/native/home' })).toEqual({ PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: '/mnt/native/home', CODEX_HOME: '/mnt/native/home/.codex' });
+  it('gives Codex its own private home, apart from Claude\'s: no inherited keys, tokens, CAs or endpoints', () => {
+    expect(codexEnv({ credentialHome: '/mnt/native/home' })).toEqual({ PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: '/mnt/native/home/codex', CODEX_HOME: '/mnt/native/home/codex' });
+  });
+
+  it('switches off every feature that adds a tool or call path (audited at openai/codex 8727186)', () => {
+    // Listed here on purpose, not imported: dropping one from the policy must fail this test.
+    for (const feature of REQUIRED_OFF) expect(CODEX_DISABLED_FEATURES).toContain(feature);
+    const args = codexArgs(['exec', '--json'], mcp);
+    for (const feature of CODEX_DISABLED_FEATURES) expect(args[args.indexOf(`features.${feature}=false`) - 1]).toBe('-c');
+    expect(args.some((a) => /^features\.[a-z_0-9]+=true$/.test(a))).toBe(false);
+  });
+
+  it('relays Codex errors only as a bounded line without URLs, addresses or token-like values', () => {
+    const raw = 'unexpected status 401 from https://chatgpt.com/backend-api/codex/responses?x=1 for owner@example.com token eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9abc\nsecond line';
+    const clean = sanitizeCodexText(raw);
+    expect(clean).toBe('unexpected status 401 from <url> for <email> token <redacted>');
+    expect(sanitizeCodexText(`You've hit your usage limit. ${'x'.repeat(400)}`)).toMatch(/^You've hit your usage limit\./);
+    expect(sanitizeCodexText(`${'a b '.repeat(200)}`).length).toBeLessThanOrEqual(300);
+    expect(sanitizeCodexEvent({ type: 'error', message: raw, extra: 'x' })).toEqual({ type: 'error', message: clean });
+    expect(sanitizeCodexEvent({ type: 'turn.failed', error: { message: raw, code: 'x' } })).toEqual({ type: 'turn.failed', error: { message: clean } });
+    expect(sanitizeCodexEvent({ type: 'item.completed', item: { id: 'e', type: 'error', message: raw } }).item.message).toBe(clean);
+    const message = { type: 'item.completed', item: { type: 'agent_message', text: 'done' } };
+    expect(sanitizeCodexEvent(message)).toBe(message);
   });
 });
 

@@ -2,7 +2,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { claudeEnv, codexEnv, loadConfig } from './policy.mjs';
+import { claudeEnv, codexEnv, loadConfig, CODEX_LOGIN_PINS } from './policy.mjs';
 import { identityCommand } from './service.mjs';
 
 export const LOGIN_PORT = 8081;
@@ -13,7 +13,7 @@ const args = ['--restricted', '--setting-sources', '', 'auth'];
 /** Codex device codes expire after 15 minutes (codex-rs/login/src/device_code_auth.rs). */
 const CODEX_TIMEOUT = 15 * 60_000;
 /** The official CLI keeps its ChatGPT login in CODEX_HOME/auth.json, never a keyring, on this worker. */
-const CODEX_LOGIN = ['-c', 'cli_auth_credentials_store="file"', '-c', 'forced_login_method="chatgpt"', 'login'];
+const CODEX_LOGIN = [...CODEX_LOGIN_PINS, 'login'];
 
 export function loginUrl(output) {
   for (const candidate of output.match(/https:\/\/[^\s\x1b]+/g) ?? []) {

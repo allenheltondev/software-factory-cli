@@ -231,11 +231,14 @@ The same supervisor serves the official Codex CLI when the image installs it (ad
 `@openai/codex` to `AGENT_PACKAGES` in `build.env`). `install.sh` then records `codex` and
 `codexAuthModule` (Updraft's `dist/agents/native-codex-auth.js`) in the worker config; without
 them Codex runs are refused. Codex runs as the same credential identity, with
-`CODEX_HOME=/var/lib/updraft-native-auth/home/.codex`, and is restricted like Claude: no user
-configuration, rules or built-in shell/exec/image/web tools, its own sandbox read-only, a
-ChatGPT-only login on the OpenAI provider, and one MCP tool (`updraft.exec`) into the same job
-sandbox. Codex announces no tool list, so the supervisor kills the session on any event other
-than reasoning, messages, the to-do list and that one tool. Details and what remains to verify
+its own 0700 `HOME=CODEX_HOME=/var/lib/updraft-native-auth/home/codex` (created by that identity,
+never by root), and the config names the official native binary, not the npm wrapper. It is
+restricted like Claude: no user configuration or rules, every tool-adding feature off under
+`--strict-config` (shell, exec, apps/connectors, plugins, hooks, sub-agents, browser, image and
+web tools), its own sandbox read-only, a ChatGPT-only login on the OpenAI provider and the
+official backend, and one MCP tool (`updraft.exec`) into the same job sandbox. Codex announces no
+tool list, so the supervisor also kills the session on any event other than reasoning, messages,
+the to-do list and that one tool, and refuses to start it if CODEX_HOME holds a hooks file. Details and what remains to verify
 live: [docs/codex-subscription.md](../../../docs/codex-subscription.md).
 
 Sign in from a direct terminal, with the official device code flow:
@@ -244,9 +247,10 @@ Sign in from a direct terminal, with the official device code flow:
 cd /
 setpriv --reuid 1001 --regid 1001 --clear-groups -- \
   env -i PATH=/usr/local/bin:/usr/bin:/bin \
-  HOME=/var/lib/updraft-native-auth/home \
-  CODEX_HOME=/var/lib/updraft-native-auth/home/.codex \
-  codex -c cli_auth_credentials_store='"file"' -c forced_login_method='"chatgpt"' login --device-auth
+  HOME=/var/lib/updraft-native-auth/home/codex \
+  CODEX_HOME=/var/lib/updraft-native-auth/home/codex \
+  codex -c cli_auth_credentials_store='"file"' -c forced_login_method='"chatgpt"' \
+  -c chatgpt_base_url='"https://chatgpt.com/backend-api/"' login --device-auth
 ```
 
 Open the printed page in your own browser, sign in to ChatGPT and enter the code. Use the same

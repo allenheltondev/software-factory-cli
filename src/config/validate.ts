@@ -1,7 +1,7 @@
 import type { z } from 'zod';
 import { agentProfile, effectiveArgs } from '../agents/profile.js';
 import { getAdapter } from '../agents/adapters/registry.js';
-import { codexSubscriptionArgProblem } from '../agents/native-codex-args.js';
+import { codexSubscriptionArgProblem, codexSubscriptionEnvProblem } from '../agents/native-codex-args.js';
 import { hasCodexAuthOverride } from '../agents/native-codex-auth.js';
 import {
   KNOWN_ADAPTERS,
@@ -81,6 +81,8 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
       if (agent.container) errors.push({ path: at, message: 'native-codex authentication is unsupported with containerized agents until credential isolation is proven' });
       const problem = codexSubscriptionArgProblem(effectiveArgs(adapter, agent));
       if (problem) errors.push({ path: `agents.${agentName}.args`, message: problem });
+      const envProblem = codexSubscriptionEnvProblem(agent.env);
+      if (envProblem) errors.push({ path: `agents.${agentName}.env`, message: envProblem });
       for (const name of Object.keys(agent.env ?? {}).filter((n) => hasCodexAuthOverride({ [n]: 'set' }))) {
         errors.push({ path: `agents.${agentName}.env.${name}`, message: `${name} selects an API key, token or endpoint; native-codex runs only on the CLI's own ChatGPT sign-in` });
       }

@@ -53,7 +53,7 @@ try {
   const credentialHome = `${credentialParent}/home`;
   const workRoot = `${fixture}/jobs`;
   const work = `${workRoot}/repo`;
-  for (const dir of [credentialHome, `${credentialHome}/.claude`, `${credentialHome}/.codex`, workRoot, work]) fs.mkdirSync(dir, { recursive: true });
+  for (const dir of [credentialHome, `${credentialHome}/.claude`, `${credentialHome}/codex`, workRoot, work]) fs.mkdirSync(dir, { recursive: true });
   fs.chownSync(credentialParent, claudeUid, claudeUid);
   fs.chmodSync(credentialParent, 0o700);
   execFileSync('/bin/chown', ['-R', `${claudeUid}:${claudeUid}`, credentialHome]);
@@ -61,10 +61,10 @@ try {
   fs.writeFileSync(`${credentialHome}/.claude/.credentials.json`, marker, { mode: 0o600 });
   fs.chownSync(`${credentialHome}/.claude/.credentials.json`, claudeUid, claudeUid);
   // The Codex CLI keeps its ChatGPT login in CODEX_HOME/auth.json: a synthetic one, never a real login.
-  const codexAuthFile = `${credentialHome}/.codex/auth.json`;
+  const codexAuthFile = `${credentialHome}/codex/auth.json`;
   fs.writeFileSync(codexAuthFile, JSON.stringify({ tokens: { refresh_token: marker } }), { mode: 0o600 });
   fs.chownSync(codexAuthFile, claudeUid, claudeUid);
-  const codexState = `${credentialHome}/.codex/status.json`;
+  const codexState = `${credentialHome}/codex/status.json`;
   const setCodexStatus = (status) => { fs.writeFileSync(codexState, JSON.stringify(status), { mode: 0o600 }); fs.chownSync(codexState, claudeUid, claudeUid); };
   setCodexStatus({ code: 0, text: 'Logged in using ChatGPT' });
   const state = `${credentialHome}/status.json`;
@@ -110,13 +110,22 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   child.stdin.end();
 });
 `, { mode: 0o755 });
+  // Every Codex feature that adds a tool or call path (openai/codex 8727186, features/src/lib.rs),
+  // listed here independently of policy.mjs: the stand-in refuses to start unless each is off.
+  const CODEX_FEATURES_OFF = ['shell_tool', 'unified_exec', 'unified_exec_tty', 'shell_snapshot', 'view_image', 'sleep_tool', 'code_mode_host',
+    'hooks', 'multi_agent', 'apps', 'tool_suggest', 'plugins', 'remote_plugin', 'plugin_sharing', 'in_app_browser', 'in_app_local_automation',
+    'browser_use', 'browser_use_full_cdp_access', 'browser_use_external', 'computer_use', 'image_generation', 'skill_mcp_dependency_install',
+    'goals', 'tool_call_mcp_elicitation', 'auth_elicitation', 'guardian_approval', 'workspace_dependencies', 'multi_agent_v2', 'code_mode',
+    'code_mode_only', 'standalone_web_search', 'web_search_request', 'web_search_cached', 'web_search_indexed_default', 'request_permissions_tool',
+    'exec_permission_approvals', 'memories', 'recommended_plugins', 'agent_message_board', 'agent_message_board_mcp', 'enable_mcp_apps',
+    'deferred_executor', 'send_message_to_user_async', 'artifact', 'statsig_gates'];
   // The Codex stand-in checks the restricted launch contract, then drives the same REAL MCP bridge.
   // Its status comes from a synthetic file; `builtin` makes it act like a CLI whose built-in shell
   // is still on: it announces a command_execution item and then tries a command anyway.
   fs.writeFileSync(`${fixture}/codex`, `#!${process.execPath}
 const fs = require('fs'), cp = require('child_process'), rl = require('readline');
 const args = process.argv.slice(2);
-if (args[0] === '--version') { console.log('codex-cli 0.200.0'); process.exit(0); }
+if (args.at(-1) === '--version') { console.log('codex-cli 0.200.0'); process.exit(0); }
 const login = args.indexOf('login');
 if (login >= 0 && args[login + 1] === 'status') {
   const status = JSON.parse(fs.readFileSync(process.env.CODEX_HOME + '/status.json', 'utf8'));
@@ -127,6 +136,9 @@ function required(...seq) { for (let i = 0; i + seq.length <= args.length; i++) 
 required('--json'); required('--skip-git-repo-check'); required('--ephemeral'); required('--ignore-user-config'); required('--ignore-rules');
 required('--sandbox', 'read-only'); required('-c', 'approval_policy="never"'); required('-c', 'features.shell_tool=false'); required('-c', 'features.unified_exec=false');
 required('-c', 'model_provider="openai"'); required('-c', 'forced_login_method="chatgpt"'); required('-c', 'web_search="disabled"');
+required('--strict-config'); required('-c', 'chatgpt_base_url="https://chatgpt.com/backend-api/"'); required('-c', 'cli_auth_credentials_store="file"');
+for (const feature of ${JSON.stringify(CODEX_FEATURES_OFF)}) required('-c', 'features.' + feature + '=false');
+if (args.some((a) => /^features[.][a-z_0-9]+=true$/.test(a))) process.exit(94);
 if (args.includes('--dangerously-bypass-approvals-and-sandbox')) process.exit(93);
 if (Object.keys(process.env).some((n) => /^(OPENAI_|CODEX_API_KEY|CODEX_ACCESS_TOKEN|GIT_|NODE_OPTIONS|ANTHROPIC_)/.test(n))) process.exit(92);
 const value = (key) => { const a = args.find((x) => x.startsWith(key + '=')); return a && JSON.parse(a.slice(key.length + 1)); };
@@ -320,9 +332,9 @@ let prompt = ''; process.stdin.on('data', (x) => prompt += x); process.stdin.on(
   assert(readableCodex.includes(marker));
   const codexAttacks = [
     `cat ${quote(codexAuthFile)}`,
-    `cat ${quote(`${credentialHome}/.codex/status.json`)}`,
+    `cat ${quote(`${credentialHome}/codex/status.json`)}`,
     `${fromSupervisor} cat /proc/${process.pid}/root${codexAuthFile}`,
-    `ln -s ${quote(`${credentialHome}/.codex`)} stolen-codex; cat stolen-codex/auth.json`,
+    `ln -s ${quote(`${credentialHome}/codex`)} stolen-codex; cat stolen-codex/auth.json`,
     `node -e 'require("fs").readFileSync(${JSON.stringify(codexAuthFile)})'`,
     'env | grep -i -E "codex_home|openai" && exit 0 || exit 1',
   ];
@@ -361,6 +373,33 @@ let prompt = ''; process.stdin.on('data', (x) => prompt += x); process.stdin.on(
     assert(!fs.existsSync(`${work}/codex-flag-ran`));
   }
   results.push('Codex: API-key, access-token, signed-out and unreadable logins and caller-chosen sandbox, provider, MCP or profile options fail closed; readiness stays sanitized');
+  // A hooks file in CODEX_HOME is refused even though hooks are switched off.
+  const hooksFile = `${credentialHome}/codex/hooks.json`;
+  execFileSync('/usr/bin/setpriv', ['--reuid', String(claudeUid), '--regid', String(claudeUid), '--clear-groups', '/bin/sh', '-c', `echo '{}' > ${quote(hooksFile)}`]);
+  assert.equal(await service.authStatus('codex'), 'unavailable');
+  assert.equal((await codexRun(['touch codex-hooks-ran'])).code, 125);
+  assert(!fs.existsSync(`${work}/codex-hooks-ran`));
+  fs.rmSync(hooksFile);
+  results.push('Codex: a hooks file in CODEX_HOME stops Codex before it starts');
+
+  // B2: root never follows a link the credential identity planted in its own storage.
+  await service.close(); service = undefined;
+  const target = `${fixture}/root-target`;
+  fs.mkdirSync(target); fs.chmodSync(target, 0o755);
+  const asCredential = (command) => execFileSync('/usr/bin/setpriv', ['--reuid', String(claudeUid), '--regid', String(claudeUid), '--clear-groups', '/bin/sh', '-c', command]);
+  asCredential(`mv ${quote(`${credentialHome}/codex`)} ${quote(`${credentialHome}/codex-real`)} && ln -s ${quote(target)} ${quote(`${credentialHome}/codex`)}`);
+  await assert.rejects(startService(config, socketPath, () => {}), /private directory/);
+  assert.equal(fs.statSync(target).uid, 0);
+  assert.equal(fs.statSync(target).mode & 0o777, 0o755);
+  asCredential(`rm ${quote(`${credentialHome}/codex`)} && mv ${quote(`${credentialHome}/codex-real`)} ${quote(`${credentialHome}/codex`)}`);
+  // The lock is taken as the credential identity: a planted link cannot make root create or open a file.
+  asCredential(`rm -f ${quote(`${credentialHome}/.updraft-worker.lock`)} && ln -s ${quote(`${target}/created-by-root`)} ${quote(`${credentialHome}/.updraft-worker.lock`)}`);
+  await assert.rejects(startService(config, socketPath, () => {}), /leased|lock/);
+  assert(!fs.existsSync(`${target}/created-by-root`));
+  asCredential(`rm ${quote(`${credentialHome}/.updraft-worker.lock`)}`);
+  service = await startService(config, socketPath, () => {});
+  assert.equal(await service.authStatus('codex'), 'connected');
+  results.push("root does not follow links the credential identity plants: a linked CODEX_HOME stops startup with the target unchanged, and the lock cannot create a file through a link");
   const later = `${work}/orphan-ran`;
   await request(argv(['/bin/sh', '-c', `echo started; sleep 2; touch ${quote(later)}`]), '', (text, socket) => { if (text.includes('started')) socket.destroy(); });
   await pause(2500);

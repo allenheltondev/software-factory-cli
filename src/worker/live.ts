@@ -33,7 +33,7 @@ import {
 import { agentProfile, describeProfile, effectiveArgs } from '../agents/profile.js';
 import { checkNativeClaudeAuth, nativeClaudeAuthHint, type NativeAuthRunner } from '../agents/native-claude-auth.js';
 import { checkNativeCodexAuth, nativeCodexAuthHint, type NativeCodexAuthRunner } from '../agents/native-codex-auth.js';
-import { CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem } from '../agents/native-codex-args.js';
+import { CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem, codexSubscriptionEnvProblem } from '../agents/native-codex-args.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
 import { baseCheckSection, renderPrompt, renderRevisionPrompt, type BaseCheckPrompt, type IssueContext } from '../agents/prompt.js';
 import { dependencyMergedSection, dependencyProtocolSection, MAX_DEPENDENCY_WAITS, readDependency } from '../agents/dependency.js';
@@ -772,7 +772,7 @@ export class LiveExecutor implements Executor {
       if (adapterName !== 'codex' || agentCfg.container) {
         throw new StartFailedError('native-codex authentication requires a host-native Codex CLI');
       }
-      const problem = codexSubscriptionArgProblem(effectiveArgs(adapterName, agentCfg));
+      const problem = codexSubscriptionArgProblem(effectiveArgs(adapterName, agentCfg)) ?? codexSubscriptionEnvProblem(agentCfg.env);
       if (problem) throw new StartFailedError(`native-codex profile cannot run on the ChatGPT subscription: ${problem}`);
       const auth = await checkNativeCodexAuth(located.launch, lookup.env, this.opts.nativeCodexAuth);
       if (auth.state !== 'connected') {

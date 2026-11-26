@@ -31,7 +31,17 @@ node -e 'const fs=require("fs");const p="/etc/updraft-native-worker.json";const 
 codex_auth=/usr/local/lib/node_modules/@allenheltondev/updraft/dist/agents/native-codex-auth.js
 if command -v codex >/dev/null 2>&1; then
   [ -f "$codex_auth" ] || { echo 'Installed Updraft lacks the Codex sign-in classifier; build from the current npm pack tarball' >&2; exit 1; }
-  node -e 'const fs=require("fs");const p="/etc/updraft-native-worker.json";const c=JSON.parse(fs.readFileSync(p));c.codex=fs.realpathSync(process.argv[1]);c.codexAuthModule=fs.realpathSync(process.argv[2]);fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n");' "$(command -v codex)" "$codex_auth"
+  # Record the official native executable, found the way the npm wrapper (bin/codex.js) finds it,
+  # so the supervisor runs and trust-checks the binary itself, never the wrapper's module lookup.
+  node -e '
+const fs=require("fs"),path=require("path");
+const triple={x64:"x86_64-unknown-linux-musl",arm64:"aarch64-unknown-linux-musl"}[process.arch];
+const pkg={x64:"@openai/codex-linux-x64",arm64:"@openai/codex-linux-arm64"}[process.arch];
+const root=path.dirname(path.dirname(fs.realpathSync(process.argv[1])));
+let vendor;try{vendor=path.join(path.dirname(require.resolve(pkg+"/package.json",{paths:[root]})),"vendor");}catch{vendor=path.join(root,"vendor");}
+const bin=fs.realpathSync(path.join(vendor,triple,"bin","codex"));
+const p="/etc/updraft-native-worker.json";const c=JSON.parse(fs.readFileSync(p));
+c.codex=bin;c.codexAuthModule=fs.realpathSync(process.argv[2]);fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n");' "$(command -v codex)" "$codex_auth"
 fi
 printf '{"image":"native-claude-worker"}\n' > /etc/updraft-native-sandbox.json
 printf '#!/bin/sh\nexec /usr/local/bin/node /opt/updraft/native-worker/runtime.mjs "$@"\n' > /opt/updraft/bin/updraft-native-worker

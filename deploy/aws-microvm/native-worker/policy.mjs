@@ -136,20 +136,53 @@ export function claudeArgs(input, mcpConfig, { egress = false } = {}) {
 }
 
 /**
+ * Codex features switched off for every isolated session (codex-rs/features/src/lib.rs at
+ * openai/codex 8727186). Audit: every feature that is on by default and adds a model-visible tool,
+ * a tool or MCP call path, an extra MCP server (the ChatGPT `codex_apps` connectors, plugins),
+ * sub-agents, hooks, browser or computer use, image generation or an approval reviewer; plus the
+ * off-by-default ones that would add such a tool if a later release turned them on. Infrastructure
+ * flags (MCP startup, compression, retries, TUI) stay as they are. `--strict-config` makes a key the
+ * pinned CLI does not know fail the run instead of being ignored, so a renamed feature fails closed.
+ */
+export const CODEX_DISABLED_FEATURES = [
+  // On by default.
+  'shell_tool', 'unified_exec', 'unified_exec_tty', 'shell_snapshot', 'view_image', 'sleep_tool', 'code_mode_host', 'hooks',
+  'multi_agent', 'apps', 'tool_suggest', 'plugins', 'remote_plugin', 'plugin_sharing', 'in_app_browser', 'in_app_local_automation',
+  'browser_use', 'browser_use_full_cdp_access', 'browser_use_external', 'computer_use', 'image_generation', 'skill_mcp_dependency_install',
+  'goals', 'tool_call_mcp_elicitation', 'auth_elicitation', 'guardian_approval', 'workspace_dependencies',
+  // Off by default, pinned off.
+  'multi_agent_v2', 'code_mode', 'code_mode_only', 'standalone_web_search', 'web_search_request', 'web_search_cached',
+  'web_search_indexed_default', 'request_permissions_tool', 'exec_permission_approvals', 'memories', 'recommended_plugins',
+  'agent_message_board', 'agent_message_board_mcp', 'enable_mcp_apps', 'deferred_executor', 'send_message_to_user_async',
+  'artifact', 'statsig_gates',
+];
+
+/**
  * The official Codex CLI (docs/codex-subscription.md), restricted the way claudeArgs restricts
- * Claude: started outside the repository with none of its own configuration, rules, hooks or
- * project files, its built-in shell, exec, image and web-search tools switched off, its own
- * sandbox read-only with no approvals (a second layer should a built-in tool ever remain), only
- * the CLI-owned ChatGPT login on the OpenAI provider, and one MCP server whose one tool runs
- * every repository command in the job sandbox. Option names are those of codex-rs (openai/codex:
- * exec/src/cli.rs, config/src/config_toml.rs, features/src/lib.rs). `mcp` is { command, args }.
- * Updraft's adapter flags (--json, the bypass default, the subscription overrides) are consumed;
- * only a model and a reasoning effort pass through. Anything else is refused.
+ * Claude. Prevention first: started outside the repository with none of its own configuration,
+ * rules or project files (`--ignore-user-config --ignore-rules`, private cwd), every tool-adding
+ * feature off (CODEX_DISABLED_FEATURES, under `--strict-config`), no web search, no updates, and
+ * one MCP server limited to its one tool, which runs every repository command in the job sandbox.
+ * Second layer: its own sandbox read-only with no approvals, so a built-in tool that remained
+ * could neither write nor reach the network. Third: checkCodexEvent ends the session on any other
+ * item. Only the CLI-owned ChatGPT login on the OpenAI provider and the official backend are used.
+ * Codex models are still offered `apply_patch` (it comes from model metadata, with no supported
+ * switch): the read-only sandbox refuses it and the gate ends the session, so the instructions
+ * tell the model to change files only through the tool. Option names are those of codex-rs
+ * (exec/src/cli.rs, config/src/config_toml.rs, config/src/mcp_types.rs, features/src/lib.rs).
+ * `mcp` is { command, args }. Updraft's adapter flags (--json, the bypass default, the subscription
+ * overrides) are consumed; only a model and a reasoning effort pass through. Anything else is refused.
  */
 export const CODEX_SERVER = 'updraft';
 export const CODEX_TOOL = 'exec';
+export const CHATGPT_BASE_URL = 'https://chatgpt.com/backend-api/';
 const toml = (value) => JSON.stringify(value);
 const PROFILE_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+/** The provider and login pins every Codex command on the worker gets (status, sign-in and runs). */
+export const CODEX_LOGIN_PINS = ['-c', 'cli_auth_credentials_store="file"', '-c', 'forced_login_method="chatgpt"', '-c', `chatgpt_base_url=${toml(CHATGPT_BASE_URL)}`];
+export function codexInstructions(egress = false) {
+  return `Use only the ${CODEX_SERVER} MCP server's ${CODEX_TOOL} tool for repository work: reading, searching, editing and creating files (write them with shell commands such as cat, printf, sed or a script), git and tests. Never use apply_patch or any other built-in tool; they are disabled, and trying one ends the session. The tool starts each command in the job worktree. ${networkNote(egress)} Commit changes when the task requires it.`;
+}
 export function codexArgs(input, mcp, { egress = false } = {}) {
   if (input[0] !== 'exec') throw new Error('native worker runs only codex exec');
   const safe = [];
@@ -166,7 +199,7 @@ export function codexArgs(input, mcp, { egress = false } = {}) {
     }
     if (flag === '-c' || flag === '--config') {
       const spec = input[++i];
-      if (spec === 'model_provider="openai"' || spec === 'forced_login_method="chatgpt"') continue;
+      if (['model_provider="openai"', 'forced_login_method="chatgpt"', `chatgpt_base_url=${toml(CHATGPT_BASE_URL)}`].includes(spec)) continue;
       const effort = /^model_reasoning_effort="([a-z]{1,16})"$/.exec(spec ?? '');
       if (!effort) throw new Error('unsupported Codex configuration in isolated worker');
       safe.push('-c', `model_reasoning_effort=${toml(effort[1])}`);
@@ -175,24 +208,24 @@ export function codexArgs(input, mcp, { egress = false } = {}) {
     throw new Error('unsupported Codex option in isolated worker');
   }
   if (!json) throw new Error('only headless JSONL runs are supported');
-  const instructions = `Use only the ${CODEX_SERVER} MCP server's ${CODEX_TOOL} tool for repository work, including reading, editing, git and tests. The tool starts each command in the job worktree. ${networkNote(egress)} Commit changes when the task requires it.`;
-  return ['exec', '--json', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only',
-    '-c', 'approval_policy="never"', '-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"', '-c', 'cli_auth_credentials_store="file"',
-    '-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false', '-c', 'features.view_image=false', '-c', 'web_search="disabled"',
-    '-c', 'check_for_update_on_startup=false',
+  return ['exec', '--json', '--strict-config', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only',
+    '-c', 'approval_policy="never"', '-c', 'model_provider="openai"', ...CODEX_LOGIN_PINS,
+    ...CODEX_DISABLED_FEATURES.flatMap((name) => ['-c', `features.${name}=false`]),
+    '-c', 'web_search="disabled"', '-c', 'check_for_update_on_startup=false',
     '-c', `mcp_servers.${CODEX_SERVER}.command=${toml(mcp.command)}`, '-c', `mcp_servers.${CODEX_SERVER}.args=${toml(mcp.args)}`,
     '-c', `mcp_servers.${CODEX_SERVER}.required=true`, '-c', `mcp_servers.${CODEX_SERVER}.enabled_tools=${toml([CODEX_TOOL])}`,
     '-c', `mcp_servers.${CODEX_SERVER}.default_tools_approval_mode="approve"`,
-    '-c', `developer_instructions=${toml(instructions)}`, ...safe];
+    '-c', `developer_instructions=${toml(codexInstructions(egress))}`, ...safe];
 }
 
 /**
- * The Codex counterpart of checkInventory. `codex exec --json` announces no tool list up front,
- * so the supervisor judges every event instead: a turn may only think, talk, keep its to-do list
- * and call the one Updraft tool. Any other item (a built-in command, file change, web search,
- * collaboration call, or a type this code does not know) means a tool other than ours is in
- * reach, and the whole session is killed before anything else it says is relayed. Returns true
- * once the thread has started (tool calls are served only after that).
+ * The Codex counterpart of checkInventory, and the second line behind the switches above.
+ * `codex exec --json` announces no tool list up front, so the supervisor judges every event: a
+ * turn may only think, talk, keep its to-do list and call the one Updraft tool. Any other item (a
+ * built-in command, file change, web search, collaboration call, or a type this code does not know)
+ * ends the whole session before it is relayed. This sees only what exec reports: it cannot catch an
+ * item kind exec drops or a sub-agent's events, which is why the features are switched off first.
+ * Returns true once the thread has started (tool calls are served only after that).
  */
 const CODEX_EVENTS = ['thread.started', 'turn.started', 'turn.completed', 'turn.failed', 'error'];
 const CODEX_ITEMS = ['agent_message', 'reasoning', 'todo_list', 'error'];
@@ -204,6 +237,28 @@ export function checkCodexEvent(event) {
   if (item && CODEX_ITEMS.includes(item.type)) return false;
   if (item?.type === 'mcp_tool_call' && item.server === CODEX_SERVER && item.tool === CODEX_TOOL) return false;
   throw new Error('Codex used a tool other than the isolated one; isolation rejected');
+}
+
+/**
+ * Error text as it leaves the worker: the CLI's error messages can quote a URL, an account or a
+ * token-like value, so only a bounded first line with those replaced is relayed (stderr never is).
+ * Enough is kept for Updraft to recognize a usage limit (src/capacity/usage-limit.ts).
+ */
+export function sanitizeCodexText(text) {
+  if (typeof text !== 'string') return '';
+  const line = text.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? '';
+  const clean = line
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>')
+    .replace(/[\w.+-]+@[\w-]+(\.[\w-]+)+/g, '<email>')
+    .replace(/[A-Za-z0-9_\-+/=.]{24,}/g, '<redacted>')
+    .replace(/[^\x20-\x7e]/g, '');
+  return clean.length > 300 ? `${clean.slice(0, 299)}…` : clean;
+}
+export function sanitizeCodexEvent(event) {
+  if (event.type === 'error') return { type: 'error', message: sanitizeCodexText(event.message) };
+  if (event.type === 'turn.failed') return { type: 'turn.failed', error: { message: sanitizeCodexText(event.error?.message) } };
+  if (event.item?.type === 'error') return { ...event, item: { id: event.item.id, type: 'error', message: sanitizeCodexText(event.item.message) } };
+  return event;
 }
 
 export function checkInventory(event) {
@@ -256,6 +311,9 @@ export function loadConfig(file) {
   for (const key of ['codex', 'codexAuthModule']) {
     if (c[key] !== undefined && (typeof c[key] !== 'string' || !path.isAbsolute(c[key]) || fs.realpathSync(c[key]) !== c[key])) throw new Error('worker paths must be canonical absolute paths');
   }
+  // The native binary itself (install.sh resolves it from the platform package), not the npm
+  // wrapper script, which would pick the binary from module resolution at every launch.
+  if (c.codex !== undefined && /\.[cm]?js$/.test(c.codex)) throw new Error('codex must be the official native executable, not the npm wrapper');
   for (const key of ['claude', 'sandboxConfig', 'authModule', ...(c.codex ? ['codex', 'codexAuthModule'] : [])]) trustedFile(c[key]);
   const home = fs.statSync(c.credentialHome);
   if (!home.isDirectory() || home.uid !== c.claudeUid || (home.mode & 0o077)) throw new Error('credential home must be private to the Claude account');
@@ -273,11 +331,13 @@ export function claudeEnv(c) {
 }
 
 /**
- * The Codex CLI's environment: the same private credential home, with the CLI's own state (its
- * ChatGPT login in auth.json, which only the CLI reads and refreshes) in CODEX_HOME beneath it.
- * Nothing inherited, so no API key, token or endpoint override can reach it.
+ * The Codex CLI's environment: its own 0700 home inside the credential storage, used as both
+ * HOME and CODEX_HOME (its ChatGPT login is auth.json there, which only the CLI reads and
+ * refreshes), so Codex never starts in Claude's home. Both CLIs still run as the one credential
+ * identity; a separate identity per CLI is a follow-up (docs/codex-subscription.md). Nothing is
+ * inherited, so no API key, token, CA, proxy or endpoint override can reach it.
  */
-export const codexHome = (c) => `${c.credentialHome}/.codex`;
+export const codexHome = (c) => `${c.credentialHome}/codex`;
 export function codexEnv(c) {
-  return { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: c.credentialHome, CODEX_HOME: codexHome(c) };
+  return { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: codexHome(c), CODEX_HOME: codexHome(c) };
 }

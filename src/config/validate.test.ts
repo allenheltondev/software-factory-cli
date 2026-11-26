@@ -40,6 +40,8 @@ describe('validateConfig', () => {
     expect(errorsOf((a) => { a.args = ['-c', 'model_provider="azure"']; })).toContainEqual({ path: 'agents.codex.args', message: expect.stringMatching(/model_provider/) });
     expect(errorsOf((a) => { a.args = ['--profile', 'api']; })).toContainEqual({ path: 'agents.codex.args', message: expect.stringMatching(/--profile/) });
     expect(errorsOf((a) => { a.env = { OPENAI_API_KEY: 'sk-test' }; })).toContainEqual({ path: 'agents.codex.env.OPENAI_API_KEY', message: expect.stringMatching(/ChatGPT sign-in/) });
+    expect(errorsOf((a) => { a.env = { SSL_CERT_FILE: '/tmp/ca.pem' }; })).toContainEqual({ path: 'agents.codex.env.SSL_CERT_FILE', message: expect.stringMatching(/ChatGPT sign-in/) });
+    expect(errorsOf((a) => { a.env = { CODEX_HOME: '/tmp/codex' }; })).toContainEqual({ path: 'agents.codex.env', message: expect.stringMatching(/CODEX_HOME/) });
   });
 
   it('accepts the shipped example and applies defaults', () => {

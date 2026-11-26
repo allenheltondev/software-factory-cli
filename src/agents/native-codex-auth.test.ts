@@ -6,7 +6,7 @@ import {
   nativeCodexAuthFromStatus,
   nativeCodexAuthHint,
 } from './native-codex-auth.js';
-import { CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem } from './native-codex-args.js';
+import { CODEX_SUBSCRIPTION_ARGS, codexSubscriptionArgProblem, codexSubscriptionEnvProblem } from './native-codex-args.js';
 
 const status = (output: string, code: number | null = 0) => ({ code, output });
 
@@ -51,7 +51,8 @@ describe('native Codex (Sign in with ChatGPT) status, without inspecting credent
   });
 
   it.each(['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN', 'OPENAI_BASE_URL', 'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_FEDERATION_RULE_ID',
-    'CODEX_REFRESH_TOKEN_URL_OVERRIDE', 'CODEX_AUTHAPI_BASE_URL', 'openai_api_key'])(
+    'CODEX_REFRESH_TOKEN_URL_OVERRIDE', 'CODEX_AUTHAPI_BASE_URL', 'openai_api_key',
+    'CODEX_CA_CERTIFICATE', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'])(
     'treats %s as an override, whatever the CLI says', (name) => {
       expect(hasCodexAuthOverride({ [name]: 'SECRET_DO_NOT_LOG' })).toBe(true);
       expect(nativeCodexAuthFromStatus(status('Logged in using ChatGPT'), { [name]: 'SECRET_DO_NOT_LOG' }))
@@ -61,6 +62,8 @@ describe('native Codex (Sign in with ChatGPT) status, without inspecting credent
 
   it('ignores empty override variables and unrelated names', () => {
     expect(hasCodexAuthOverride({ OPENAI_API_KEY: '', CODEX_HOME: '/x', ANTHROPIC_API_KEY: 'other provider', PATH: '/bin' })).toBe(false);
+    // A proxy alone cannot read TLS traffic while only the system roots are trusted.
+    expect(hasCodexAuthOverride({ HTTPS_PROXY: 'http://proxy:3128', ALL_PROXY: 'http://proxy:3128' })).toBe(false);
   });
 
   it('does not start the CLI when an override is present, and treats a throwing probe as unknown', async () => {
@@ -108,7 +111,15 @@ describe('native Codex profile arguments', () => {
     expect(codexSubscriptionArgProblem(['--model', 'gpt-5-codex', '-c', 'model_reasoning_effort="high"', '--sandbox', 'workspace-write'])).toBeNull();
   });
 
-  it('forces the built-in OpenAI provider and a ChatGPT-only login', () => {
-    expect([...CODEX_SUBSCRIPTION_ARGS]).toEqual(['-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"']);
+  it('refuses a profile env that moves CODEX_HOME', () => {
+    expect(codexSubscriptionEnvProblem({ CODEX_HOME: '/elsewhere' })).toContain('CODEX_HOME');
+    expect(codexSubscriptionEnvProblem({ codex_home: '/elsewhere' })).toContain('codex_home');
+    expect(codexSubscriptionEnvProblem({ FOO: '1' })).toBeNull();
+    expect(codexSubscriptionEnvProblem(undefined)).toBeNull();
+  });
+
+  it('forces the built-in OpenAI provider, a ChatGPT-only login and the official backend', () => {
+    expect([...CODEX_SUBSCRIPTION_ARGS]).toEqual(['-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"',
+      '-c', 'chatgpt_base_url="https://chatgpt.com/backend-api/"']);
   });
 });
