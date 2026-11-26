@@ -7,11 +7,14 @@ import { createGitHubFlows } from '../flows/github.js';
 import type { GitHubApi } from '../github/client.js';
 import type { AppSettings } from '../github/settings.js';
 import { createMemoryStore, type Store, type Tenant } from '../store/store.js';
+import { createAgentKeyService } from './agent-key-service.js';
+import type { SecretsPort } from './agent-keys.js';
 import { createConfigService, type ObjectStore } from './config-service.js';
-import { defaultConsoleConfig } from './console.js';
+import { defaultConsoleConfig, type ConsoleConfig } from './console.js';
 import { decideDispatch } from './dispatch.js';
 import { configPrefix, SOURCE_FILE } from './paths.js';
 import { publishTenantConfig } from './publish.js';
+import fixture from './fixtures/console-samples.json' with { type: 'json' };
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const SETTINGS: AppSettings = {
@@ -70,6 +73,8 @@ let failPuts: boolean;
 /** Holds uploads into config/<version>/ until released: two publishes interleaved, as in the #83 review. */
 let gates: Map<number, Promise<void>>;
 let app: ReturnType<typeof createApp>;
+/** Agent key values as Secrets Manager would hold them (write-only to the console). */
+let secrets: Map<string, string>;
 
 /** A response, as far as the assertions read it. */
 interface Body {
@@ -115,6 +120,8 @@ beforeEach(async () => {
     },
   };
   const flows = createGitHubFlows({ store, github, loadSettings: async () => SETTINGS, now: () => NOW });
+  secrets = new Map();
+  const secretsPort: SecretsPort = { put: async (n, v) => void secrets.set(n, v), remove: async (n) => void secrets.delete(n) };
   app = createApp({
     resolveCaller: (c) => {
       const sub = c.req.header('x-test-sub');
@@ -122,6 +129,8 @@ beforeEach(async () => {
     },
     github: flows,
     config: createConfigService({ store, github: flows, objects: port, now: () => NOW }),
+    // The key routes as deployed (membership through the config context); every key the provider accepts.
+    agentKeys: createAgentKeyService({ store, github: flows, secrets: secretsPort, check: async () => 'valid', now: () => NOW }),
     logError: () => {},
   });
 });
@@ -472,7 +481,9 @@ describe('history', () => {
     );
     expect(adminVersion).toMatchObject({ ok: true, version: 1 });
     const defaults = defaultConsoleConfig({ offered: ['codex'], login: 'ivy' });
-    const codexOnly = { ...defaults, repositories: { 'globex/app': repo() } };
+    // Codex alone codes and reviews: the person opts in to self-review, which the defaults never do.
+    const implement = defaults.workflows.implement!;
+    const codexOnly = { ...defaults, workflows: { implement: { ...implement, review: { ...implement.review, allowSameAgent: true } } }, repositories: { 'globex/app': repo() } };
     expect(await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/publish', { config: codexOnly, baseVersion: 1 })).toMatchObject({ status: 200, body: { version: 2 } });
 
     const res = await call({ sub: 'sub-ivy' }, 'POST', '/installations/77/config/versions/1/reactivate', {});
@@ -520,5 +531,243 @@ describe('history', () => {
     await store.activateConfig(55, 2);
     await publish(settings({ 'acme/api': repo() }), { baseVersion: 2 });
     expect(await call(PAT, 'POST', '/installations/55/config/versions/2/reactivate', {})).toMatchObject({ status: 409, body: { error: 'not_reactivatable' } });
+  });
+});
+
+/*
+ * #193: what the role-oriented configuration page relies on, asserted on what the server compiles
+ * and stores. The settings are those of fixtures/console-samples.json, which the page's own tests
+ * (app/src/pages/config.test.tsx) load, preview and publish through the page.
+ */
+const SAMPLES = fixture.samples as unknown as Record<string, ConsoleConfig>;
+const TWO_PROVIDERS = fixture.twoProviders as unknown as { start: ConsoleConfig; published: ConsoleConfig };
+const SAM: Caller = { sub: 'sub-sam' };
+const KEYS = { ANTHROPIC: 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123', KIRO: 'ksk_abcdefghijklmnopqrstuvwxyz0123456789' };
+
+/** A version's files as jobs read them (config.yaml, prompts/), by name. */
+const bundle = (version: number) =>
+  Object.fromEntries(
+    [...objects]
+      .filter(([k]) => k.startsWith(configPrefix(55, version)) && !k.endsWith(SOURCE_FILE))
+      .map(([k, v]) => [k.slice(configPrefix(55, version).length), v]),
+  );
+const loadConfig = async (caller: Caller = PAT) => (await call(caller, 'GET', '/installations/55/config')).body as unknown as { config: ConsoleConfig; agentKeys: Record<string, boolean>; source: string; activeVersion: number | null; notices: string[]; tenant: { role: string } };
+const preview = async (config: unknown, caller: Caller = PAT) => (await call(caller, 'POST', '/installations/55/config/preview', { config })).body;
+const putKey = (name: string, value: string, caller: Caller = PAT) => call(caller, 'PUT', `/installations/55/agent-keys/${name}`, { value });
+const keyList = async () => (await call(PAT, 'GET', '/installations/55/agent-keys')).body.keys as { name: string; configured: boolean; lastUsed?: { ok: boolean } }[];
+const rulesOf = async (version: number) => (await store.getConfigVersion(55, version))!.dispatch;
+/** The agent keys a job started by this label in this repository is handed (jobs/launch.ts takes them from the decision). */
+const jobKeys = async (version: number, repository: string, id: number, label: string) => {
+  const d = decideDispatch(await rulesOf(version), { repositoryFullName: repository, repositoryId: id, label, sender: 'pat' });
+  return d.start ? d.keys : d.reason;
+};
+interface CompiledYaml {
+  agents: Record<string, { adapter?: string; model?: string; effort?: string }>;
+  pools: Record<string, { agents: string[] }>;
+  repositories: Record<string, { review?: unknown; workflows: { id?: string; trigger: { label: string }; action: string; pool: string; reviewPool?: string; tiers?: unknown }[] }>;
+}
+const yamlOf = (text: string | undefined) => parse(text ?? '') as CompiledYaml;
+
+describe('no-op round trip of published settings (#193)', () => {
+  // Workflow ids, profile and pool names jobs and pull requests in flight are resolved by.
+  const ids: Record<string, Record<string, string[]>> = {
+    simple: { 'acme/web': ['implement'] },
+    labels: { 'acme/web': ['implement', 'art', 'docs'], 'acme/api': ['implement-api', 'art'] },
+    // An upgraded workflow keeps the id its first-console version had (`<v1 workflow>:<label>`; acme/api's copy of the action has its own checks).
+    advanced: { 'acme/web': ['implement:ready', 'docs', 'chore'], 'acme/api': ['implement.2:ready'] },
+  };
+
+  it.each(Object.keys(SAMPLES))('%s: loaded, previewed and published again with no edit compiles byte for byte the same, ids and names included', async (name) => {
+    const sample = SAMPLES[name]!;
+    const first = await preview(sample);
+    expect(first).toMatchObject({ ok: true });
+    expect(await publish(sample, { baseVersion: null, confirmAutoMerge: true })).toMatchObject({ status: 200, body: { ok: true, version: 1 } });
+
+    const loaded = await loadConfig();
+    expect(loaded).toMatchObject({ source: 'console', activeVersion: 1, notices: [] });
+    // The settings come back exactly as saved: the same names, values and order.
+    expect(JSON.stringify(loaded.config)).toBe(JSON.stringify(sample));
+    expect((await preview(loaded.config)).yaml).toBe(first.yaml);
+    expect(await publish(loaded.config, { baseVersion: 1 })).toMatchObject({ status: 200, body: { ok: true, version: 2 } });
+
+    // Every file of the bundle jobs read is the same text, and so are the stored dispatch rules.
+    expect(bundle(1)['config.yaml']).toBe(first.yaml);
+    expect(bundle(2)).toEqual(bundle(1));
+    expect(Object.keys(bundle(2)).length).toBeGreaterThan(1);
+    expect((await store.getConfigVersion(55, 2))!.sha256).toBe((await store.getConfigVersion(55, 1))!.sha256);
+    expect(await rulesOf(2)).toEqual(await rulesOf(1));
+
+    const yaml = yamlOf(bundle(2)['config.yaml']);
+    expect(Object.keys(yaml.agents)).toEqual(Object.keys(sample.agents));
+    // Settings upgraded from the first console also keep their legacy pool names, for work in flight.
+    expect(Object.keys(yaml.pools)).toEqual([...Object.keys(sample.pools), ...Object.keys(sample.legacy?.pools ?? {})]);
+    for (const [repo, list] of Object.entries(ids[name]!)) expect(yaml.repositories[repo]!.workflows.map((w) => w.id ?? `${w.action}:${w.trigger.label}`)).toEqual(list);
+  });
+
+  it('keeps explicit models and efforts, the review requirement, auto-merge, actor restrictions and prompts as they were set', async () => {
+    const sample = SAMPLES.labels!;
+    await publish(sample, { baseVersion: null, confirmAutoMerge: true });
+    await publish((await loadConfig()).config, { baseVersion: 1 });
+    const yaml = yamlOf(bundle(2)['config.yaml']);
+    expect(yaml.agents.claude).toMatchObject({ model: 'claude-opus-5-5', effort: 'high' });
+    expect(yaml.agents.codex).toMatchObject({ effort: 'medium' });
+    expect(yaml.agents.codex!.model).toBeUndefined();
+    expect(yaml.repositories['acme/web']).toMatchObject({ review: { acceptance: 'enforce' }, maxRevisions: 2, autoMerge: 'squash', autoMergeRequiredChecks: ['test'], ciFix: true });
+    expect(yaml.repositories['acme/web']!.workflows.every((w) => JSON.stringify((w as { allowedActors?: string[] }).allowedActors) === '["sam"]')).toBe(true);
+    expect(bundle(2)['prompts/implement.md']).toBe('# Implement the issue, our way');
+    expect(bundle(2)['prompts/implement.review.md']).toBe('# Review against our style guide');
+    expect(bundle(2)['prompts/art.md']).toBe('# Draw the assets the issue asks for');
+  });
+
+  it('a tenant-admin version with tiers is not converted by the editor, and re-activating it compiles its tiers unchanged', async () => {
+    const tiers = { pools: { routine: 'general', standard: 'general', complex: 'deep' }, minConfidence: 0.7, escalation: { maxHops: 2 } };
+    await publishTenantConfig(
+      {
+        installationId: 55,
+        submission: {
+          config: {
+            dispatch: { allowedActors: ['pat'] },
+            agents: { claude: {}, 'claude-deep': { adapter: 'claude', model: 'claude-opus-5-5', effort: 'high' } },
+            pools: { general: { agents: ['claude'] }, deep: { agents: ['claude-deep'] } },
+            actions: { go: { prompt: './prompts/go.md' } },
+            repositories: { 'acme/web': { workflows: [{ id: 'go', trigger: { event: 'issue.labeled', label: 'go' }, action: 'go', pool: 'general', tiers }] } },
+          },
+          prompts: { 'go.md': '# Go' },
+        },
+        platform: { appId: 4242 },
+        repositoryIds: new Map([['acme/web', 99]]),
+        publishedBy: 'admin:ops',
+      },
+      { store, putObject: async (k, b) => void objects.set(k, b), now: () => NOW },
+    );
+    expect(yamlOf(bundle(1)['config.yaml']).repositories['acme/web']!.workflows[0]).toMatchObject({ id: 'go', pool: 'general', tiers });
+    // The editor cannot show tiers: it says so and starts from the defaults, and never rewrites the version.
+    const loaded = await loadConfig();
+    expect(loaded).toMatchObject({ source: 'tenant', activeVersion: 1 });
+    expect(JSON.stringify(loaded.config)).not.toContain('tiers');
+
+    await publish(settings(), { baseVersion: 1 });
+    expect((await call(PAT, 'POST', '/installations/55/config/versions/1/reactivate', {})).body).toMatchObject({ ok: true, version: 3 });
+    expect(bundle(3)).toEqual(bundle(1));
+    expect(yamlOf(bundle(3)['config.yaml']).repositories['acme/web']!.workflows[0]!.tiers).toEqual(tiers);
+  });
+});
+
+describe('manual models and efforts (#193)', () => {
+  const withClaude = (agent: Record<string, unknown>) => {
+    const s = settings();
+    return { ...s, agents: { ...s.agents, claude: { adapter: 'claude', enabled: true, ...agent } } };
+  };
+
+  it('a model or effort that is not a valid value is refused at its field, in a preview and a publish, and nothing is published', async () => {
+    expect(await preview(withClaude({ model: 'claude opus' }))).toEqual({
+      ok: false,
+      errors: [{ path: 'agents.claude.model', message: 'a model name: letters, digits, ".", "_", ":", "/" or "-"' }],
+      warnings: [],
+    });
+    expect((await preview(withClaude({ effort: 'very high' }))).errors).toEqual([{ path: 'agents.claude.effort', message: 'an effort level, such as low, medium or high' }]);
+    expect(await publish(withClaude({ model: 'claude opus', effort: 'very high' }), { baseVersion: null })).toMatchObject({
+      status: 400,
+      body: { errors: [{ path: 'agents.claude.model' }, { path: 'agents.claude.effort' }] },
+    });
+    expect((await store.getTenant(55))?.activeConfigVersion).toBeUndefined();
+    expect(objects.size).toBe(0);
+  });
+
+  it('valid manual values are compiled as given; Automatic (none) leaves the provider default', async () => {
+    expect(await publish(withClaude({ model: 'claude-sonnet-5-5', effort: 'high' }), { baseVersion: null })).toMatchObject({ status: 200, body: { version: 1 } });
+    const yaml = yamlOf(bundle(1)['config.yaml']);
+    expect(yaml.agents.claude).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high' });
+    expect(yaml.agents.codex!.model).toBeUndefined();
+    expect(yaml.agents.codex!.effort).toBeUndefined();
+  });
+});
+
+describe('connections and the team (#193)', () => {
+  it('two providers code and a distinct review team reviews: the compiled config routes exactly that', async () => {
+    await store.putAgentKeyMeta(55, { name: 'KIRO_API_KEY', updatedAt: '2026-11-20T00:00:00.000Z', updatedBy: 'pat' });
+    // What the page starts from is the server's own default for an installation with only Kiro connected.
+    const d = defaultConsoleConfig({ offered: ['claude', 'codex', 'kiro'], login: 'pat', keys: new Set(['KIRO_API_KEY']) });
+    const prompts = TWO_PROVIDERS.start.workflows.implement!;
+    expect(TWO_PROVIDERS.start).toEqual({
+      ...d,
+      workflows: { implement: { ...d.workflows.implement!, prompt: prompts.prompt, review: { ...d.workflows.implement!.review, prompt: prompts.review.prompt }, revise: { ...d.workflows.implement!.revise, prompt: prompts.revise.prompt } } },
+    });
+
+    // What the page publishes once Claude Code and Codex are connected and chosen (config.test.tsx).
+    expect(await publish(TWO_PROVIDERS.published, { baseVersion: null })).toMatchObject({ status: 200, body: { ok: true, version: 1 } });
+    const yaml = yamlOf(bundle(1)['config.yaml']);
+    expect(Object.keys(yaml.agents)).toEqual(['claude', 'codex', 'kiro']);
+    expect(yaml.pools).toEqual({ builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['kiro'] } });
+    expect(yaml.repositories['acme/web']!.workflows).toEqual([expect.objectContaining({ id: 'implement', trigger: { event: 'issue.labeled', label: 'updraft' }, pool: 'builders', reviewPool: 'reviewers' })]);
+    expect(await jobKeys(1, 'acme/web', 99, 'updraft')).toEqual(['ANTHROPIC_API_KEY', 'CODEX_API_KEY', 'KIRO_API_KEY']);
+  });
+
+  it('saving a key on its own changes neither the compiled config nor the keys a job receives', async () => {
+    const sample = SAMPLES.simple!;
+    await publish(sample, { baseVersion: null });
+    const before = await loadConfig();
+    expect(before.agentKeys.KIRO_API_KEY).toBe(false);
+    expect(await jobKeys(1, 'acme/web', 99, 'updraft')).toEqual(['ANTHROPIC_API_KEY', 'CODEX_API_KEY']);
+
+    expect(await putKey('KIRO_API_KEY', KEYS.KIRO)).toMatchObject({ status: 200 });
+    const after = await loadConfig();
+    expect(after.agentKeys.KIRO_API_KEY).toBe(true);
+    // The draft is the published settings, unchanged: Kiro is not put in any team.
+    expect(JSON.stringify(after.config)).toBe(JSON.stringify(before.config));
+    expect((await preview(after.config)).yaml).toBe(bundle(1)['config.yaml']);
+    // The active version still hands jobs the same keys, and so does the same settings published again.
+    expect(await jobKeys(1, 'acme/web', 99, 'updraft')).toEqual(['ANTHROPIC_API_KEY', 'CODEX_API_KEY']);
+    await publish(after.config, { baseVersion: 1 });
+    expect(bundle(2)).toEqual(bundle(1));
+    expect(await jobKeys(2, 'acme/web', 99, 'updraft')).toEqual(['ANTHROPIC_API_KEY', 'CODEX_API_KEY']);
+  });
+
+  it('a key whose last use failed stays stale until it is saved again; reconnecting clears it and changes no setting', async () => {
+    await publish(SAMPLES.simple!, { baseVersion: null });
+    await store.recordAgentKeyUse(55, 'ANTHROPIC_API_KEY', { at: '2026-11-20T01:00:00.000Z', ok: false, jobStartedAt: '2026-11-20T00:30:00.000Z' });
+    expect((await keyList()).find((k) => k.name === 'ANTHROPIC_API_KEY')).toMatchObject({ configured: true, lastUsed: { ok: false } });
+    const before = await loadConfig();
+
+    expect(await putKey('ANTHROPIC_API_KEY', KEYS.ANTHROPIC)).toMatchObject({ status: 200 });
+    const reconnected = (await keyList()).find((k) => k.name === 'ANTHROPIC_API_KEY')!;
+    expect(reconnected.configured).toBe(true);
+    // The failure belonged to the old key: the new one has not been used yet, so nothing is failing.
+    expect(reconnected.lastUsed).toBeUndefined();
+    expect(JSON.stringify((await loadConfig()).config)).toBe(JSON.stringify(before.config));
+    expect((await store.getTenant(55))?.activeConfigVersion).toBe(1);
+  });
+});
+
+describe('owner and member permissions (#193)', () => {
+  beforeEach(async () => {
+    // Sam is an editor (a member who is not an owner) of acme's installation.
+    await store.link(SAM.sub, { githubUserId: 4, githubLogin: 'sam', linkedAt: '2026-11-20T00:00:00.000Z' });
+    await store.putTenantWithMember(tenant(55, 'acme'), { installationId: 55, sub: SAM.sub, role: 'editor', githubUserId: 4, githubLogin: 'sam', addedAt: '2026-11-20T00:00:00.000Z' });
+  });
+
+  it('the configuration and its keys are a member\'s, not only an owner\'s: both load, preview, publish and save keys', async () => {
+    expect((await loadConfig(PAT)).tenant.role).toBe('owner');
+    expect((await loadConfig(SAM)).tenant.role).toBe('editor');
+    expect(await preview(settings(), SAM)).toMatchObject({ ok: true });
+
+    expect(await publish(settings(), { baseVersion: null }, PAT)).toMatchObject({ status: 200, body: { version: 1 } });
+    expect(await publish(settings({ 'acme/web': repo(), 'acme/api': repo() }), { baseVersion: 1 }, SAM)).toMatchObject({ status: 200, body: { version: 2 } });
+    expect(await store.getConfigVersion(55, 2)).toMatchObject({ publishedBy: 'sam' });
+    expect((await call(SAM, 'POST', '/installations/55/config/versions/1/reactivate', {})).body).toMatchObject({ ok: true, version: 3 });
+
+    expect(await putKey('ANTHROPIC_API_KEY', KEYS.ANTHROPIC, PAT)).toMatchObject({ status: 200 });
+    expect(await putKey('KIRO_API_KEY', KEYS.KIRO, SAM)).toMatchObject({ status: 200 });
+    expect((await store.listAgentKeyMeta(55)).find((k) => k.name === 'KIRO_API_KEY')).toMatchObject({ updatedBy: 'sam' });
+  });
+
+  it('a non-member can neither publish nor save a key, and an installation that is not active takes a publish from no one', async () => {
+    expect(await putKey('KIRO_API_KEY', KEYS.KIRO, EVE)).toMatchObject({ status: 403, body: { error: 'not_authorized' } });
+    expect(await publish(settings(), { baseVersion: null }, EVE)).toMatchObject({ status: 403, body: { error: 'not_authorized' } });
+    expect(secrets.size).toBe(0);
+
+    await store.setSuspended(55, true);
+    for (const who of [PAT, SAM]) expect(await publish(settings(), { baseVersion: null }, who)).toMatchObject({ status: 409, body: { error: 'tenant_disabled' } });
+    expect(await store.listConfigVersions(55)).toEqual([]);
   });
 });

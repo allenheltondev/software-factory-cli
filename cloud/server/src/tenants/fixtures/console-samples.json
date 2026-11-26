@@ -1,0 +1,493 @@
+{
+  "$comment": "Console settings as published by the configuration page (#193), shared by the server's round-trip tests (config-service.test.ts) and the page's (app/src/pages/config.test.tsx). Installation 55 reaches acme/web and acme/api and has the Claude and Codex keys.",
+  "samples": {
+    "simple": {
+      "version": 2,
+      "agents": {
+        "claude": {
+          "adapter": "claude",
+          "enabled": true
+        },
+        "codex": {
+          "adapter": "codex",
+          "enabled": true
+        }
+      },
+      "pools": {
+        "builders": {
+          "agents": [
+            "claude",
+            "codex"
+          ]
+        },
+        "reviewers": {
+          "agents": [
+            "claude",
+            "codex"
+          ]
+        }
+      },
+      "allowedActors": [
+        "pat"
+      ],
+      "workflows": {
+        "implement": {
+          "label": "updraft",
+          "pool": "builders",
+          "prompt": "# Implement the issue",
+          "review": {
+            "enabled": true,
+            "pool": "reviewers",
+            "prompt": "# Review the PR",
+            "allowSameAgent": false
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise the PR"
+          }
+        }
+      },
+      "repositories": {
+        "acme/web": {
+          "enabled": true,
+          "workflows": [
+            "implement"
+          ],
+          "publish": "draft-pr",
+          "commentOnFailure": true,
+          "verify": []
+        }
+      }
+    },
+    "labels": {
+      "version": 2,
+      "agents": {
+        "claude": {
+          "adapter": "claude",
+          "model": "claude-opus-5-5",
+          "effort": "high",
+          "enabled": true
+        },
+        "codex": {
+          "adapter": "codex",
+          "effort": "medium",
+          "enabled": true
+        }
+      },
+      "pools": {
+        "builders": {
+          "agents": [
+            "claude",
+            "codex"
+          ]
+        },
+        "reviewers": {
+          "agents": [
+            "claude",
+            "codex"
+          ]
+        },
+        "art-coding": {
+          "agents": [
+            "codex"
+          ]
+        },
+        "art-review": {
+          "agents": [
+            "claude"
+          ]
+        },
+        "implement-api-coding": {
+          "agents": [
+            "claude"
+          ]
+        },
+        "implement-api-review": {
+          "agents": [
+            "codex"
+          ]
+        }
+      },
+      "allowedActors": [
+        "pat",
+        "sam"
+      ],
+      "workflows": {
+        "implement": {
+          "label": "ready",
+          "pool": "builders",
+          "prompt": "# Implement the issue, our way",
+          "timeoutMinutes": 45,
+          "review": {
+            "enabled": true,
+            "pool": "reviewers",
+            "prompt": "# Review against our style guide",
+            "allowSameAgent": false,
+            "acceptance": "enforce"
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise, keeping the diff small",
+            "maxRevisions": 2
+          }
+        },
+        "art": {
+          "label": "art",
+          "pool": "art-coding",
+          "prompt": "# Draw the assets the issue asks for",
+          "review": {
+            "enabled": true,
+            "pool": "art-review",
+            "prompt": "# Review the assets",
+            "allowSameAgent": false,
+            "acceptance": "enforce"
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise the assets",
+            "maxRevisions": 2
+          }
+        },
+        "docs": {
+          "label": "docs",
+          "pool": "builders",
+          "prompt": "# Write the docs",
+          "review": {
+            "enabled": true,
+            "pool": "reviewers",
+            "prompt": "# Review the docs",
+            "allowSameAgent": false,
+            "acceptance": "enforce"
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise the docs",
+            "maxRevisions": 2
+          }
+        },
+        "implement-api": {
+          "label": "ready",
+          "pool": "implement-api-coding",
+          "prompt": "# Implement the issue, our way",
+          "timeoutMinutes": 45,
+          "review": {
+            "enabled": true,
+            "pool": "implement-api-review",
+            "prompt": "# Review against our style guide",
+            "allowSameAgent": false,
+            "acceptance": "enforce"
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise, keeping the diff small",
+            "maxRevisions": 2
+          }
+        }
+      },
+      "repositories": {
+        "acme/web": {
+          "enabled": true,
+          "workflows": [
+            "implement",
+            "art",
+            "docs"
+          ],
+          "allowedActors": [
+            "sam"
+          ],
+          "publish": "pr",
+          "commentOnFailure": true,
+          "verify": [
+            "npm ci",
+            "npm test"
+          ],
+          "verifyTimeoutMinutes": 20,
+          "autoMerge": {
+            "method": "squash",
+            "requiredChecks": [
+              "test"
+            ]
+          },
+          "ci": {}
+        },
+        "acme/api": {
+          "enabled": true,
+          "workflows": [
+            "implement-api",
+            "art"
+          ],
+          "baseBranch": "dev",
+          "publish": "draft-pr",
+          "commentOnFailure": false,
+          "verify": [
+            "make test"
+          ],
+          "notifications": "verbose",
+          "suggestions": "follow-up"
+        }
+      }
+    },
+    "advanced": {
+      "version": 2,
+      "agents": {
+        "claude": {
+          "adapter": "claude",
+          "enabled": true
+        },
+        "claude-fast": {
+          "adapter": "claude",
+          "model": "claude-haiku-5-5",
+          "effort": "low",
+          "enabled": true
+        },
+        "codex": {
+          "adapter": "codex",
+          "model": "gpt-5.5-codex",
+          "enabled": true
+        }
+      },
+      "pools": {
+        "builders": {
+          "agents": [
+            "claude",
+            "codex"
+          ]
+        },
+        "reviewers": {
+          "agents": [
+            "codex",
+            "claude"
+          ]
+        },
+        "fast": {
+          "agents": [
+            "claude-fast"
+          ]
+        }
+      },
+      "allowedActors": [
+        "pat",
+        "sam"
+      ],
+      "workflows": {
+        "implement": {
+          "label": "ready",
+          "pool": "builders",
+          "prompt": "# Implement the issue",
+          "timeoutMinutes": 90,
+          "review": {
+            "enabled": true,
+            "pool": "reviewers",
+            "prompt": "# Review the PR",
+            "allowSameAgent": false,
+            "acceptance": "report"
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise the PR",
+            "maxRevisions": 4
+          }
+        },
+        "docs": {
+          "label": "docs",
+          "pool": "fast",
+          "prompt": "# Write the docs",
+          "review": {
+            "enabled": true,
+            "pool": "reviewers",
+            "prompt": "# Review the docs",
+            "allowSameAgent": false,
+            "acceptance": "report"
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise the docs",
+            "maxRevisions": 4
+          }
+        },
+        "chore": {
+          "label": "chore",
+          "pool": "fast",
+          "prompt": "# Do the chore",
+          "timeoutMinutes": 15,
+          "review": {
+            "enabled": true,
+            "pool": "reviewers",
+            "prompt": "# Review the chore",
+            "allowSameAgent": false,
+            "acceptance": "report"
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise the chore",
+            "maxRevisions": 4
+          }
+        }
+      },
+      "repositories": {
+        "acme/web": {
+          "enabled": true,
+          "workflows": [
+            "implement",
+            "docs",
+            "chore"
+          ],
+          "allowedActors": [
+            "pat",
+            "sam"
+          ],
+          "publish": "draft-pr",
+          "commentOnFailure": true,
+          "verify": [
+            "npm ci && npm test"
+          ],
+          "autoMerge": {
+            "method": "rebase",
+            "waitMinutes": 30
+          },
+          "ci": {
+            "checks": [
+              "build"
+            ],
+            "ignore": [
+              "preview"
+            ]
+          }
+        },
+        "acme/api": {
+          "enabled": false,
+          "workflows": [
+            "implement"
+          ],
+          "publish": "draft-pr",
+          "commentOnFailure": true,
+          "verify": []
+        }
+      },
+      "legacy": {
+        "pools": {
+          "implement": "builders",
+          "implement.review": "reviewers"
+        },
+        "workflows": {
+          "implement": "implement"
+        }
+      }
+    }
+  },
+  "twoProviders": {
+    "$comment": "A new installation that offers Claude Code, Codex and Kiro with only the Kiro key set (defaultConsoleConfig, with these prompts), and what the page publishes once Claude Code and Codex are connected and chosen to code, Kiro to review, in acme/web.",
+    "start": {
+      "version": 2,
+      "agents": {
+        "claude": {
+          "adapter": "claude",
+          "enabled": false
+        },
+        "codex": {
+          "adapter": "codex",
+          "enabled": false
+        },
+        "kiro": {
+          "adapter": "kiro",
+          "enabled": true
+        }
+      },
+      "pools": {
+        "builders": {
+          "agents": [
+            "kiro"
+          ]
+        },
+        "reviewers": {
+          "agents": [
+            "kiro"
+          ]
+        }
+      },
+      "allowedActors": [
+        "pat"
+      ],
+      "workflows": {
+        "implement": {
+          "label": "updraft",
+          "pool": "builders",
+          "prompt": "# Implement the issue",
+          "review": {
+            "enabled": true,
+            "pool": "reviewers",
+            "prompt": "# Review the PR",
+            "allowSameAgent": false
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise the PR"
+          }
+        }
+      },
+      "repositories": {}
+    },
+    "published": {
+      "version": 2,
+      "agents": {
+        "claude": {
+          "adapter": "claude",
+          "enabled": true
+        },
+        "codex": {
+          "adapter": "codex",
+          "enabled": true
+        },
+        "kiro": {
+          "adapter": "kiro",
+          "enabled": true
+        }
+      },
+      "pools": {
+        "builders": {
+          "agents": [
+            "claude",
+            "codex"
+          ]
+        },
+        "reviewers": {
+          "agents": [
+            "kiro"
+          ]
+        }
+      },
+      "allowedActors": [
+        "pat"
+      ],
+      "workflows": {
+        "implement": {
+          "label": "updraft",
+          "pool": "builders",
+          "prompt": "# Implement the issue",
+          "review": {
+            "enabled": true,
+            "pool": "reviewers",
+            "prompt": "# Review the PR",
+            "allowSameAgent": false
+          },
+          "revise": {
+            "enabled": true,
+            "prompt": "# Revise the PR"
+          }
+        }
+      },
+      "repositories": {
+        "acme/web": {
+          "enabled": true,
+          "workflows": [
+            "implement"
+          ],
+          "publish": "draft-pr",
+          "commentOnFailure": true,
+          "verify": [],
+          "ci": {}
+        }
+      }
+    }
+  }
+}
