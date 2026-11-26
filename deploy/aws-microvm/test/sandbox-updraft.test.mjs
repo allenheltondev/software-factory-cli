@@ -303,17 +303,18 @@ describe.runIf(sandbox.usable)('git in the sandbox, in a clone the worker made',
     expect(result.stderr, result.diagnosis).toBe('');
   });
 
-  it.skipIf(!reftable)(`deletes refs too, with a git that has reftable: git stash pop and git branch -d work${reftable ? '' : ' (SKIPPED: this git has no reftable)'}`, async () => {
+  it.skipIf(!reftable)(`deletes refs too, with a git that has reftable: git branch -d and git update-ref -d work${reftable ? '' : ' (SKIPPED: this git has no reftable)'}`, async () => {
     fixture = createGitFixture('octo/widgets');
-    const result = await inSandbox(fixture, 'echo changed > README.md && git stash -q && git stash pop -q && git branch -q scratch && git branch -q -d scratch && git stash list | wc -l && echo done');
-    expect(result.stdout, result.diagnosis).toMatch(/^0\ndone\n$/);
+    const result = await inSandbox(fixture, 'git branch -q scratch && git branch -q -d scratch && git update-ref refs/tags/t HEAD && git update-ref -d refs/tags/t && git show-ref --verify --quiet refs/heads/scratch; echo "gone=$?"');
+    expect(result.stdout, result.diagnosis).toBe('gone=1\n');
     expect(result.stderr, result.diagnosis).toBe('');
   });
 
   it('(the same commit with git\'s automatic gc on is what warned)', async () => {
     fixture = createGitFixture('octo/widgets');
     // A low threshold, so that this commit's loose objects start gc as a big one would.
-    const result = await inSandbox(fixture, COMMIT_MANY, [['gc.auto', '1'], ['maintenance.auto', 'true']]);
+    // In the foreground, so that what it prints reaches the agent's output (newer git detaches it).
+    const result = await inSandbox(fixture, COMMIT_MANY, [['gc.auto', '1'], ['maintenance.auto', 'true'], ['gc.autoDetach', 'false'], ['maintenance.autoDetach', 'false']]);
     expect(result.stdout, result.diagnosis).toContain('committed');
     expect(result.stderr, result.diagnosis).toMatch(/Read-only file system/);
   });

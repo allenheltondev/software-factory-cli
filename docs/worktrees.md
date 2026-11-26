@@ -65,7 +65,7 @@ It is there because the other ways do not work in a container: there, the clone'
 directory is read-only apart from what a commit writes ([Isolation](isolation.md#the-git-directory)),
 so in a clone with the files ref store `git stash pop` and deleting a branch fail with
 `packed-refs.lock: Read-only file system` (a clone the worker makes uses reftable where Git has
-it, which avoids that), and checking out another commit would change the working tree that
+it, which avoids that for deletions), and checking out another commit would change the working tree that
 becomes the pull request.
 
 In `live` mode the routed agent then runs in the worktree; see
