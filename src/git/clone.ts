@@ -26,6 +26,12 @@ import { isGitRepo, runGit as defaultRunGit, type GitOptions, type GitOutput } f
 /** Marks a clone `ensureClone` created; a clone carrying it is always fetched with the worker's credentials. */
 export const MANAGED_CLONE_KEY = 'updraft.managedClone';
 
+/** Set in a clone ensureClone creates; see there. */
+export const MANAGED_CLONE_CONFIG: ReadonlyArray<readonly [string, string]> = [
+  ['gc.auto', '0'],
+  ['maintenance.auto', 'false'],
+];
+
 type RunGit = (args: readonly string[], opts: GitOptions) => Promise<GitOutput>;
 
 export class CloneError extends Error {
@@ -85,6 +91,11 @@ export async function ensureClone(req: EnsureCloneRequest): Promise<EnsuredClone
   await run(['init', '--quiet'], opts);
   await run(['remote', 'add', 'origin', req.cloneUrl], opts);
   await run(['config', '--local', MANAGED_CLONE_KEY, 'true'], opts);
+  // No automatic housekeeping. A contained agent commits through a git directory whose top
+  // level is read-only (src/worker/container.ts, gitMounts), and the gc that `git commit` may
+  // start packs refs there: it fails, with a "packed-refs.lock: Read-only file system" warning
+  // in the agent's output. This clone lives as long as its machine, so nothing needs collecting.
+  for (const [key, value] of MANAGED_CLONE_CONFIG) await run(['config', '--local', key, value], opts);
   return { created: true, managed: true };
 }
 

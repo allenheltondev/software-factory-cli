@@ -40,7 +40,16 @@ describe('ensureClone', { timeout: 60_000 }, () => {
     };
     expect(await ensureClone({ checkoutPath, cloneUrl: githubCloneUrl(FULL), runGit: recording })).toEqual({ created: true, managed: true });
 
-    expect(seen.map((s) => s.args.join(' '))).toEqual(['init --quiet', `remote add origin https://github.com/${FULL}.git`, `config --local ${MANAGED_CLONE_KEY} true`]);
+    expect(seen.map((s) => s.args.join(' '))).toEqual([
+      'init --quiet',
+      `remote add origin https://github.com/${FULL}.git`,
+      `config --local ${MANAGED_CLONE_KEY} true`,
+      'config --local gc.auto 0',
+      'config --local maintenance.auto false',
+    ]);
+    // No automatic gc, whose ref packing a contained agent's commit would trigger in a read-only git directory.
+    expect(f.git(checkoutPath, 'config', '--get', 'gc.auto')).toBe('0');
+    expect(f.git(checkoutPath, 'config', '--get', 'maintenance.auto')).toBe('false');
     // No credentials are involved in creating it: none in argv, none in the environment, none in a file.
     expect(seen.every((s) => s.opts.env === undefined)).toBe(true);
     expect(f.git(checkoutPath, 'remote', 'get-url', 'origin')).toBe(`https://github.com/${FULL}.git`);

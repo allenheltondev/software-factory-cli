@@ -5,6 +5,7 @@
 // which the agent and the verify command try to reach.
 //
 // Runs where bwrap can build a sandbox (sandbox-host.mjs says why when it cannot).
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
@@ -20,10 +21,13 @@ import { worktreesRoot } from '../../../src/git/worktree.ts';
 import { resolvePaths } from '../../../src/paths.ts';
 import { silentLogger } from '../../../src/util/log.ts';
 import { LiveExecutor } from '../../../src/worker/live.ts';
+import { baseCheckRoot } from '../../../src/worker/base-check.ts';
+import { buildContainerRunArgs, worktreeMounts } from '../../../src/worker/container.ts';
+import { MANAGED_CLONE_CONFIG } from '../../../src/git/clone.ts';
 import { SANDBOX_IMAGE } from '../image/runner/isolation.mjs';
-import { installRuntime, sandboxAvailability } from './sandbox-host.mjs';
+import { installRuntime, requireUnlessAllowedToSkip, sandboxAvailability } from './sandbox-host.mjs';
 
-const sandbox = process.platform === 'win32' ? { usable: false, reason: 'needs Linux' } : sandboxAvailability();
+const sandbox = requireUnlessAllowedToSkip(process.platform === 'win32' ? { usable: false, reason: 'needs Linux' } : sandboxAvailability());
 const API_KEY = 'sk-test-0123456789';
 
 /**
@@ -149,6 +153,139 @@ describe.runIf(sandbox.usable)('Updraft container mode with the sandbox runtime'
     expect(report.ppidVisible).toBe(false);
     // Outside, nothing changed.
     expect(fs.readFileSync(stateFile, 'utf8')).toBe('state the agent must not change');
+  });
+});
+
+/**
+ * The "agent" of the base checkout test: changes README.md and commits, then does what the
+ * prompt says to check a failure against the base, and reports what it could and could not do.
+ */
+const BASE_CHECK_AGENT = `
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+const attempt = (f) => { try { f(); return 'ok'; } catch (e) { return e.code || String(e.message); } };
+process.stdin.resume();
+process.stdin.on('end', () => {
+  fs.writeFileSync('README.md', 'changed by the agent\\n');
+  const commit = execFileSync('git', ['commit', '--quiet', '-am', 'agent: change the readme'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const base = process.env.UPDRAFT_BASE_DIR;
+  const scratch = process.env.UPDRAFT_SCRATCH_DIR;
+  const copy = path.join(scratch, 'base');
+  const report = {
+    base, scratch,
+    baseFiles: fs.readdirSync(base).sort(),
+    baseReadme: fs.readFileSync(path.join(base, 'README.md'), 'utf8'),
+    writeBase: attempt(() => fs.writeFileSync(path.join(base, 'README.md'), 'tampered')),
+    createInBase: attempt(() => fs.writeFileSync(path.join(base, 'new-file'), 'x')),
+    copy: attempt(() => fs.cpSync(base, copy, { recursive: true })),
+    writeCopy: attempt(() => fs.writeFileSync(path.join(copy, 'node_modules-stand-in'), 'installed')),
+    commitOutput: commit,
+  };
+  console.log('base-check report: ' + JSON.stringify(report));
+});
+`;
+
+describe.runIf(sandbox.usable)('the base checkout, in the sandbox', { timeout: 120_000 }, () => {
+  it('lets the agent read the base commit and work on a copy in scratch, never write the base, and leaves the job branch alone', async () => {
+    fixture = createGitFixture('octo/widgets');
+    const f = fixture;
+    const paths = resolvePaths({ env: { UPDRAFT_HOME: path.join(f.root, 'job home') } });
+    fs.mkdirSync(path.join(paths.configDir, 'prompts'), { recursive: true });
+    fs.writeFileSync(path.join(paths.configDir, 'prompts', 'implement.md'), 'Implement the issue below. Commit your work.\n');
+    const tools = path.join(f.root, 'tools');
+    fs.mkdirSync(tools);
+    fs.writeFileSync(path.join(tools, 'base-check-agent.cjs'), BASE_CHECK_AGENT);
+    const runtime = installRuntime(path.join(f.root, 'runtime'), { readOnlyBinds: [tools] });
+    const config = configSchema.parse({
+      version: 1,
+      execution: { mode: 'live' },
+      agents: {
+        claude: {
+          command: process.execPath,
+          args: [path.join(tools, 'base-check-agent.cjs')],
+          env: { GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'A', GIT_AUTHOR_EMAIL: 'a@example.com', GIT_COMMITTER_NAME: 'A', GIT_COMMITTER_EMAIL: 'a@example.com' },
+          container: { image: SANDBOX_IMAGE, runtime: runtime.path },
+        },
+      },
+      pools: { general: { agents: ['claude'] } },
+      actions: { 'implement-issue': { prompt: './prompts/implement.md', timeoutMinutes: 2 } },
+      dispatch: { allowedActors: ['allen'] },
+      repositories: {
+        'octo/widgets': {
+          id: 42,
+          checkoutPath: path.relative(paths.configDir, f.clone),
+          remote: 'origin',
+          workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
+        },
+      },
+    });
+    db = openDatabase(':memory:');
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 8 });
+    const c = claimNextJob(db, config, { workerId: 'wrk_test', hostname: hostname(), leaseSeconds: 60, runsDir: paths.runsDir });
+    const result = await new LiveExecutor({ env: process.env, locate: () => { throw new Error('host discovery for a contained agent'); } }).execute(c, {
+      config,
+      paths,
+      log: silentLogger,
+      signal: new globalThis.AbortController().signal,
+      now: Date.now,
+      recordProcess: (info) => setRunProcess(db, c.run.id, info),
+    });
+    const log = fs.readFileSync(c.run.logPath, 'utf8');
+    expect(result, log).toMatchObject({ outcome: 'succeeded', summary: { commitCount: 1 } });
+    const report = JSON.parse(/base-check report: (.*)/.exec(log)[1]);
+    const root = baseCheckRoot(paths.dataDir, c.run.id);
+    expect(report).toMatchObject({
+      base: path.join(root, 'base'),
+      scratch: path.join(root, 'scratch'),
+      // The base commit's files, without git metadata, and not the agent's change.
+      baseFiles: ['README.md'],
+      baseReadme: '# widgets\n',
+      writeBase: 'EROFS',
+      createInBase: 'EROFS',
+      copy: 'ok',
+      writeCopy: 'ok',
+      commitOutput: '',
+    });
+    // The commit printed no read-only git warning, and nothing else did either.
+    expect(log).not.toMatch(/Read-only file system|packed-refs\.lock/);
+    // The job branch got the agent's commit; the base checkout is gone with the run.
+    const worktree = path.join(worktreesRoot(paths), '42', c.job.id);
+    expect(fs.readFileSync(path.join(worktree, 'README.md'), 'utf8')).toBe('changed by the agent\n');
+    expect(f.git(worktree, 'status', '--porcelain')).toBe('');
+    expect(fs.existsSync(root)).toBe(false);
+  });
+});
+
+describe.runIf(sandbox.usable)('git in the sandbox, in a clone the worker made', { timeout: 120_000 }, () => {
+  /** Commit 3000 new files in a job worktree of the fixture clone, in the sandbox, with its mounts. */
+  function commitMany(f, config) {
+    for (const [key, value] of config) f.git(f.clone, 'config', '--local', key, value);
+    const worktree = path.join(f.root, 'job');
+    f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-1-job_t1', worktree, 'HEAD');
+    const runtime = installRuntime(path.join(f.root, 'runtime'));
+    const names = ['GIT_CONFIG_NOSYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+    const args = buildContainerRunArgs(
+      { file: '/bin/sh', args: ['-c', 'i=0; while [ $i -lt 3000 ]; do echo $i > f$i; i=$((i+1)); done; git add . && git commit -qm many && echo committed'] },
+      { image: SANDBOX_IMAGE, name: `gc-${process.pid}-${Date.now()}`, mounts: worktreeMounts(worktree), workdir: worktree, user: `${process.getuid()}:${process.getgid()}`, envNames: names, network: 'none' },
+    );
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'A', GIT_AUTHOR_EMAIL: 'a@example.com', GIT_COMMITTER_NAME: 'A', GIT_COMMITTER_EMAIL: 'a@example.com' };
+    return spawnSync(runtime.path, args, { env, encoding: 'utf8', timeout: 90_000 });
+  }
+
+  it('commits without a read-only git warning: no automatic gc tries to write the read-only git directory', () => {
+    fixture = createGitFixture('octo/widgets');
+    const result = commitMany(fixture, MANAGED_CLONE_CONFIG);
+    expect(result.stdout, result.stderr).toContain('committed');
+    expect(result.stderr).toBe('');
+  });
+
+  it('(the same commit with git\'s automatic gc on is what warned)', () => {
+    fixture = createGitFixture('octo/widgets');
+    // A low threshold, so that this commit's loose objects start gc as a big one would.
+    const result = commitMany(fixture, [['gc.auto', '1'], ['maintenance.auto', 'true']]);
+    expect(result.stdout, result.stderr).toContain('committed');
+    expect(result.stderr).toMatch(/Read-only file system/);
   });
 });
 

@@ -9,9 +9,11 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CONTAINER_HOME, buildContainerRunArgs, removeContainer, runRuntime, stopContainer } from '../../../src/worker/container.ts';
 import { EXIT_NOT_FOUND, EXIT_RUNTIME_FAILED, IMAGE_NAME, imageId, processStart } from '../image/sandbox/updraft-sandbox.mjs';
-import { installRuntime, networkNamespaceAvailability, sandboxAvailability } from './sandbox-host.mjs';
+import { REQUIRED, installRuntime, networkNamespaceAvailability, requireUnlessAllowedToSkip, sandboxAvailability } from './sandbox-host.mjs';
 
-const availability = sandboxAvailability();
+// With UPDRAFT_SANDBOX_TESTS=required (the CI job that installs bubblewrap) an unusable host
+// fails here instead of skipping the suite.
+const availability = requireUnlessAllowedToSkip(sandboxAvailability());
 const SECRET = 'TOP-SECRET-0f3a9c';
 
 let root;
@@ -211,12 +213,13 @@ describe.skipIf(!availability.usable)(`updraft-sandbox, started for real${availa
   it('shows no process of the outside, and cannot signal one', async () => {
     const outside = spawn('sleep', ['300'], { stdio: 'ignore' });
     started.push(outside);
-    const result = sh(`echo "pids=$(ls /proc | grep -c '^[0-9][0-9]*$')"; echo "self=$$"; kill -0 ${outside.pid} 2>/dev/null; echo "signal=$?"; cat /proc/1/comm; grep -c sleep /proc/[0-9]*/comm 2>/dev/null | grep -v ':0' ; echo "end"; hostname`);
+    const result = sh(`echo "pids=$(ls /proc | grep -c '^[0-9][0-9]*$')"; echo "self=$$"; kill -0 ${outside.pid} 2>/dev/null; echo "signal=$?"; cat /proc/1/comm; grep -c sleep /proc/[0-9]*/comm 2>/dev/null | grep -v ':0' ; echo "end"; cat /proc/sys/kernel/hostname`);
     const pids = Number(/pids=(\d+)/.exec(result.stdout)[1]);
     // bwrap's init, the shell, and the handful of commands of the script itself.
     expect(pids).toBeLessThan(8);
     expect(Number(/self=(\d+)/.exec(result.stdout)[1])).toBeLessThan(8);
     // Unless a process of the sandbox happens to have that number, there is nothing to signal.
+    // (The hostname is read from /proc: a minimal image, like the microVM's, has no `hostname`.)
     if (outside.pid > 8) expect(result.stdout).toContain('signal=1');
     expect(result.stdout).toContain('bwrap\n');
     expect(result.stdout).toContain('updraft-sandbox\n');
@@ -282,7 +285,7 @@ describe.skipIf(!availability.usable)(`updraft-sandbox, started for real${availa
     expect(result.stdout).not.toContain(path.basename(root));
   });
 
-  const network = networkNamespaceAvailability();
+  const network = requireUnlessAllowedToSkip(networkNamespaceAvailability());
   it.skipIf(!network.usable)(`--network none takes the network away; without it the caller's loopback is reachable${network.usable ? '' : ` (SKIPPED: ${network.reason})`}`, () => {
     const isolated = sh('cat /proc/net/dev | grep -c -v -E "lo:|Inter|face"', { network: 'none' });
     expect(isolated.stdout.trim()).toBe('0');
@@ -367,12 +370,29 @@ describe.skipIf(!availability.usable)(`updraft-sandbox, started for real${availa
 // As a user that is not root, where this process is root and can become one: the uid the
 // command runs as is that user's, and root's files stay root's.
 const NOBODY = 65534;
-const canDropPrivileges = availability.usable && process.getuid?.() === 0;
+/**
+ * Can that user start Node.js at all? The runtime it calls is a copy of the script outside the
+ * checkout (the checkout often sits below a directory only its owner may enter, such as a home
+ * directory or a job directory), but this Node.js is the one it runs.
+ */
+function nodeRunsAs(uid) {
+  if (process.getuid?.() !== 0) return { usable: false, reason: 'needs root to switch user' };
+  const probe = spawnSync(process.execPath, ['-e', 'process.exit(0)'], { uid, gid: uid, cwd: '/', encoding: 'utf8', timeout: 30_000 });
+  if (probe.status === 0) return { usable: true };
+  return { usable: false, reason: `uid ${uid} cannot run ${process.execPath} (${probe.error?.message ?? (probe.stderr.trim() || `exit ${probe.status}`)})` };
+}
+const asNobody = availability.usable ? nodeRunsAs(NOBODY) : availability;
+// Required: a root caller on a usable host must run it. A caller that is not root cannot switch
+// user at all, which CI covers with a second, root run of this file.
+if (REQUIRED && process.getuid?.() === 0) requireUnlessAllowedToSkip(asNobody);
+const canDropPrivileges = asNobody.usable;
 
-describe.skipIf(!canDropPrivileges)(`updraft-sandbox as an unprivileged user${canDropPrivileges ? '' : ' (SKIPPED: needs root to switch user, and a usable sandbox)'}`, { timeout: 120_000 }, () => {
+describe.skipIf(!canDropPrivileges)(`updraft-sandbox as an unprivileged user${canDropPrivileges ? '' : ` (SKIPPED: ${asNobody.reason})`}`, { timeout: 120_000 }, () => {
   it('runs as that user, without root\'s files and without a way back', () => {
     // The runtime directory and the bound directory must be the user's own.
     fs.chmodSync(root, 0o755);
+    // A runtime whose script that user can read wherever this checkout is.
+    runtime = installRuntime(path.join(root, 'runtime-copy'), { copyScript: true });
     const home = path.join(root, 'job');
     const work = path.join(home, 'work');
     fs.mkdirSync(work, { recursive: true });

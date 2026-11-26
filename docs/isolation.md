@@ -93,6 +93,8 @@ directory, not the SSH agent socket, not the runtime's own socket.
 | `<clone>/.git/worktrees/<job>` | read-write | This worktree's `HEAD`, index and logs |
 | `commondir`, `gitdir`, `config.worktree` in that directory | read-only | See below |
 | Object stores listed in `objects/info/alternates` | read-only | Only for clones made with `--reference` or `--shared` |
+| `<state dir>/base-checks/<run>/base` | read-only | The files of the base commit, no git metadata; see [Checking a failure against the base commit](worktrees.md#checking-a-failure-against-the-base-commit) |
+| `<state dir>/base-checks/<run>/scratch` | read-write | Scratch space for running a test on a copy of the base. Removed with the run, like the base |
 | `prompt.md` of the run | read-only | Only for an adapter that passes the prompt by path. The built-in adapters use stdin, and then the run directory is not mounted at all |
 
 **User.** The container runs as the worker's own `uid:gid`, so files the agent creates in the
@@ -141,8 +143,17 @@ inside it. In particular these stay read-only:
 
 Ordinary work is unaffected: `git add`, `commit`, `checkout -b`, `stash`, `rebase`, `tag` and
 `reset` all work. Commands that rewrite files directly in the Git directory fail inside the
-container: `git gc`, `git pack-refs`, deleting a branch that is stored in `packed-refs`, and
-`git config` without `--global` (`--global` writes to the scratch home and works).
+container: `git gc`, `git pack-refs`, deleting a ref (`git branch -d`, `git stash pop` or
+`drop` of the last entry: Git locks `packed-refs` for every deletion), and `git config`
+without `--global` (`--global` writes to the scratch home and works). To compare a failure with
+the base commit an agent uses the run's base checkout instead
+([Checking a failure against the base commit](worktrees.md#checking-a-failure-against-the-base-commit)).
+
+A clone the worker creates itself (`updraft run-event`) has
+`gc.auto=0` and `maintenance.auto=false`: otherwise the automatic gc that `git commit` starts
+once there are enough loose objects tries to pack refs in the read-only directory, and the
+agent's commit prints `packed-refs.lock` (or `gc.pid.lock`) `Read-only file system` errors.
+A clone you made is left as you configured it.
 
 After the agent exits, the worker summarizes the run with `git diff` on the host, in a
 worktree whose contents the agent wrote. For a containerized run it tells Git not to look

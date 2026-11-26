@@ -14,6 +14,9 @@
 //   stubborn  like hang, but both processes ignore SIGTERM and SIGINT (POSIX escalation to SIGKILL)
 //   orphan    start a child process, write both pids to --pids-file, and exit 0 leaving the child
 //   env       print selected environment variables; exit 0
+//   base-check  commit a change to README.md, then check against the base commit as the prompt
+//             says: copy $UPDRAFT_BASE_DIR into $UPDRAFT_SCRATCH_DIR and print the copy's
+//             README.md and what is in the base directory; exit 0
 //   wait      find that the issue needs another repository's pull request first: commit
 //             nothing, explain, and end with "UPDRAFT-WAITING-ON: <--waiting-on>"; exit 0
 //   review    act as a reviewer: write REVIEW_NOTES.md and try to commit it (none of which may
@@ -30,7 +33,8 @@
 //             carries an earlier review all are verified. In success mode, --acceptance reports
 //             every listed criterion as implemented.
 import { execFileSync, spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, writeSync } from 'node:fs';
+import { cpSync, readdirSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
+import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 const opt = (name) => {
@@ -185,6 +189,18 @@ switch (mode) {
       default:
         line(verdict);
     }
+    process.exit(0);
+    break;
+  }
+  case 'base-check': {
+    writeFileSync('README.md', 'changed by the agent\n');
+    git('commit', '--quiet', '-am', 'fake agent: change the readme');
+    const base = process.env.UPDRAFT_BASE_DIR;
+    const scratch = process.env.UPDRAFT_SCRATCH_DIR;
+    say(`fake agent: base ${base} scratch ${scratch}`);
+    say(`fake agent: base holds ${JSON.stringify(readdirSync(base).sort())}`);
+    cpSync(base, join(scratch, 'base'), { recursive: true });
+    say(`fake agent: base README.md ${JSON.stringify(readFileSync(join(scratch, 'base', 'README.md'), 'utf8'))}`);
     process.exit(0);
     break;
   }

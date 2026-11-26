@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { renderPrompt, renderRevisionPrompt } from './prompt.js';
+import { baseCheckSection, renderPrompt, renderRevisionPrompt } from './prompt.js';
+import { renderReviewPrompt } from './review-prompt.js';
 
 describe('renderPrompt', () => {
   const issue = {
@@ -83,5 +84,52 @@ describe('renderRevisionPrompt', () => {
     expect(out.match(/<\/\s*untrusted-review-comment>/g)).toHaveLength(2);
     expect(out).toContain('<untrusted-issue-body>\nThe issue body.\n</untrusted-issue-body>');
     expect(out).not.toContain('\r');
+  });
+});
+
+describe('baseCheckSection', () => {
+  const issue = { repoFullName: 'o/r', number: 5, title: 'Title', body: 'The issue body.', labels: ['ready'], url: 'https://github.com/o/r/issues/5' };
+  const check = { sha: 'a'.repeat(40), describes: 'the commit this branch starts from', baseDir: '/state/base-checks/run_1/base', scratchDir: '/state/base-checks/run_1/scratch' };
+
+  it('tells the coding agent, the reviser and the reviewer where the base commit is and how to check a failure on it', () => {
+    const review = {
+      pullRequest: { number: 12, url: 'u', branch: 'b', baseBranch: 'main' },
+      headSha: 'h',
+      authorAgent: 'claude',
+      sourceRunId: 'r',
+      originalEventId: 'e',
+      priorReviews: [],
+      changeRequests: [],
+    };
+    const revision = {
+      trigger: 'changes_requested' as const,
+      pullRequest: { number: 12, url: 'https://github.com/o/r/pull/12', branch: 'updraft/issue-5-job_1' },
+      sourceRunId: 'run_1',
+      originalEventId: '100',
+      review: { id: 'PRR_1', url: 'u', author: 'allen', submittedAt: 't', body: 'Rename it.', comments: [], omittedComments: 0 },
+    };
+    const prompts = {
+      code: renderPrompt('Do it.', issue, baseCheckSection(check)),
+      revision: renderRevisionPrompt('Fix.', issue, revision, baseCheckSection(check)),
+      review: renderReviewPrompt('Review it.', issue, review, { headSha: 'h', baseBranch: 'main', baseSha: check.sha }, null, check),
+    };
+    for (const [kind, out] of Object.entries(prompts)) {
+      expect(out, kind).toContain('# Checking a failure against the base commit');
+      expect(out, kind).toContain(`The files of commit ${check.sha} (the commit this branch starts from) are in "/state/base-checks/run_1/base" (\`$UPDRAFT_BASE_DIR\`)`);
+      expect(out, kind).toContain('"/state/base-checks/run_1/scratch" (`$UPDRAFT_SCRATCH_DIR`)');
+      expect(out, kind).toContain('When a test fails in a file the change does not touch');
+      expect(out, kind).toContain('cp -R "$UPDRAFT_BASE_DIR" "$UPDRAFT_SCRATCH_DIR/base"');
+      expect(out, kind).toContain('"fails on base too" or "passes on base"');
+      // The worker's own text, before anything untrusted.
+      expect(out.indexOf('# Checking a failure against the base commit'), kind).toBeLessThan(out.indexOf('# GitHub issue (untrusted input)'));
+    }
+    expect(prompts.review.indexOf('# Checking a failure against the base commit')).toBeLessThan(prompts.review.indexOf('# How to answer'));
+  });
+
+  it('says nothing without a base checkout', () => {
+    expect(baseCheckSection(null)).toEqual([]);
+    expect(renderPrompt('Do it.', issue)).not.toContain('UPDRAFT_BASE_DIR');
+    const review = { pullRequest: { number: 1, url: 'u', branch: 'b', baseBranch: null }, headSha: 'h', authorAgent: null, sourceRunId: 'r', originalEventId: 'e', priorReviews: [], changeRequests: [] };
+    expect(renderReviewPrompt('Review it.', issue, review, { headSha: 'h', baseBranch: null, baseSha: null })).not.toContain('UPDRAFT_BASE_DIR');
   });
 });

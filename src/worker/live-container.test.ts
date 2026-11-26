@@ -17,6 +17,7 @@ import { claimNextJob, getJob, getRun, markExecutionStarted, setRunProcess, type
 import { worktreesRoot } from '../git/worktree.js';
 import { resolvePaths, type UpdraftPaths } from '../paths.js';
 import { silentLogger } from '../util/log.js';
+import { baseCheckRoot } from './base-check.js';
 import { CONTAINER_HOME } from './container.js';
 import { runDaemon } from './daemon.js';
 import { StartFailedError, type ExecutionContext } from './executor.js';
@@ -204,7 +205,12 @@ describe.skipIf(process.platform === 'win32')('LiveExecutor with agents.<name>.c
       [join(common, 'worktrees', c.job.id)]: 'rw',
       [join(common, 'worktrees', c.job.id, 'commondir')]: 'ro',
     });
-    for (const p of Object.keys(mounts)) expect(p === worktree || p.startsWith(`${worktree}/`) || p === common || p.startsWith(`${common}/`), p).toBe(true);
+    // And the base checkout (base-check.ts): the base commit's files read-only, a scratch directory read-write.
+    const baseCheck = baseCheckRoot(paths.dataDir, c.run.id);
+    expect(mounts).toMatchObject({ [join(baseCheck, 'base')]: 'ro', [join(baseCheck, 'scratch')]: 'rw' });
+    for (const p of Object.keys(mounts)) {
+      expect(p === worktree || p.startsWith(`${worktree}/`) || p === common || p.startsWith(`${common}/`) || p.startsWith(`${baseCheck}/`), p).toBe(true);
+    }
     expect(mounts[join(common, 'hooks')]).toBeUndefined();
     expect(mounts[join(common, 'config')]).toBeUndefined();
 
@@ -219,8 +225,13 @@ describe.skipIf(process.platform === 'win32')('LiveExecutor with agents.<name>.c
       'GIT_AUTHOR_EMAIL',
       'GIT_COMMITTER_NAME',
       'GIT_COMMITTER_EMAIL',
+      'UPDRAFT_BASE_DIR',
+      'UPDRAFT_SCRATCH_DIR',
     ]);
     expect(started!.env).toMatchObject({ FAKE_API_KEY: SECRET, FAKE_ADAPTER_ENV: 'from-adapter', GIT_AUTHOR_NAME: 'Fake Agent', HOME: CONTAINER_HOME });
+    expect(started!.env).toMatchObject({ UPDRAFT_BASE_DIR: join(baseCheck, 'base'), UPDRAFT_SCRATCH_DIR: join(baseCheck, 'scratch') });
+    // Removed with the run; the job branch's worktree was never touched by it.
+    expect(existsSync(baseCheck)).toBe(false);
     for (const withheld of ['GH_TOKEN', 'GITHUB_TOKEN', 'WORKER_ONLY', 'USER', 'SSH_AUTH_SOCK']) expect(started!.env).not.toHaveProperty(withheld);
     const log = readFileSync(c.run.logPath!, 'utf8');
     for (const text of [argv.join('\n'), log]) {
@@ -508,7 +519,8 @@ describe.skipIf(process.platform === 'win32')('verify commands of a containerize
     expect(second!.argv.slice(second!.argv.indexOf('runner:test'))).toEqual(['runner:test', '/bin/sh', '-c', 'exit 3']);
     for (const call of [first!, second!]) {
       expect(valuesOf(call.argv, '--workdir')).toEqual([worktree]);
-      expect(valuesOf(call.argv, '--mount')).toEqual(valuesOf(agent!.argv, '--mount'));
+      // The agent's mounts without its base checkout: the commands check the worktree.
+      expect(valuesOf(call.argv, '--mount')).toEqual(valuesOf(agent!.argv, '--mount').filter((m) => !m.includes('/base-checks/')));
       // Only the runtime's own options: the first command has a `-e` of its own after the image.
       expect(valuesOf(call.argv.slice(0, call.argv.indexOf('runner:test')), '-e')).toEqual([`HOME=${CONTAINER_HOME}`]);
       expect(call.env).not.toHaveProperty('FAKE_API_KEY');

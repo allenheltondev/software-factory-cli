@@ -133,6 +133,16 @@ jobs:
           sudo chown root:root /usr/local /usr/local/bin
           sudo chmod go-w /usr/local /usr/local/bin
           sudo install -o root -g root -m 0755 "$(command -v node)" /usr/local/bin/updraft-security-node
+      # The test matrix above has no bubblewrap (and Ubuntu's AppArmor blocks it), so these
+      # suites skip there. Here they must run: UPDRAFT_SANDBOX_TESTS=required turns every
+      # "cannot run here" into a failure. Once as the unprivileged runner account, as a job runs
+      # them, and once as root, which adds the switch to another user.
+      - name: Sandbox tests, as the runner account (no skips)
+        env:
+          UPDRAFT_SANDBOX_TESTS: required
+        run: npx vitest run deploy/aws-microvm/test/sandbox-exec.test.mjs deploy/aws-microvm/test/sandbox-updraft.test.mjs deploy/aws-microvm/test/egress-sandbox.test.mjs deploy/aws-microvm/test/runner-isolation.test.mjs
+      - name: Sandbox tests, as root (no skips)
+        run: sudo --preserve-env=PATH env UPDRAFT_SANDBOX_TESTS=required "$(command -v npx)" vitest run deploy/aws-microvm/test/sandbox-exec.test.mjs
       - name: Attack the real supervisor and MCP sandbox (no skips)
         run: sudo /usr/local/bin/updraft-security-node deploy/aws-microvm/native-worker/security-check.mjs
 
