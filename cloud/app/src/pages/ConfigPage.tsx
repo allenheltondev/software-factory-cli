@@ -261,7 +261,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
       )}
       {view.source === 'tenant' && (
         <Alert variant="info" data-testid="config-tenant-source">
-          Version {view.activeVersion} was published with tenant-admin. The editor starts from the defaults, and publishing from here replaces it.
+          Version {view.activeVersion} was published with tenant-admin. The editor starts from the defaults, not from that config. Publishing from here replaces that config, including its tiers and anything else the console can't show. To change it and keep those, publish a new document with tenant-admin.
         </Alert>
       )}
       {(view.notices ?? []).length > 0 && (

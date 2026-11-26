@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import { AuthProvider, configureAuth } from '@readysetcloud/ui/auth';
 import userEvent from '@testing-library/user-event';
 import axe from 'axe-core';
@@ -854,6 +854,7 @@ describe('the full editor', () => {
   it('warns about a version tenant-admin published; a disabled tenant is read-only', async () => {
     configPage(fakeApi({ config: vi.fn().mockResolvedValue(view({ source: 'tenant', activeVersion: 3, tenant: { ...view().tenant, status: 'disabled' } })) }));
     expect(await screen.findByTestId('config-tenant-source')).toHaveTextContent('Version 3 was published with tenant-admin');
+    expect(screen.getByTestId('config-tenant-source')).toHaveTextContent('Publishing from here replaces that config, including its tiers and anything else the console can\'t show.');
     expect(screen.getByTestId('config-readonly')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
   });
@@ -1271,7 +1272,20 @@ describe('accessibility and layout of the configuration page (#193)', () => {
     expect([...new Set(cards)]).toEqual(['provider-claude', 'provider-codex', 'provider-kiro']);
   });
 
-  it.each([375, 1280])('at %ipx wide the three steps stack in order, and no control is hidden', async (width) => {
+  it('at 375px and 1280px wide the three steps stack in order, no control is hidden, and both widths show the same controls', async () => {
+    // Both widths in one test, so the comparison never depends on test order.
+    const counts: number[] = [];
+    for (const width of [375, 1280]) {
+      counts.push(await checkLayoutAt(width));
+      cleanup();
+    }
+    // The same controls at both widths: nothing is dropped on a phone.
+    expect(counts[0]).toBe(counts[1]);
+  });
+});
+
+/** Renders the first-run page at `width`, checks the steps stack with no hidden control, and returns how many controls it shows. */
+async function checkLayoutAt(width: number): Promise<number> {
     viewport(width);
     try {
       const { container } = configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
@@ -1289,12 +1303,8 @@ describe('accessibility and layout of the configuration page (#193)', () => {
       expect(shown.length).toBeGreaterThan(15);
       for (const el of shown) expect(hiddenBy(el), el.outerHTML.slice(0, 160)).toBeNull();
       expect(hiddenBy(within(screen.getByTestId('advanced')).getByText('Advanced'))).toBeNull();
-      // The same controls at both widths: nothing is dropped on a phone.
-      expect(container.querySelectorAll(CONTROLS).length).toBe(LAYOUT_CONTROLS.count ??= container.querySelectorAll(CONTROLS).length);
+      return container.querySelectorAll(CONTROLS).length;
     } finally {
       viewport(1024);
     }
-  });
-});
-/** The number of controls the first width rendered, for the second to compare with. */
-const LAYOUT_CONTROLS: { count?: number } = {};
+}
