@@ -18,6 +18,9 @@ export const EXECUTION_MODES = ['log-only', 'prepare-only', 'live'] as const;
  */
 export const PUBLISH_MODES = ['none', 'draft-pr', 'pr'] as const;
 export type PublishMode = (typeof PUBLISH_MODES)[number];
+/** repositories.<repo>.notifications: quiet (the default) or verbose. */
+export const NOTIFICATION_MODES = ['quiet', 'verbose'] as const;
+export type NotificationMode = (typeof NOTIFICATION_MODES)[number];
 /** repositories.<repo>.autoMerge: how Updraft merges a PR its reviewer found ready. */
 export const MERGE_METHODS = ['squash', 'merge', 'rebase'] as const;
 export type MergeMethod = (typeof MERGE_METHODS)[number];
@@ -285,6 +288,14 @@ export const repositorySchema = z.strictObject({
    */
   commentOnFailure: z.boolean().optional(),
   /**
+   * What Updraft says on GitHub about its own progress (docs/assignment-comments.md). quiet (the
+   * default): one live status comment on the issue, edited in place as the run moves on, plus a
+   * comment only when a person has to act. verbose: the separate status comments of earlier
+   * versions (the assignment table, the "PR has the changes" comment, the queue acknowledgement
+   * on a pull request and every CI step comment).
+   */
+  notifications: z.enum(NOTIFICATION_MODES).optional(),
+  /**
    * Live mode, together with publish: when an allowed actor requests changes on a PR Updraft
    * opened, run the agent on that PR's branch with the review and push the result. Default false.
    */
@@ -517,6 +528,11 @@ export function repoNeedsCheckout(config: Pick<UpdraftConfig, 'actions'>, repo: 
 }
 
 /** The repo's publication mode; none unless the config opts in. */
+/** repositories.<repo>.notifications, with its default. */
+export function notificationMode(repo: Pick<RepositoryConfig, 'notifications'> | undefined | null): NotificationMode {
+  return repo?.notifications ?? 'quiet';
+}
+
 export function publishMode(repo: Pick<RepositoryConfig, 'publish'>): PublishMode {
   return repo.publish ?? 'none';
 }

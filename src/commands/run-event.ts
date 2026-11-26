@@ -1100,6 +1100,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
 
     // 6. Drain: the worker of `updraft start`, wired as it is there, until the event's work is done.
     const eventScope = scope;
+    const consoleContext = consoleContextFromEnv(process.env);
     const publishDeps = (component: string): PublishDeps => ({
       db: openDb,
       config,
@@ -1111,18 +1112,20 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       env: ctx.env,
       scope: eventScope,
       claimReviews: true,
+      console: consoleContext,
     });
     const publication = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
     const revising = revisionsEnabled(config) ? createRevisionPublisher(publishDeps('revision'), publication) : publication;
     const publisher = reviewsEnabled(config) ? createReviewLoopPublisher(publishDeps('review'), revising) : revising;
     // The worker does not wait for an assignment comment; a process that is about to exit has to.
-    const announcer = createAssignmentCommenter({ db: openDb, config, api, log: log.child({ component: 'assignment-comment' }), console: consoleContextFromEnv(process.env) });
+    const announcer = createAssignmentCommenter({ db: openDb, config, api, log: log.child({ component: 'assignment-comment' }), console: consoleContext });
     const assignmentCommenter: AssignmentCommenter = {
       announce(job, run, signal) {
         const p: Promise<void> = announcer.announce(job, run, signal).finally(() => announcements.delete(p));
         announcements.add(p);
         return p;
       },
+      ended: (job, run, signal) => announcer.ended?.(job, run, signal) ?? Promise.resolve(),
     };
     const appAuth = credentials.app;
     const startedAt = Date.now();

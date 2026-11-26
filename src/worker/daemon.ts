@@ -363,6 +363,10 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       if (finished && !policyRequeued && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.failureCommenter) {
         await deps.failureCommenter.afterRun(run.id, controller.signal);
       }
+      // The issue's live status comment no longer says a worker is on it (quiet notifications).
+      if (finished && !policyRequeued && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.assignmentCommenter?.ended) {
+        await deps.assignmentCommenter.ended(job, run, controller.signal).catch((err: unknown) => runLog.error('status comment crashed', { error: message(err) }));
+      }
       // After publishing and commenting, so the trace has Updraft's own steps too.
       if (runTrace) await runTrace.end(finished?.outcome ?? result.outcome);
     })().finally(() => {
