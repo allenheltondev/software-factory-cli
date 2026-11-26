@@ -359,8 +359,10 @@ export function createLauncher(deps: LaunchDeps) {
     const config = await deps.store.getConfigVersion(req.installationId, configVersion, { consistent: true });
     // What the job is for: an issue (its label) or a pull request (its review loop).
     // `unscoped`: the workflow, and so its keys, is not known here (a pull request job): nothing is
-    // checked, and the job is recorded without keys, so the broker hands it every key (broker.ts, jobAgentKeys).
-    let decision: { repository: string; repositoryId: number; keys: string[] | null; unscoped?: true; label?: string; issue?: number; pullRequest?: number };
+    // checked, and the job is recorded without keys, so the broker hands it every key (broker.ts,
+    // jobAgentKeys). `unchecked`: a close, which runs no agent of its own, is never refused for a
+    // key; it is still handed its workflow's keys, as run-event may find review work to do in it.
+    let decision: { repository: string; repositoryId: number; keys: string[] | null; unscoped?: true; unchecked?: true; label?: string; issue?: number; pullRequest?: number };
     const binding = benchmark ? undefined : deps.native?.route.installationId === req.installationId ? deps.native : await deps.resolveNative?.(req.installationId);
     const mode = await binding?.mode?.();
     const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
@@ -402,13 +404,12 @@ export function createLauncher(deps: LaunchDeps) {
       // The workflow that started the pull request: the label of the job that opened it (its finish
       // recorded this pull request), or of an earlier job of this pull request's loop (which carries
       // that label on), while one is kept. Only an exact match: one issue can have several pull
-      // requests, from different workflows. Its keys are the ones checked. A close runs no agent and
-      // needs none; a pull request whose origin is not known here is checked by the job itself
-      // (run-event fails without the key, and says so on the job).
+      // requests, from different workflows. Its keys are the ones checked (never for a close, which
+      // runs no agent of its own) and handed to the job; a pull request whose origin is not known
+      // here is checked by the job itself (run-event fails without the key, and says so on the job),
+      // and handed every key.
       let keys: string[] | null = [];
-      // A close runs no agent: no keys, and known to need none. Anything else whose workflow is not
-      // told here is unscoped (below).
-      let known = d.closing;
+      let known = false;
       let label: string | undefined;
       {
         const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS);
@@ -429,11 +430,13 @@ export function createLauncher(deps: LaunchDeps) {
           // its key itself. Under the same version: the keys that job was started with (two
           // workflows can share a label, for different actors), or, once its record is gone (it is
           // kept a week past its run), the label's when the label names one workflow's.
-          if (!d.closing && origin.configVersion === tenant.activeConfigVersion) {
+          if (origin.configVersion === tenant.activeConfigVersion) {
             const lower = origin.label.toLowerCase();
-            // A revision or CI fix inherits its origin's keys: the origin's workflow, reviewer
-            // included. An origin recorded without them (launched before they were recorded, or
-            // itself unscoped) says nothing, and neither does a label two workflows share.
+            // A revision, CI fix or close inherits its origin's keys: the origin's workflow,
+            // reviewer included. A close is not checked for them: it runs no agent of its own, but
+            // run-event polls the pull request again, and a review or revision it finds to do
+            // runs in the close's job. An origin recorded without them (launched before they were
+            // recorded, or itself unscoped) says nothing, and neither does a label two workflows share.
             const inherited = originJob ? originJob.agentKeys : Object.hasOwn(d.keysByLabel, lower) ? d.keysByLabel[lower] ?? undefined : undefined;
             if (inherited) {
               keys = inherited;
@@ -444,7 +447,7 @@ export function createLauncher(deps: LaunchDeps) {
           log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
         }
       }
-      decision = { repository: d.repository, repositoryId: d.repositoryId, keys, ...(known ? {} : { unscoped: true as const }), pullRequest: d.pullRequest, ...(label ? { label } : {}) };
+      decision = { repository: d.repository, repositoryId: d.repositoryId, keys, ...(known ? {} : { unscoped: true as const }), ...(d.closing ? { unchecked: true as const } : {}), pullRequest: d.pullRequest, ...(label ? { label } : {}) };
     }
     // The issue or pull request the job is for: refusals and over-quota comments name it.
     const number = (decision.issue ?? decision.pullRequest)!;
@@ -547,10 +550,10 @@ export function createLauncher(deps: LaunchDeps) {
     if (native) needed = needed.filter((k) => k !== 'ANTHROPIC_API_KEY');
     const supported = new Set<string>(Object.values(SUPPORTED_AGENT_KEY_ENV));
     const unsupported = needed.filter((k) => !supported.has(k));
-    if (unsupported.length > 0) {
+    if (unsupported.length > 0 && !decision.unchecked) {
       return refuse(`This workflow needs ${unsupported.join(' and ')}, which no agent Updraft Cloud runs uses: choose another agent in the configuration and publish it again`, { unavailable: unsupported });
     }
-    if (needed.length > 0) {
+    if (needed.length > 0 && !decision.unchecked) {
       const set = new Set((await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name));
       const missing = needed.filter((k) => !set.has(k));
       if (missing.length > 0) {

@@ -548,7 +548,7 @@ describe('the launcher', () => {
         const secrets = statements.filter((st) => st.Action === 'secretsmanager:GetSecretValue').flatMap((st) => (Array.isArray(st.Resource) ? st.Resource : [st.Resource]));
         return { handed: Object.keys(out.descriptor.agentKeySecrets).sort(), secrets: secrets.sort() };
       };
-      const arn = (name: string) => `arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/tenants/55/agent-keys/${name}-*`;
+      const arn = (name: string) => `arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/tenants/55/agent-keys/${name}-??????`;
 
       it('a Claude coder with a Codex reviewer: exactly the Anthropic and Codex keys', async () => {
         await fromCompiled({ agents: ALL, pools: POOLS, repositories: { 'acme/web': { id: 9, review: true, workflows: [{ trigger: { label: 'updraft' }, pool: 'c', reviewPool: 'x' }, { trigger: { label: 'other' }, pool: 'k' }] } } });
@@ -1267,9 +1267,23 @@ describe('the launcher', () => {
         const unknown = await launch(onIssue(30));
         expect(unknown.disposition).toBe('launched');
         expect((await store.getJob(unknown.jobId!))?.agentKeys).toBeUndefined();
+        // A close nothing names the workflow of: every key (run-event may find review work in it).
         const close = await launch({ ...onIssue(32, { action: 'closed' }, 'close-32'), eventName: 'pull_request' });
         expect(close.disposition).toBe('launched');
-        expect((await store.getJob(close.jobId!))?.agentKeys).toEqual([]);
+        expect((await store.getJob(close.jobId!))?.agentKeys).toBeUndefined();
+      });
+
+      it("hands a close its origin's keys, and never refuses it for one that is not set", async () => {
+        // #53 was opened by the Codex workflow; only the Anthropic key is set.
+        await opened('codex', 13, 53);
+        const close = await createLauncher(deps)({ ...onIssue(13, { action: 'closed' }, 'close-53'), eventName: 'pull_request' });
+        expect(close.disposition).toBe('launched');
+        expect((await store.getJob(close.jobId!))?.agentKeys).toEqual(['CODEX_API_KEY']);
+        // Opened under an earlier version: nothing here names the workflow, so every key.
+        await opened('updraft', 14, 54, ['ANTHROPIC_API_KEY'], 1);
+        const older = await createLauncher(deps)({ ...onIssue(14, { action: 'closed' }, 'close-54'), eventName: 'pull_request' });
+        expect(older.disposition).toBe('launched');
+        expect((await store.getJob(older.jobId!))?.agentKeys).toBeUndefined();
       });
     });
 

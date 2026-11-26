@@ -120,7 +120,7 @@ describe('the job broker', () => {
     };
 
     it('an ordinary job: exactly its recorded keys, each one secret', async () => {
-      expect(await startedWith(['ANTHROPIC_API_KEY', 'CODEX_API_KEY'])).toEqual({ handed: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY-*'), arn('CODEX_API_KEY-*')] });
+      expect(await startedWith(['ANTHROPIC_API_KEY', 'CODEX_API_KEY'])).toEqual({ handed: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY-??????'), arn('CODEX_API_KEY-??????')] });
     });
 
     it('a job whose workflow needs no key: none, and no secret at all', async () => {
@@ -134,8 +134,8 @@ describe('the job broker', () => {
     it('the telemetry key too when the job sends telemetry, never as an agent key', async () => {
       const base = { provider: 'honeycomb' as const, region: 'eu' as const, serviceName: 'factory', captureContent: true, updatedAt: '', updatedBy: 'pat' };
       await store.putTelemetry(55, { ...base, enabled: true, key: { updatedAt: '', updatedBy: 'pat', secretVersion: 'a1b2c3d4-0000-4000-8000-000000000001' } }, 0);
-      expect(await startedWith(['ANTHROPIC_API_KEY'])).toEqual({ handed: ['ANTHROPIC_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY-*'), arn('HONEYCOMB_API_KEY-*')] });
-      expect(await startedWith([], { jobId: 'job_keys00002', deliveryId: 'd-keys-2' })).toEqual({ handed: [], secrets: [arn('HONEYCOMB_API_KEY-*')] });
+      expect(await startedWith(['ANTHROPIC_API_KEY'])).toEqual({ handed: ['ANTHROPIC_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY-??????'), arn('HONEYCOMB_API_KEY-??????')] });
+      expect(await startedWith([], { jobId: 'job_keys00002', deliveryId: 'd-keys-2' })).toEqual({ handed: [], secrets: [arn('HONEYCOMB_API_KEY-??????')] });
     });
   });
 

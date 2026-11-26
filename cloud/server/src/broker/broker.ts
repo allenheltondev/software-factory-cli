@@ -137,10 +137,11 @@ export function jobSessionPolicy(job: Pick<Job, 'installationId' | 'configVersio
       {
         Effect: 'Allow',
         Action: 'secretsmanager:GetSecretValue',
-        // Secrets Manager appends a random suffix to a secret's name in its ARN: `-*` is that one secret.
+        // Secrets Manager appends a hyphen and six random characters to a secret's name in its ARN:
+        // `-??????` is that one secret, never another whose name starts with this one's.
         Resource: keys === null
           ? secretArn(`${agentKeySecretPrefix(job.installationId)}*`)
-          : [...keys, ...(opts.telemetry ? [TELEMETRY_KEY_NAME] : [])].map((k) => secretArn(`${agentKeySecretName(job.installationId, k)}-*`)),
+          : [...keys, ...(opts.telemetry ? [TELEMETRY_KEY_NAME] : [])].map((k) => secretArn(`${agentKeySecretName(job.installationId, k)}-??????`)),
       },
     ].filter((statement) => !Array.isArray(statement.Resource) || statement.Resource.length > 0),
   };
