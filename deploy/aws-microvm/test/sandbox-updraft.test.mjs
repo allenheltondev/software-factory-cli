@@ -259,7 +259,7 @@ describe.runIf(sandbox.usable)('the base checkout, in the sandbox', { timeout: 1
 
 describe.runIf(sandbox.usable)('git in the sandbox, in a clone the worker made', { timeout: 120_000 }, () => {
   /** Commit 3000 new files in a job worktree of the fixture clone, in the sandbox, with its mounts. */
-  function commitMany(f, config) {
+  function commitMany(f, config, extraEnv = {}) {
     for (const [key, value] of config) f.git(f.clone, 'config', '--local', key, value);
     const worktree = path.join(f.root, 'job');
     f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'updraft/issue-1-job_t1', worktree, 'HEAD');
@@ -267,12 +267,12 @@ describe.runIf(sandbox.usable)('git in the sandbox, in a clone the worker made',
     // Git's own trace of what it ran, for the failure message: which command touched what.
     const traceDir = path.join(f.root, 'trace');
     fs.mkdirSync(traceDir);
-    const names = ['GIT_CONFIG_NOSYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_TRACE2_PERF'];
+    const names = ['GIT_CONFIG_NOSYSTEM', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_TRACE2_PERF', ...Object.keys(extraEnv)];
     const args = buildContainerRunArgs(
       { file: '/bin/sh', args: ['-c', 'i=0; while [ $i -lt 3000 ]; do echo $i > f$i; i=$((i+1)); done; git add . && git commit -qm many && echo committed'] },
       { image: SANDBOX_IMAGE, name: `gc-${process.pid}-${Date.now()}`, mounts: [...worktreeMounts(worktree), { path: traceDir, readOnly: false }], workdir: worktree, user: `${process.getuid()}:${process.getgid()}`, envNames: names, network: 'none' },
     );
-    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'A', GIT_AUTHOR_EMAIL: 'a@example.com', GIT_COMMITTER_NAME: 'A', GIT_COMMITTER_EMAIL: 'a@example.com', GIT_TRACE2_PERF: path.join(traceDir, 'perf') };
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'A', GIT_AUTHOR_EMAIL: 'a@example.com', GIT_COMMITTER_NAME: 'A', GIT_COMMITTER_EMAIL: 'a@example.com', GIT_TRACE2_PERF: path.join(traceDir, 'perf'), ...extraEnv };
     const result = spawnSync(runtime.path, args, { env, encoding: 'utf8', timeout: 90_000 });
     let trace = '';
     try {
@@ -288,6 +288,41 @@ describe.runIf(sandbox.usable)('git in the sandbox, in a clone the worker made',
     const result = commitMany(fixture, MANAGED_CLONE_CONFIG);
     expect(result.stdout, result.diagnosis).toContain('committed');
     expect(result.stderr, result.diagnosis).toBe('');
+  });
+
+  // TEMPORARY DIAGNOSIS (#177): which setting stops the lock attempt on this git.
+  it('diagnosis: candidates', () => {
+    const lines = [];
+    lines.push(`keys: ${spawnSync('git', ['help', '--config'], { encoding: 'utf8' }).stdout.split('\n').filter((l) => /^(refs|core\.packed|core\.ref|gc\.|maintenance\.|pack\.ref|extensions\.ref|core\.logAll)/i.test(l)).join(' ')}`);
+    const variants = {
+      baseline: [],
+      packRefsFalseAndTimeout: [['gc.packRefs', 'false'], ['core.packedRefsTimeout', '0']],
+      packRefsFalse: [['gc.packRefs', 'false']],
+      packedRefsTimeout0: [['core.packedRefsTimeout', '0']],
+      logAllRefUpdatesFalse: [['core.logAllRefUpdates', 'false']],
+      maintenanceStrategyNone: [['maintenance.strategy', 'none']],
+      packRefsTaskOff: [['maintenance.pack-refs.enabled', 'false'], ['maintenance.gc.enabled', 'false']],
+      refsAutoPackFalse: [['refs.autoPack', 'false']],
+    };
+    for (const [name, extra] of Object.entries(variants)) {
+      fixture?.cleanup();
+      fixture = createGitFixture('octo/widgets');
+      const r = commitMany(fixture, [...MANAGED_CLONE_CONFIG, ...extra], name === 'baseline' ? { GIT_TRACE_REFS: '1' } : {});
+      const err = r.stderr.split('\n').filter((l) => !/refs\/debug\.c/.test(l) || /transaction|lock|delete|pack|optimi|ref_store|update|error/i.test(l) && !/read_raw_ref|for_each|resolve/.test(l));
+      lines.push(`${name}: committed=${r.stdout.includes('committed')} stderr=${JSON.stringify(err.join('\n').slice(0, 4000))}`);
+    }
+    // Without a packed-refs file at all.
+    fixture?.cleanup();
+    fixture = createGitFixture('octo/widgets');
+    const packed = path.join(fixture.clone, '.git', 'packed-refs');
+    for (const line of fs.readFileSync(packed, 'utf8').split('\n')) {
+      const m = /^([0-9a-f]{40}) (refs\/\S+)$/.exec(line);
+      if (m) { fs.mkdirSync(path.dirname(path.join(fixture.clone, '.git', m[2])), { recursive: true }); fs.writeFileSync(path.join(fixture.clone, '.git', m[2]), `${m[1]}\n`); }
+    }
+    fs.rmSync(packed);
+    const r = commitMany(fixture, MANAGED_CLONE_CONFIG, { GIT_TRACE_REFS: '1' });
+    lines.push(`noPackedRefs: committed=${r.stdout.includes('committed')} stderr=${JSON.stringify(r.stderr.trim().slice(-3000))}`);
+    expect.fail(`DIAGNOSIS\n${lines.join('\n')}\nEND DIAGNOSIS`);
   });
 
   it('(the same commit with git\'s automatic gc on is what warned)', () => {
