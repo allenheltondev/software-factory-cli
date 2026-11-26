@@ -67,6 +67,7 @@ function at(path: string, element: React.ReactNode, route: string) {
   );
 }
 
+const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 const configPage = (api: ReturnType<typeof fakeApi>) => at('/installations/55/config', <ConfigPage api={api} />, '/installations/:id/config');
 const publishedOk = (version = 2) => vi.fn().mockResolvedValue({ ok: true, version, yaml: 'version: 1\n', warnings: [] });
 const sentConfig = (api: ReturnType<typeof fakeApi>, call = 0) => (api.publishConfig as ReturnType<typeof vi.fn>).mock.calls[call]![1].config as ConsoleConfig;
@@ -184,18 +185,25 @@ describe('the simple page', () => {
     expect(screen.queryByTestId('kiro-not-enabled')).toBeNull();
   });
 
-  it('ticks coding and review agents separately; no review agent means no review, one reviews its own work', async () => {
+  it('ticks coding and review agents separately; no review agent means no review; self-review takes explicit consent', async () => {
     const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);
+    expect(screen.queryByTestId('pending-changes')).toBeNull();
     await userEvent.click(within(await screen.findByTestId('review-claude')).getByRole('checkbox'));
-    expect(screen.getByText(/Codex reviews its own work when it wrote the code/)).toBeInTheDocument();
+    // The policy is not changed for the person: Codex would review its own code, so they choose.
+    expect(screen.getByTestId('review-summary')).toHaveTextContent(/An agent would review its own work. Choose another review agent/);
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Codex would review its own work on "updraft": choose another review agent, or allow self-review.');
+    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    expect(screen.getByTestId('pending-changes')).toHaveTextContent('acme/web · updraft: review Claude Code, Codex → Codex.');
+    await userEvent.click(screen.getByTestId('allow-self-review'));
+    expect(screen.getByTestId('pending-changes')).toHaveTextContent('An agent may now review its own pull request');
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     let sent = sentConfig(api);
     expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['codex'] } });
     expect(sent.workflows.implement!.review).toMatchObject({ enabled: true, pool: 'reviewers', allowSameAgent: true });
 
     await userEvent.click(within(screen.getByTestId('review-codex')).getByRole('checkbox'));
-    expect(screen.getByText(/No review: pull requests wait for a person/)).toBeInTheDocument();
+    expect(screen.getByTestId('review-policy')).toHaveTextContent('No automated review: pull requests wait for a person.');
     await userEvent.click(within(screen.getByTestId('coding-codex')).getByRole('checkbox'));
     // Unticking the last coding agent is allowed, and the bar says it must be put back.
     await userEvent.click(within(screen.getByTestId('coding-claude')).getByRole('checkbox'));
@@ -228,20 +236,30 @@ describe('the simple page', () => {
     expect(screen.queryByText('Key set')).toBeNull();
     expect(screen.queryByText('No key')).toBeNull();
     const info = within(codex).getByRole('button', { name: 'Why Codex cannot be used' });
-    expect(info).toHaveAccessibleDescription('Add your OpenAI Platform API key to use Codex. Click to add it.');
+    expect(info).toHaveAccessibleDescription('Connect Codex with your OpenAI Platform API key to use it. Click to connect.');
+    expect(within(screen.getByTestId('provider-codex')).getByText('Not connected')).toBeInTheDocument();
 
+    // The info icon opens Codex's connection, in the connected-agents step.
     await userEvent.click(info);
-    await userEvent.type(within(codex).getByLabelText(/OpenAI Platform API key/), 'sk-proj-abc');
-    await userEvent.click(within(codex).getByRole('button', { name: 'Save key' }));
+    const card = screen.getByTestId('provider-codex');
+    await userEvent.type(within(card).getByLabelText(/OpenAI Platform API key/), 'sk-proj-abc');
+    await userEvent.click(within(card).getByRole('button', { name: 'Save key' }));
     expect(setAgentKey).toHaveBeenCalledWith(55, 'CODEX_API_KEY', 'sk-proj-abc');
-    // With its key, Codex codes and reviews, as the defaults have it.
-    await waitFor(() => expect(within(codex).getByRole('checkbox', { name: 'Codex' })).toBeChecked());
-    expect(within(screen.getByTestId('review-codex')).getByRole('checkbox', { name: 'Codex' })).toBeChecked();
+    // Connected, and nothing else changed: connecting never puts an agent to work (or bills it).
+    await waitFor(() => expect(within(codex).getByRole('checkbox', { name: 'Codex' })).toBeEnabled());
+    expect(within(card).getByText('Connected')).toBeInTheDocument();
+    expect(within(codex).getByRole('checkbox', { name: 'Codex' })).not.toBeChecked();
+    expect(within(screen.getByTestId('review-codex')).getByRole('checkbox', { name: 'Codex' })).not.toBeChecked();
+    // Choosing it is a separate step: Codex reviews Claude's work, independently.
+    await userEvent.click(within(screen.getByTestId('review-codex')).getByRole('checkbox', { name: 'Codex' }));
+    await userEvent.click(within(screen.getByTestId('review-claude')).getByRole('checkbox', { name: 'Claude Code' }));
+    expect(screen.getByTestId('review-summary')).toHaveTextContent(/Independent review/);
     await userEvent.click(screen.getByRole('checkbox', { name: 'Work in acme/web' }));
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     const sent = sentConfig(api);
-    expect(sent.pools).toEqual({ builders: { agents: ['claude', 'codex'] }, reviewers: { agents: ['claude', 'codex'] } });
-    expect(sent.workflows.implement!.review.allowSameAgent).toBe(false);
+    expect(sent.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['codex'] } });
+    // The consent the defaults gave a single agent stays until the person turns it off.
+    expect(sent.workflows.implement!.review.allowSameAgent).toBe(true);
   });
 
   it('never changes a published review policy because a key went missing: the person adds it back or unticks it', async () => {
@@ -255,7 +273,7 @@ describe('the simple page', () => {
     const box = within(claude).getByRole('checkbox', { name: 'Claude Code' });
     expect(box).toBeChecked();
     expect(box).toBeEnabled();
-    expect(within(claude).getByRole('button', { name: 'Why Claude Code cannot be used' })).toHaveAccessibleDescription(/was removed. Add it again, or untick Claude Code/);
+    expect(within(claude).getByRole('button', { name: 'Why Claude Code cannot be used' })).toHaveAccessibleDescription(/was removed. Connect it again, or untick Claude Code/);
     // Nothing in the draft changed by itself; the bar says what the person has to decide.
     expect(screen.getByTestId('blockers')).toHaveTextContent('Add the key for Claude Code, or untick it.');
 
@@ -266,7 +284,7 @@ describe('the simple page', () => {
 
     // Turning review off is the person's choice, and then it publishes.
     await userEvent.click(box);
-    expect(screen.getByText(/No review: pull requests wait for a person/)).toBeInTheDocument();
+    expect(screen.getByTestId('review-policy')).toHaveTextContent('No automated review: pull requests wait for a person.');
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     expect(sentConfig(api).workflows.implement!.review.enabled).toBe(false);
   });
@@ -279,8 +297,11 @@ describe('the simple page', () => {
   it('changes an agent model, and keeps repository extras behind its settings', async () => {
     const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);
-    const claude = await screen.findByTestId('coding-claude');
-    await userEvent.click(within(claude).getByRole('button', { name: 'Change model' }));
+    await userEvent.click(await screen.findByText(/models and effort/));
+    const claude = screen.getByTestId('model-claude');
+    expect(claude).toHaveTextContent('Automatic');
+    expect(within(claude).queryByLabelText('Model')).toBeNull();
+    await userEvent.click(within(claude).getByRole('checkbox', { name: 'Choose the model myself' }));
     await userEvent.type(within(claude).getByLabelText('Model'), 'claude-opus-5-5');
     const web = screen.getByTestId('repo-acme/web');
     expect(within(web).queryByLabelText('Base branch')).toBeNull();
@@ -415,6 +436,153 @@ describe('the simple page', () => {
   });
 });
 
+describe('connected agents, teams and exceptions (#193)', () => {
+  it('the happy path: connect one provider, choose it to code, no review, choose a repository and label, publish; no pool, profile, YAML or model', async () => {
+    // A new installation where nothing is connected yet: the server starts every agent off.
+    const config = baseConfig();
+    config.agents.claude!.enabled = false;
+    config.agents.codex!.enabled = false;
+    config.pools = { builders: { agents: [] }, reviewers: { agents: [] } };
+    config.workflows.implement!.review.allowSameAgent = true;
+    const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: false }], refusals: [] });
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agentKeys: {} })), setAgentKey, publishConfig: publishedOk(1) });
+    configPage(api);
+    // Three steps on one page.
+    expect(await screen.findByText('1 · Connect agents')).toBeInTheDocument();
+    expect(screen.getByText('2 · Choose your agent team')).toBeInTheDocument();
+    expect(screen.getByText('3 · Choose where work starts')).toBeInTheDocument();
+
+    const card = screen.getByTestId('provider-claude');
+    expect(card).toHaveTextContent('API key · runs bill your API billing');
+    await userEvent.click(within(card).getByRole('button', { name: 'Connect Claude Code' }));
+    await userEvent.type(within(card).getByLabelText(/Claude Console API key/), 'sk-ant-abc');
+    await userEvent.click(within(card).getByRole('button', { name: 'Save key' }));
+    await waitFor(() => expect(within(card).getByText('Connected')).toBeInTheDocument());
+
+    await userEvent.click(within(screen.getByTestId('coding-claude')).getByRole('checkbox', { name: 'Claude Code' }));
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Work in acme/web' }));
+    expect(screen.getByTestId('blockers')).toHaveTextContent('Choose at least one review agent, or choose no automated review.');
+    await userEvent.click(screen.getByRole('button', { name: 'No automated review' }));
+    // The label defaults are fine; keep "updraft".
+    expect(within(screen.getByTestId('effective-config')).getByTestId('effective-acme/web-updraft')).toHaveTextContent('Claude Code');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const sent = sentConfig(api);
+    expect(sent.pools).toEqual({ builders: { agents: ['claude'] } });
+    expect(sent.agents).toEqual({ claude: { adapter: 'claude', enabled: true }, codex: { adapter: 'codex', enabled: false } });
+    expect(sent.workflows.implement!.review.enabled).toBe(false);
+    expect(await screen.findByTestId('first-publish')).toHaveTextContent('add the label updraft to an issue in acme/web');
+  });
+
+  it('labels and repository exceptions in the main page: art -> Codex, ready inherits; changing the default shows who it affects; reset restores it', async () => {
+    const config = withRepo();
+    config.repositories['acme/api'] = { ...config.repositories['acme/web']! };
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig: publishedOk(2) });
+    configPage(api);
+    await userEvent.type(await screen.findByLabelText('Add a label'), 'art');
+    await userEvent.click(screen.getByRole('button', { name: 'Add label' }));
+    const art = screen.getByTestId('label-art');
+    await userEvent.selectOptions(within(art).getByLabelText('Agents for "art"'), 'custom');
+    await userEvent.click(within(art).getByTestId('label-art-coding-claude').querySelector('input')!);
+    expect(within(art).getByTestId('label-art-team')).toHaveTextContent('Coding: Codex · Review: Claude Code, Codex · its own agents');
+
+    // acme/api's "updraft" gets Claude alone; acme/web keeps the defaults.
+    const apiRow = screen.getByTestId('repo-acme/api');
+    await userEvent.click(within(apiRow).getByRole('button', { name: 'Customize agents for "updraft" in acme/api' }));
+    await userEvent.click(within(apiRow).getByTestId('repo-acme/api-implement-coding-codex').querySelector('input')!);
+    expect(screen.getByTestId('effective-acme/api-updraft')).toHaveTextContent('Claude CodeClaude Code, CodexThis repository only');
+
+    // The default team says what it changes, and what it does not.
+    expect(screen.getByTestId('affects-coding')).toHaveTextContent('Used by "updraft" in acme/web.');
+    expect(screen.getByTestId('affects-coding')).toHaveTextContent('Not changed: "art" in acme/web, "updraft" in acme/api, "art" in acme/api (own agents).');
+    await userEvent.click(within(screen.getByTestId('coding-codex')).getByRole('checkbox'));
+    expect(screen.getByTestId('effective-acme/web-art')).toHaveTextContent('Codex');
+    expect(screen.getByTestId('pending-changes')).toHaveTextContent('acme/web · updraft: coding Claude Code, Codex → Claude Code.');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const sent = sentConfig(api);
+    expect(sent.pools).toEqual({
+      builders: { agents: ['claude'] },
+      reviewers: { agents: ['claude', 'codex'] },
+      'art-coding': { agents: ['codex'] },
+      'art-review': { agents: ['claude', 'codex'] },
+      'implement-api-coding': { agents: ['claude'] },
+      'implement-api-review': { agents: ['claude', 'codex'] },
+    });
+    expect(sent.workflows.art).toMatchObject({ label: 'art', pool: 'art-coding', review: { pool: 'art-review' } });
+    expect(sent.repositories['acme/web']!.workflows).toEqual(['implement', 'art']);
+    expect(sent.repositories['acme/api']!.workflows).toEqual(['implement-api', 'art']);
+
+    // Reset both: the label and the repository use the defaults again.
+    await userEvent.click(within(screen.getByTestId('label-art')).getByRole('button', { name: 'Reset to defaults' }));
+    await userEvent.click(within(screen.getByTestId('repo-acme/api')).getByRole('button', { name: 'Use the agents of "updraft" in acme/api' }));
+    expect(screen.getByTestId('effective-acme/api-updraft')).toHaveTextContent('Installation defaults');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const reset = sentConfig(api, 1);
+    expect(reset.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['claude', 'codex'] } });
+    expect(reset.repositories['acme/api']!.workflows).toEqual(['implement', 'art']);
+  });
+
+  it('a no-op load and preview sends simple and advanced settings exactly as loaded, and offers no publish', async () => {
+    const advanced = beyondSimple();
+    advanced.agents['claude-2'] = { adapter: 'claude', model: 'claude-haiku-5-5', effort: 'low', enabled: true };
+    advanced.pools.fast = { agents: ['claude-2'] };
+    advanced.workflows.implement!.timeoutMinutes = 30;
+    advanced.repositories['acme/web'] = { ...advanced.repositories['acme/web']!, allowedActors: ['sam'], autoMerge: { method: 'squash' }, ci: {}, baseBranch: 'dev' };
+    advanced.legacy = { pools: { implement: 'builders' }, workflows: { implement: 'implement' } };
+    for (const config of [withRepo(), advanced]) {
+      const previewConfig = vi.fn().mockResolvedValue({ ok: true, yaml: 'version: 1\n', warnings: [], autoMergeTurnedOn: [] });
+      const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config: clone(config) })), previewConfig });
+      const { unmount } = configPage(api);
+      await userEvent.click(await screen.findByRole('button', { name: 'View config' }));
+      expect(previewConfig).toHaveBeenCalledWith(55, config);
+      expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+      expect(screen.queryByTestId('pending-changes')).toBeNull();
+      unmount();
+    }
+  });
+
+  it('settings the page cannot show stay in the full editor, unconverted, with a readable summary and the custom settings named', async () => {
+    const config = beyondSimple();
+    config.agents['claude-2'] = { adapter: 'claude', model: 'claude-haiku-5-5', enabled: true };
+    config.pools.fast = { agents: ['claude-2'] };
+    config.workflows.implement!.pool = 'fast';
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config })) }));
+    expect(await screen.findByTestId('config-custom')).toHaveTextContent('Agent profile "claude-2" (Claude Code) has a name of its own');
+    expect(screen.getByTestId('effective-acme/web-updraft')).toHaveTextContent('Claude Code');
+    expect(screen.queryByTestId('simple-config')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Workflows' })).toBeInTheDocument();
+  });
+
+  it('explains a key whose last use failed without removing the agent, weakening review or switching billing', async () => {
+    const api = fakeApi({
+      config: vi.fn().mockResolvedValue(published()),
+      agentKeys: vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true, lastUsed: { at: '2026-11-20T00:00:00Z', ok: false } }, { name: 'CODEX_API_KEY', configured: true, required: true }], refusals: [] }),
+      publishConfig: publishedOk(2),
+    });
+    configPage(api);
+    const card = await screen.findByTestId('provider-claude');
+    await waitFor(() => expect(within(card).getByText('Last use failed')).toBeInTheDocument());
+    expect(within(card).getByRole('button', { name: 'Reconnect Claude Code' })).toBeInTheDocument();
+    const box = within(screen.getByTestId('coding-claude')).getByRole('checkbox', { name: 'Claude Code' });
+    expect(box).toBeChecked();
+    expect(screen.getByTestId('coding-claude')).toHaveTextContent('its last run could not use the key: reconnect it');
+    expect(within(screen.getByTestId('review-claude')).getByRole('checkbox', { name: 'Claude Code' })).toBeChecked();
+    expect(screen.getByTestId('review-summary')).toHaveTextContent(/Independent review/);
+    // A Claude subscription is a separate route, never a silent fallback here.
+    expect(within(card).getByRole('link', { name: 'Claude subscription routing' })).toHaveAttribute('href', '/installations/55/claude');
+  });
+
+  it('shows a provider this deployment no longer runs honestly, and keeps the settings that name it', async () => {
+    const config = withRepo();
+    config.agents.vibe = { adapter: 'vibe', enabled: false };
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config })) }));
+    const card = await screen.findByTestId('provider-vibe');
+    expect(card).toHaveTextContent('Not available here');
+    expect(within(card).queryByRole('button')).toBeNull();
+    expect(within(screen.getByTestId('coding-vibe')).getByRole('checkbox')).toBeDisabled();
+  });
+});
+
 /** From the simple page to the full editor. */
 async function openFull() {
   await userEvent.click(await screen.findByText(/prompts, revision rounds/));
@@ -482,7 +650,7 @@ describe('the full editor', () => {
     expect(screen.queryByText(/would only ever review its own work/)).toBeNull();
   });
 
-  it('adds an agent to every pool, edits pool members, and takes a missing key in place', async () => {
+  it('adds an agent to no pool, edits pool members, and takes a missing key in place', async () => {
     const setAgentKey = vi.fn().mockResolvedValue({ keys: [{ name: 'ANTHROPIC_API_KEY', configured: true, required: true }, { name: 'CODEX_API_KEY', configured: true, required: true }], refusals: [] });
     const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config: beyondSimple(), agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: false } })), setAgentKey, publishConfig: publishedOk(2) });
     configPage(api);
@@ -493,8 +661,11 @@ describe('the full editor', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Add agent' }));
     const second = screen.getByTestId('agent-claude-2');
     await userEvent.type(within(second).getByLabelText('Model'), 'claude-haiku-5-5');
-    expect(within(screen.getByTestId('pool-builders')).getByRole('checkbox', { name: 'claude-2' })).toBeChecked();
-    await userEvent.click(within(screen.getByTestId('pool-reviewers')).getByRole('checkbox', { name: 'claude-2' }));
+    // Adding a profile changes no one's work until it is ticked into a pool.
+    expect(within(screen.getByTestId('pool-builders')).getByRole('checkbox', { name: 'claude-2' })).not.toBeChecked();
+    expect(within(screen.getByTestId('pool-fast')).getByRole('checkbox', { name: 'claude-2' })).not.toBeChecked();
+    await userEvent.click(within(screen.getByTestId('pool-builders')).getByRole('checkbox', { name: 'claude-2' }));
+    await userEvent.click(within(screen.getByTestId('pool-fast')).getByRole('checkbox', { name: 'claude-2' }));
 
     const codex = screen.getByTestId('agent-codex');
     await userEvent.type(within(codex).getByLabelText(/OpenAI Platform API key/), 'sk-proj-abc');

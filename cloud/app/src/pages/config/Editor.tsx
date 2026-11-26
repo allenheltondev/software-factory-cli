@@ -577,9 +577,8 @@ function AgentsSection({ config, onChange, view, errors, installationId, keyApi,
 
   function addAgent() {
     const name = freeName(adding, config.agents);
-    // A new agent joins every pool, as the defaults do: it takes its turn building and reviewing.
-    const pools = Object.fromEntries(Object.entries(config.pools).map(([n, p]) => [n, { agents: [...p.agents, name] }]));
-    onChange({ ...config, agents: { ...config.agents, [name]: { adapter: adding, enabled: true } }, pools });
+    // A new profile joins no pool: adding it never changes who works. Tick it into the pools that should use it.
+    onChange({ ...config, agents: { ...config.agents, [name]: { adapter: adding, enabled: true } } });
   }
   function addPool() {
     const name = poolName.trim();
@@ -649,7 +648,7 @@ function AgentsSection({ config, onChange, view, errors, installationId, keyApi,
           })}
           <div className="flex flex-wrap items-end gap-2">
             <div className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
-              <Select label="Add an agent" value={adding} onChange={(e) => setAdding(e.target.value as AgentAdapter)} hint="For example a second Claude on another model; it joins every pool">
+              <Select label="Add an agent" value={adding} onChange={(e) => setAdding(e.target.value as AgentAdapter)} hint="For example a second Claude on another model; then tick it into the pools that should use it">
                 {offered.map((o) => (
                   <option key={o} value={o}>
                     {AGENT_LABEL[o]}

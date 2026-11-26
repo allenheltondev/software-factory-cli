@@ -5,11 +5,12 @@ import { api as defaultApi, ApiError, ConfigInvalidError, type ApiClient, type C
 import { tenantStatusLabel } from './GitHubSettingsPage';
 import { ConfigEditor } from './config/Editor';
 import { AGENT_LABEL, KEY_FOR, keysNeeded, sectionOf, type Section } from './config/model';
-import { isSimple, SimpleConfig, simpleBlockers } from './config/Simple';
+import { EffectiveConfig, isSimple, SimpleConfig, simpleBlockers } from './config/Simple';
+import { customSettings, describeChanges, labelGroups, type KeyStatus } from './config/team';
 
 export { issuesAt, parseLogins } from './config/model';
 
-type ConfigApi = Pick<ApiClient, 'config' | 'previewConfig' | 'publishConfig' | 'setAgentKey'>;
+type ConfigApi = Pick<ApiClient, 'config' | 'previewConfig' | 'publishConfig' | 'setAgentKey'> & Partial<Pick<ApiClient, 'agentKeys'>>;
 type Load = { state: 'loading' } | { state: 'ok'; view: ConfigView } | { state: 'error'; message: string };
 type Busy = 'preview' | 'publish' | null;
 
@@ -17,10 +18,11 @@ const message = (err: unknown) => (err instanceof Error ? err.message : 'Somethi
 const SECTION_NAME: Record<Section, string> = { repositories: 'Repositories', workflows: 'Workflows', agents: 'Agents and pools' };
 
 /**
- * A tenant's configuration: one short page (the label, the repositories, coding agents and
- * review agents) for the first setup and every change after, and the full editor (workflows,
- * named pools, agents) for configurations that need more. A publish bar says what is unsaved,
- * what still blocks a publish, and what the server refused, and where.
+ * A tenant's configuration: one page (connect agents, the default team, labels and repositories
+ * with their exceptions) for the first setup and every change after, and the full editor
+ * (workflows, named pools, agent profiles) for configurations with custom settings, which still
+ * get a readable summary. A publish bar says what publishing changes, what still blocks it, and
+ * what the server refused, and where.
  */
 export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
   const { id } = useParams();
@@ -49,6 +51,17 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
   /** The server asked for the confirmation (auto_merge_unconfirmed): its message. */
   const [serverConfirm, setServerConfirm] = useState<string | null>(null);
   const [generation, setGeneration] = useState(0);
+  /** Each key's status as the server reports it (set, and its last use); absent until read. */
+  const [keyStatus, setKeyStatus] = useState<Record<string, KeyStatus>>({});
+
+  const readKeyStatus = useCallback(() => {
+    if (!valid || !api.agentKeys) return;
+    // Only status: a failure here leaves the page as it is (the config's own key flags still say which are set).
+    Promise.resolve(api.agentKeys(installationId))
+      .then((v) => v && setKeyStatus(Object.fromEntries(v.keys.map((k) => [k.name, { configured: k.configured, ...(k.lastUsed ? { lastUsed: k.lastUsed } : {}) }]))))
+      .catch(() => undefined);
+  }, [api, installationId, valid]);
+  useEffect(readKeyStatus, [readKeyStatus]);
 
   const show = useCallback((view: ConfigView) => {
     setLoad({ state: 'ok', view });
@@ -169,8 +182,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
     try {
       const out = await api.publishConfig(installationId, { config: config!, baseVersion: activeVersion, ...(confirm ? { confirmAutoMerge: true } : {}) });
       if (activeVersion === null) {
-        const w = Object.values(config!.workflows)[0];
-        setFirstPublish({ label: w?.label ?? '', repositories: Object.keys(config!.repositories) });
+        setFirstPublish({ label: labelGroups(config!)[0]?.label ?? '', repositories: Object.keys(config!.repositories) });
       }
       setActiveVersion(out.version);
       setSaved(JSON.stringify(config));
@@ -196,9 +208,15 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
   }
 
   const status = tenantStatusLabel(view.tenant);
-  const shared = { config, onChange: edit, view, installationId, keyApi: api, onKeys: setKeys };
-  const simple = mode === 'simple' && isSimple(config);
+  const onKeys = (keys: Record<string, boolean>) => {
+    setKeys(keys);
+    readKeyStatus();
+  };
+  const shared = { config, onChange: edit, view, installationId, keyApi: api, onKeys };
+  const custom = customSettings(config);
+  const simple = mode === 'simple' && custom.length === 0;
   const blockers = simple ? simpleBlockers(config, view) : [];
+  const changes = dirty && saved ? describeChanges(JSON.parse(saved) as ConsoleConfig, config) : [];
 
   return (
     <div className="flex flex-col gap-6" data-testid="config-page">
@@ -274,10 +292,21 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
 
       {simple ? (
         <fieldset disabled={readOnly} className="flex min-w-0 flex-col gap-6">
-          <SimpleConfig {...shared} errors={errors} generation={generation} onAskAutoMerge={setConfirming} onOpenFull={() => setMode('full')} />
+          <SimpleConfig {...shared} keyStatus={keyStatus} firstRun={activeVersion === null} errors={errors} generation={generation} onAskAutoMerge={setConfirming} onOpenFull={() => setMode('full')} />
         </fieldset>
       ) : (
         <>
+          {custom.length > 0 && (
+            <Alert variant="info" data-testid="config-custom">
+              <p className="font-medium">These settings need the full editor. Nothing is changed or converted; edit them here, or anything else as before:</p>
+              <ul className="mt-2 list-disc pl-5">
+                {custom.map((c) => (
+                  <li key={c}>{c}</li>
+                ))}
+              </ul>
+            </Alert>
+          )}
+          <EffectiveConfig config={config} />
           {missingAgents.length > 0 && (
             <Alert variant="info" data-testid="config-missing-keys">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -323,6 +352,16 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
               </Alert>
             )}
 
+            {changes.length > 0 && (
+              <div className="text-sm" data-testid="pending-changes">
+                <p className="font-medium">Publishing changes:</p>
+                <ul className="list-disc pl-5 text-muted-foreground">
+                  {changes.map((c) => (
+                    <li key={c}>{c}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {errors.length > 0 && (
               <Alert variant="error" data-testid="config-errors">
                 <p className="font-medium">Nothing was published. Fix these first:</p>
