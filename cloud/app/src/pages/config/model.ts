@@ -6,8 +6,8 @@ export const NAME_RULE = 'Lower-case letters, digits and "-", at most 40';
 
 export const AGENT_LABEL: Record<AgentAdapter, string> = { claude: 'Claude Code', codex: 'Codex', kiro: 'Kiro', vibe: 'Mistral Vibe' };
 export const KEY_FOR: Record<AgentAdapter, string> = { claude: 'ANTHROPIC_API_KEY', codex: 'CODEX_API_KEY', kiro: 'KIRO_API_KEY', vibe: 'MISTRAL_API_KEY' };
-/** What an API from before the deployment named its agents offers. */
-export const DEFAULT_OFFERED: AgentAdapter[] = ['claude', 'codex'];
+/** What an API that does not name its agents offers: every supported agent. */
+export const DEFAULT_OFFERED: AgentAdapter[] = ['claude', 'codex', 'kiro', 'vibe'];
 
 /** Logins from free text: commas or spaces between them, an @ in front allowed. */
 export const parseLogins = (text: string) => [...new Set(text.split(/[\s,]+/).map((s) => s.replace(/^@/, '')).filter(Boolean))];

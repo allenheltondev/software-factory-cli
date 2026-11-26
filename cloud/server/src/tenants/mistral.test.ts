@@ -1,7 +1,5 @@
 import { expect, it, vi } from 'vitest';
 
-vi.hoisted(() => { process.env.CLOUD_AGENTS = 'claude,codex,vibe'; });
-
 const { checkAgentKeyWithProvider } = await import('./key-check.js');
 const { compileTenantConfig } = await import('./config.js');
 const { defaultConsoleConfig, toTenantSubmission } = await import('./console.js');

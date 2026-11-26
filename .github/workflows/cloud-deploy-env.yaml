@@ -115,17 +115,9 @@ jobs:
         env:
           APP_DOMAIN_NAME: ${{ inputs.domain }}
           APP_HOSTED_ZONE_ID: ${{ vars.HOSTED_ZONE_ID }}
-          OFFERED_AGENTS: ${{ vars.CLOUD_AGENTS }}
           AWS_DEPLOYMENT_ROLE_ARN: ${{ secrets.AWS_DEPLOYMENT_ROLE_ARN }}
         run: |
           export CLAUDE_IMAGE_DEPLOYMENT_ROLE_NAME="${AWS_DEPLOYMENT_ROLE_ARN##*/}"
-          if [ -n "$OFFERED_AGENTS" ]; then
-            if [[ ! "$OFFERED_AGENTS" =~ ^(claude|codex|kiro|vibe)(,(claude|codex|kiro|vibe))*$ ]]; then
-              echo "::error::CLOUD_AGENTS must be a comma-separated list of supported agent names."
-              exit 1
-            fi
-            export CLOUD_AGENTS="$OFFERED_AGENTS"
-          fi
           if [ -n "${APP_DOMAIN_NAME}" ]; then
             if [ -z "${APP_HOSTED_ZONE_ID}" ]; then
               echo "::error title=No hosted zone::Set the ${{ inputs.environment }} environment's HOSTED_ZONE_ID variable to the hosted zone that holds ${APP_DOMAIN_NAME}."

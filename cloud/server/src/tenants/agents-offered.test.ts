@@ -1,19 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
 
-// A deployment that runs Claude alone (CloudAgents=claude), as after Kiro and Codex were taken
-// out of service. Read when the modules load, so it is set before they are imported.
-vi.hoisted(() => {
-  process.env.CLOUD_AGENTS = 'claude';
-});
+// Every supported agent is always offered: there is no deployment setting that turns one off.
 
 const { generateKeyPairSync, randomBytes } = await import('node:crypto');
+const { SUPPORTED_AGENT_KEY_ENV, AGENT_KEY_ENV } = await import('./agents.js');
 const { compileTenantConfig } = await import('./config.js');
 const { dispatchRules } = await import('./dispatch.js');
 const { createMemoryStore } = await import('../store/store.js');
 const { createLauncher } = await import('../jobs/launch.js');
 const { createBroker, hashToken } = await import('../broker/broker.js');
 const { CONSOLE_AGENTS, defaultConsoleConfig, missingKeys, parseConsoleConfig, toConsolePath, toTenantSubmission } = await import('./console.js');
-const { createStatusService } = await import('./status-service.js');
 
 const REPOS = new Map([['acme/web', 9]]);
 /** One builder and one reviewer agent, each in a pool of its own. */
@@ -35,39 +31,34 @@ const compileErrors = (raw: unknown) => {
   return out.ok ? [] : out.errors.map((e) => ({ ...e, path: toConsolePath(e.path, parsed.config) }));
 };
 
-describe('agents this deployment does not run', () => {
-  it('starts with the agents it runs: Claude alone builds and reviews, and may review its own work', () => {
-    expect(CONSOLE_AGENTS).toEqual(['claude']);
+describe('the agents Updraft Cloud offers', () => {
+  it('are every supported agent', () => {
+    expect(AGENT_KEY_ENV).toEqual(SUPPORTED_AGENT_KEY_ENV);
+    expect(CONSOLE_AGENTS).toEqual(['claude', 'codex', 'kiro', 'vibe']);
+  });
+
+  it('start every pool with every agent, and compile a config that runs any one of them', () => {
     const d = defaultConsoleConfig({ login: 'pat' });
-    expect(d.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['claude'] } });
-    expect(d.workflows.implement!.review.allowSameAgent).toBe(true);
-    expect(compileErrors({ ...d, repositories: { 'acme/web': { enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: [] } } })).toEqual([]);
+    expect(d.pools).toEqual({ builders: { agents: [...CONSOLE_AGENTS] }, reviewers: { agents: [...CONSOLE_AGENTS] } });
+    for (const a of CONSOLE_AGENTS) expect(compileErrors(withAgents(a, a))).toEqual([]);
   });
 
-  it('still loads a saved config that names an agent it no longer runs, and refuses to publish one that would run it', () => {
-    const saved = withAgents('kiro', 'codex');
-    expect(parseConsoleConfig(saved).ok).toBe(true);
-    // The reviewer is in no pool a job routes to while review is off: only the builder is refused.
-    expect(compileErrors(saved)).toEqual([expect.objectContaining({ path: 'agents.writer.adapter', message: expect.stringMatching(/not an agent Updraft Cloud runs \(claude\)/) })]);
-    expect(compileErrors(withAgents('claude', 'codex', true))).toEqual([expect.objectContaining({ path: 'agents.checker.adapter' })]);
+  it('refuse an agent name that is not supported', () => {
+    const parsed = parseConsoleConfig(withAgents('gemini', 'claude'));
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.errors).toEqual([expect.objectContaining({ path: 'agents.writer.adapter' })]);
   });
 
-  it('asks for no key of an agent it does not run: compiling says to choose another', () => {
-    const parsed = parseConsoleConfig(withAgents('kiro', 'claude'));
-    if (!parsed.ok) throw new Error('did not parse');
-    expect(missingKeys(parsed.config, new Set())).toEqual([]);
-  });
-
-  it('an agent that is off is not compiled into any job, wherever it is offered', () => {
-    const saved = withAgents('claude', 'codex');
-    const off = { ...saved, agents: { ...saved.agents, checker: { adapter: 'codex', enabled: false } }, pools: { ...saved.pools, builders: { agents: ['writer'] } } };
-    const parsed = parseConsoleConfig(off);
-    if (!parsed.ok) throw new Error(JSON.stringify(parsed.errors));
-    expect(missingKeys(parsed.config, new Set(['ANTHROPIC_API_KEY']))).toEqual([]);
+  it('ask for the key of every agent that is on', () => {
+    for (const a of CONSOLE_AGENTS) {
+      const parsed = parseConsoleConfig(withAgents(a, a));
+      if (!parsed.ok) throw new Error(JSON.stringify(parsed.errors));
+      expect(missingKeys(parsed.config, new Set()).map((m) => m.message).join(" ")).toContain(SUPPORTED_AGENT_KEY_ENV[a]);
+    }
   });
 });
 
-describe('a published version that runs an agent taken out of service', () => {
+describe('a published version that needs a key no supported agent uses', () => {
   const tenant = { installationId: 55, accountId: 900, accountLogin: 'acme', accountType: 'Organization', status: 'active' as const, createdAt: '', createdBy: 's' };
   const member = { installationId: 55, sub: 's', role: 'owner' as const, githubUserId: 1, githubLogin: 'pat', addedAt: '' };
   const publish = async (store: ReturnType<typeof createMemoryStore>, keys: string[]) => {
@@ -80,8 +71,8 @@ describe('a published version that runs an agent taken out of service', () => {
   it('starts no job, and says what to change', async () => {
     const store = createMemoryStore();
     await store.putTenantWithMember(tenant, member);
-    await publish(store, ['KIRO_API_KEY']);
-    await store.putAgentKeyMeta(55, { name: 'KIRO_API_KEY', updatedAt: 't', updatedBy: 'pat' });
+    await publish(store, ['GEMINI_API_KEY']);
+    await store.putAgentKeyMeta(55, { name: 'GEMINI_API_KEY', updatedAt: 't', updatedBy: 'pat' });
     const runMicrovm = vi.fn();
     const launch = createLauncher({
       store,
@@ -96,10 +87,10 @@ describe('a published version that runs an agent taken out of service', () => {
     const payload = { action: 'labeled', issue: { number: 12 }, label: { name: 'updraft' }, sender: { login: 'pat' }, repository: { id: 9, full_name: 'acme/web' } };
     expect(await launch({ installationId: 55, deliveryId: 'd-1', body: JSON.stringify(payload), payload })).toMatchObject({ status: 200, disposition: 'missing_key' });
     expect(runMicrovm).not.toHaveBeenCalled();
-    expect((await store.listRefusals(55, 5))[0]?.reason).toMatch(/runs kiro, which Updraft Cloud no longer runs here: choose another agent/);
+    expect((await store.listRefusals(55, 5))[0]?.reason).toMatch(/needs GEMINI_API_KEY, which no agent Updraft Cloud runs uses: choose another agent/);
   });
 
-  it("hands a job only the keys of the agents the deployment runs", async () => {
+  it("hands a job the key of every supported agent", async () => {
     const store = createMemoryStore();
     await store.putTenantWithMember(tenant, member);
     const token = randomBytes(32).toString('base64url');
@@ -116,39 +107,6 @@ describe('a published version that runs an agent taken out of service', () => {
       policy: { bucket: 'b', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
     } as never);
     const out = (await broker({ action: 'start', jobId: 'job_abc12345', token })) as { descriptor?: { agentKeySecrets?: Record<string, string> } };
-    expect(Object.keys(out.descriptor?.agentKeySecrets ?? {})).toEqual(['ANTHROPIC_API_KEY']);
-  });
-});
-
-describe('the first-job step after an agent is taken out of service', () => {
-  const overview = async (triggers: { label: string; keys: string[] }[]) => {
-    const store = createMemoryStore();
-    await store.putTenantWithMember(
-      { installationId: 55, accountId: 900, accountLogin: 'acme', accountType: 'Organization', status: 'active', createdAt: '', createdBy: 's' },
-      { installationId: 55, sub: 'u1', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' },
-    );
-    const v = (await store.createConfigVersion(55, { sha256: 'x', files: ['config.yaml'], publishedBy: 'pat', publishedAt: '', dispatch: { repositories: { 'acme/web': { id: 9, actors: ['pat'], triggers } } } })) as number;
-    await store.markConfigReady(55, v);
-    await store.activateConfig(55, v);
-    const member = async () => ({ tenant: (await store.getTenant(55))!, summary: { installationId: 55, accountLogin: 'acme', accountType: 'Organization', status: 'active' as const, role: 'owner' as const }, githubLogin: 'pat' });
-    const service = createStatusService({
-      store,
-      github: {
-        member,
-        installation: async () => ({ id: 55, account: { id: 900, login: 'acme', type: 'Organization' }, suspendedAt: null, permissions: { metadata: 'read', contents: 'write', issues: 'write', pull_requests: 'write', checks: 'read', statuses: 'read' } }),
-        repositories: async () => ({ tenant: {} as never, repositories: [{ id: 9, fullName: 'acme/web', private: true, htmlUrl: 'https://github.com/acme/web' }] }),
-      },
-      agentKeys: { list: async () => ({ keys: [], refusals: [] }) },
-      readLog: async () => null,
-      log: () => {},
-    } as never);
-    return (await service.overview({ sub: 'u1' }, 55)).config;
-  };
-
-  it("skips a label whose agent it no longer runs, and names the agent when no label is left", async () => {
-    expect(await overview([{ label: 'kiro', keys: ['KIRO_API_KEY'] }, { label: 'updraft', keys: ['ANTHROPIC_API_KEY'] }])).toMatchObject({ triggers: [{ repository: 'acme/web', label: 'updraft' }] });
-    const none = await overview([{ label: 'kiro', keys: ['KIRO_API_KEY'] }, { label: 'review', keys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] }]);
-    expect(none).not.toHaveProperty('triggers');
-    expect(none.retiredAgents).toEqual(['codex', 'kiro']);
+    expect(Object.keys(out.descriptor?.agentKeySecrets ?? {})).toEqual(Object.values(SUPPORTED_AGENT_KEY_ENV));
   });
 });

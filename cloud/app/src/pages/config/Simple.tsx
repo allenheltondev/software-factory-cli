@@ -1,7 +1,6 @@
 import { useId, useState } from 'react';
 import { Button, Card, CardBody, CardDescription, CardHeader, CardTitle, EmptyState, Input, Select } from '@readysetcloud/ui';
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepository, ConsoleWorkflow } from '../../api/client';
-import { KiroNotEnabled } from '../../components/kiro';
 import { AGENT_GUIDES } from '../../lib/agentGuides';
 import { installationSettingsUrl } from '../../lib/diagnostics';
 import { AutoMerge, CiRepair, Suggestions } from './Editor';
@@ -299,11 +298,6 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
               </div>
             );
           })}
-          {!offered('kiro') && (
-            <div className="py-3">
-              <KiroNotEnabled />
-            </div>
-          )}
         </CardBody>
       </Card>
 

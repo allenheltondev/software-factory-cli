@@ -9,7 +9,7 @@ import { legacyNativeTriggers, sameNativeRepository, sameNativeTrigger, nativeJo
 import { hashToken, jobPaths } from '../broker/broker.js';
 import { NativeEnqueueRejectedError, type Job, type QuotaLimit, type Quotas, type Store } from '../store/store.js';
 import { decideDispatch, decidePullRequestDispatch, PULL_REQUEST_ACTIONS, pullRequestOfPayload } from '../tenants/dispatch.js';
-import { AGENT_KEY_ENV, SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
+import { SUPPORTED_AGENT_KEY_ENV } from '../tenants/agents.js';
 import type { BundleKeys } from '../tenants/key-needs.js';
 import { safeMessage } from '../tenants/redact.js';
 import { OFF_SWITCH, type KillSwitch } from './kill-switch.js';
@@ -530,14 +530,13 @@ export function createLauncher(deps: LaunchDeps) {
       return skip('missing_key', { reason: 'missing_key', message: reason });
     };
     if (needed === null) return refuse('Updraft could not tell which agent keys this workflow needs: publish the configuration again', { unknown: true });
-    // An agent this deployment no longer runs (CloudAgents): a version published while it did
-    // names it, and its job would get no key. Refused with what to change.
+    // A key no supported agent uses (a version published by an older release that named an agent
+    // since removed): its job would get no key. Refused with what to change.
     if (native) needed = needed.filter((k) => k !== 'ANTHROPIC_API_KEY');
-    const offered = new Set(Object.values(AGENT_KEY_ENV));
-    const retired = needed.filter((k) => !offered.has(k));
-    if (retired.length > 0) {
-      const agents = Object.entries(SUPPORTED_AGENT_KEY_ENV).filter(([, k]) => retired.includes(k)).map(([a]) => a);
-      return refuse(`This workflow runs ${agents.join(' and ')}, which Updraft Cloud no longer runs here: choose another agent in the configuration and publish it again`, { unavailable: agents });
+    const supported = new Set<string>(Object.values(SUPPORTED_AGENT_KEY_ENV));
+    const unsupported = needed.filter((k) => !supported.has(k));
+    if (unsupported.length > 0) {
+      return refuse(`This workflow needs ${unsupported.join(' and ')}, which no agent Updraft Cloud runs uses: choose another agent in the configuration and publish it again`, { unavailable: unsupported });
     }
     if (needed.length > 0) {
       const set = new Set((await deps.store.listAgentKeyMeta(req.installationId)).map((k) => k.name));
