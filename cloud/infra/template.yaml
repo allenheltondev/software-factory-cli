@@ -150,7 +150,7 @@ Parameters:
   # image/build.env: AGENT_PACKAGES for Claude Code and Codex, KIRO_INSTALL_COMMAND for Kiro).
   CloudAgents:
     Type: String
-    Default: claude,codex
+    Default: claude,codex,kiro
     AllowedPattern: '^(claude|codex|kiro|vibe)(,(claude|codex|kiro|vibe))*$'
     Description: Comma-separated agents tenants may run (claude, codex, kiro, vibe). List only the ones the job image ships.
   # Agent Timeline has no documented link to a conversation (tenants/telemetry-service.ts):
