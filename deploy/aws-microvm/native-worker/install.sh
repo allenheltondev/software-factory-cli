@@ -26,6 +26,13 @@ chown -R root:root /usr/local/lib/updraft-egress
 chmod 0755 /usr/local/lib/updraft-egress; chmod 0644 /usr/local/lib/updraft-egress/egress-shim.mjs
 cp "$here/worker.example.json" /etc/updraft-native-worker.json
 node -e 'const fs=require("fs");const p="/etc/updraft-native-worker.json";const c=JSON.parse(fs.readFileSync(p));c.claude=fs.realpathSync(process.argv[1]);fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n");' "$(command -v claude)"
+# Codex (Sign in with ChatGPT, docs/codex-subscription.md) is served only when the image installs
+# the official CLI (AGENT_PACKAGES="... @openai/codex@<pinned>"). Without it the worker refuses Codex.
+codex_auth=/usr/local/lib/node_modules/@allenheltondev/updraft/dist/agents/native-codex-auth.js
+if command -v codex >/dev/null 2>&1; then
+  [ -f "$codex_auth" ] || { echo 'Installed Updraft lacks the Codex sign-in classifier; build from the current npm pack tarball' >&2; exit 1; }
+  node -e 'const fs=require("fs");const p="/etc/updraft-native-worker.json";const c=JSON.parse(fs.readFileSync(p));c.codex=fs.realpathSync(process.argv[1]);c.codexAuthModule=fs.realpathSync(process.argv[2]);fs.writeFileSync(p,JSON.stringify(c,null,2)+"\n");' "$(command -v codex)" "$codex_auth"
+fi
 printf '{"image":"native-claude-worker"}\n' > /etc/updraft-native-sandbox.json
 printf '#!/bin/sh\nexec /usr/local/bin/node /opt/updraft/native-worker/runtime.mjs "$@"\n' > /opt/updraft/bin/updraft-native-worker
 chown -R root:root /opt/updraft/native-worker /opt/updraft/image /opt/updraft/bin

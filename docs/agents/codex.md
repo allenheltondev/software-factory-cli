@@ -11,7 +11,8 @@ launchers' account, not just your terminal):
 
 - Codex installed and signed in: `codex login status` exits 0 (a ChatGPT login or a stored
   API key), or `CODEX_API_KEY` is set in the worker's environment, which `codex exec`
-  accepts. `updraft agents` and `updraft doctor` run the same check.
+  accepts. `updraft agents` and `updraft doctor` run the same check. To require the ChatGPT
+  subscription and refuse API keys, see [On a ChatGPT subscription](#on-a-chatgpt-subscription).
 - Only agents with a live adapter enabled, a `checkoutPath` for the repository and a `prompt`
   for the action (see [Requirements](../live-execution.md#requirements)).
 
@@ -79,6 +80,15 @@ supported; use `--sandbox workspace-write` instead. Other flags from the
 Codex reads the worktree's `AGENTS.md` files. Project `.codex/config.toml` settings and
 project MCP servers load only for projects you have marked trusted, and the adapter doesn't
 pass `--trust`. Point live mode only at repositories whose checked-in instructions you trust.
+
+## On a ChatGPT subscription
+
+`authentication: native-codex` runs the profile only on the CLI's own Sign in with ChatGPT,
+never an API key: sign in once with `codex login --device-auth`, check with
+`updraft native-auth --codex`, and every run checks the login again before checkout and just
+before launch, then adds `-c model_provider="openai" -c forced_login_method="chatgpt"`. An
+`OPENAI_*` or `CODEX_API_KEY` variable, or args that choose another provider or profile, fail
+the run. Design, isolation and the hosted worker: [Codex on a ChatGPT subscription](../codex-subscription.md).
 
 ## Platform notes
 

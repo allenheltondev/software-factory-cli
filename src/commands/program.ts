@@ -195,6 +195,7 @@ export function buildProgram(opts: ProgramOptions): Command {
     .command('native-auth')
     .description('Check native coding-agent sign-in on this worker without exposing credentials')
     .option('--claude', 'check the official Claude Code subscription login')
+    .option('--codex', 'check the official Codex CLI sign-in with ChatGPT')
     .addOption(new Option('--json', 'machine-readable fixed state and reason; no account data'))
     .action((o: NativeAuthOptions) => exec((ctx) => handlers.nativeAuth(ctx, o)));
 

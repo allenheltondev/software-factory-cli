@@ -838,6 +838,93 @@ describe('LiveExecutor (Codex adapter, fake codex CLI)', { timeout: 120_000 }, (
 
   const start = (...events: Array<Record<string, unknown>>) => [cx.threadStarted(), cx.turnStarted(), cx.command('item_1', 'bash -lc "npm test"', 'ok'), ...events];
 
+  describe('native-codex (Sign in with ChatGPT)', () => {
+    const chatgpt = { code: 0, output: 'Logged in using ChatGPT\n' };
+    const guarded = (run: (...a: never[]) => Promise<{ code: number | null; output: string }>, env?: NodeJS.ProcessEnv) => new LiveExecutor({
+      ...(env ? { env } : {}),
+      locate: () => ({ path: FAKE_CODEX, launch: { file: process.execPath, args: [FAKE_CODEX] } }),
+      nativeCodexAuth: run as never,
+    });
+
+    it('runs only after both checks pass, forcing the OpenAI provider and ChatGPT login', async () => {
+      const { paths, config, db, record } = codexSetup(start(cx.agentMessage('item_2', 'Done.'), cx.turnCompleted()), { FAKE_CODEX_COMMIT: '1' });
+      config.agents.codex!.authentication = 'native-codex';
+      insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+      const c = claim(db, config, paths);
+      const run = vi.fn(async (_launch: unknown, _env: NodeJS.ProcessEnv, _cwd?: string) => chatgpt);
+      markExecutionStarted(db, c.run.id, { workerId: 'wrk_test' });
+      const result = await guarded(run).execute(c, context(db, config, paths, c.run.id));
+      expect(result.outcome).toBe('succeeded');
+      expect(run).toHaveBeenCalledTimes(2);
+      expect(run.mock.calls[0]).toHaveLength(2);
+      expect(run.mock.calls[1]![2]).toBe(join(worktreesRoot(paths), '42', c.job.id));
+      const got = JSON.parse(readFileSync(record, 'utf8')) as { argv: string[] };
+      expect(got.argv).toEqual(['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5-codex',
+        '-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"']);
+    });
+
+    it('refuses API-key, signed-out and unreadable logins before checkout, without echoing CLI output', async () => {
+      for (const [status, reason] of [
+        [{ code: 0, output: 'API key configured - sk-proj-***SECRET\n' }, 'not_subscription'],
+        [{ code: 0, output: 'Logged in using access token\n' }, 'not_subscription'],
+        [{ code: 1, output: 'Not logged in\n' }, 'sign_in_required'],
+        [{ code: 1, output: 'Error checking login status: sensitive detail\n' }, 'status_unavailable'],
+      ] as const) {
+        const { paths, config, db, record } = codexSetup(start(cx.turnCompleted()), {});
+        config.agents.codex!.authentication = 'native-codex';
+        insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+        const c = claim(db, config, paths);
+        const run = vi.fn(async () => status);
+        const err = await guarded(run).execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(StartFailedError);
+        expect((err as Error).message).toContain(reason);
+        expect((err as Error).message).not.toMatch(/SECRET|sensitive/);
+        expect(run).toHaveBeenCalledOnce();
+        expect(existsSync(join(worktreesRoot(paths), '42', c.job.id))).toBe(false);
+        expect(existsSync(record)).toBe(false);
+      }
+    });
+
+    it('refuses an API key in the environment without starting the status CLI', async () => {
+      for (const env of [{ ...process.env, OPENAI_API_KEY: 'NEVER_LOG_ME' }, { ...process.env, CODEX_API_KEY: 'NEVER_LOG_ME' }]) {
+        const { paths, config, db, record } = codexSetup(start(cx.turnCompleted()), {});
+        config.agents.codex!.authentication = 'native-codex';
+        insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+        const c = claim(db, config, paths);
+        const run = vi.fn(async () => chatgpt);
+        const err = await guarded(run, env).execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+        expect((err as Error).message).toContain('auth_override_present');
+        expect(run).not.toHaveBeenCalled();
+        expect(existsSync(record)).toBe(false);
+        expect(readFileSync(c.run.logPath!, 'utf8')).not.toContain('NEVER_LOG_ME');
+      }
+    });
+
+    it('refuses a profile that picks another provider, even when signed in', async () => {
+      const { paths, config, db, record } = codexSetup(start(cx.turnCompleted()), {});
+      config.agents.codex!.authentication = 'native-codex';
+      config.agents.codex!.args = ['-c', 'model_provider="azure"'];
+      insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+      const c = claim(db, config, paths);
+      const run = vi.fn(async () => chatgpt);
+      const err = await guarded(run).execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+      expect((err as Error).message).toContain('model_provider');
+      expect(run).not.toHaveBeenCalled();
+      expect(existsSync(record)).toBe(false);
+    });
+
+    it('stops when the login changes between checkout and launch', async () => {
+      const { paths, config, db, record } = codexSetup(start(cx.turnCompleted()), {});
+      config.agents.codex!.authentication = 'native-codex';
+      insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 7 });
+      const c = claim(db, config, paths);
+      const run = vi.fn().mockResolvedValueOnce(chatgpt).mockResolvedValueOnce({ code: 0, output: 'API key configured - sk-***\n' });
+      const err = await guarded(run).execute(c, context(db, config, paths, c.run.id)).catch((e: unknown) => e);
+      expect((err as Error).message).toContain('not ready at launch: not_subscription');
+      expect(existsSync(record)).toBe(false);
+    });
+  });
+
   it('runs codex exec with the prompt on stdin; the final message lands in the run summary', async () => {
     const final = '## Summary\n- Added the art page.\n- `npm test` passed.';
     const { paths, config, db, record } = codexSetup(start(cx.agentMessage('item_2', final), cx.turnCompleted()), { FAKE_CODEX_COMMIT: '1' });

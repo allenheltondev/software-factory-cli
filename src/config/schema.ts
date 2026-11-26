@@ -91,8 +91,12 @@ export const agentSchema = z.strictObject({
   model: z.string().optional(),
   /** Live mode: reasoning effort, mapped to the adapter's own option (see docs/agents/profiles.md). */
   effort: z.string().optional(),
-  /** Opt in to CLI-managed subscription auth; checked at the start of every Claude run (not continuously). */
-  authentication: z.enum(['default', 'native-claude']).optional(),
+  /**
+   * Opt in to CLI-managed subscription auth, checked at the start of every run (not continuously):
+   * `native-claude` (Claude Code's own claude.ai login) or `native-codex` (the Codex CLI's own
+   * Sign in with ChatGPT, docs/codex-subscription.md). Never an API key.
+   */
+  authentication: z.enum(['default', 'native-claude', 'native-codex']).optional(),
   /** Live mode: environment variables set for the agent process, on top of the worker's environment. */
   env: z.record(envName, z.string()).optional(),
   /** Live mode: run this agent in a container. `env` above is then set inside the container. */

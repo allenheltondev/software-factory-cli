@@ -6,7 +6,7 @@ import net from 'node:net';
 import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { IMAGE, DEFAULT_SOCKET, MAX_FRAME, DEFAULT_TOOL_TIMEOUT_SECONDS, EGRESS_SOCKET, loadConfig, claudeEnv, validateRun, claudeArgs, checkInventory, trustedFile, withEgress, networkNote } from './policy.mjs';
+import { IMAGE, DEFAULT_SOCKET, MAX_FRAME, DEFAULT_TOOL_TIMEOUT_SECONDS, EGRESS_SOCKET, loadConfig, claudeEnv, codexEnv, codexHome, validateRun, claudeArgs, codexArgs, checkInventory, checkCodexEvent, trustedFile, withEgress, networkNote } from './policy.mjs';
 import { createEgressProxy, mergeRules, parseEgressConfig, parseJobEgress, sanitize } from '../image/sandbox/egress-proxy.mjs';
 import { frames, send } from './protocol.mjs';
 
@@ -27,13 +27,17 @@ function kill(child) {
   if (child?.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } }
 }
 
-function captureAs(uid, gid, file, args, options, track) {
-  const child = track(startAs(uid, gid, file, args, { ...options, stdio: ['ignore', 'pipe', 'ignore'] }));
+/**
+ * Bounded output of a short official-CLI command, for a classifier only; never relayed or logged.
+ * `stderr: true` reads both streams (Codex prints its login status on stderr).
+ */
+function captureAs(uid, gid, file, args, options, track, { stderr = false } = {}) {
+  const child = track(startAs(uid, gid, file, args, { ...options, stdio: ['ignore', 'pipe', stderr ? 'pipe' : 'ignore'] }));
   return new Promise((resolve) => {
     let stdout = '';
     let invalid = false;
     const timer = setTimeout(() => { invalid = true; kill(child); }, 10000);
-    child.stdout.on('data', (data) => {
+    for (const stream of [child.stdout, ...(stderr ? [child.stderr] : [])]) stream.on('data', (data) => {
       if (Buffer.byteLength(stdout) + data.length > 65536) { invalid = true; kill(child); }
       else stdout += data.toString('utf8');
     });
@@ -72,6 +76,14 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   for (const file of [process.execPath, '/usr/bin/setpriv', sandbox, ...(c.egress ? [egressProxyModule, c.egress.shim] : []), ...['service.mjs', 'mcp.mjs', 'policy.mjs', 'protocol.mjs'].map((n) => path.join(here, n))]) trustedFile(file);
   const { nativeClaudeAuthFromStatus } = await import(pathToFileURL(c.authModule).href);
   const environment = claudeEnv(c);
+  // Codex is served only when the worker config names its official executable and classifier.
+  const codex = c.codex ? { env: codexEnv(c), ...(await import(pathToFileURL(c.codexAuthModule).href)) } : undefined;
+  if (codex) {
+    // The CLI requires CODEX_HOME to exist. It is created empty and private; only the CLI writes in it.
+    fs.mkdirSync(codexHome(c), { mode: 0o700, recursive: true });
+    fs.chownSync(codexHome(c), c.claudeUid, c.claudeGid);
+    fs.chmodSync(codexHome(c), 0o700);
+  }
   const root = path.dirname(socketPath);
   fs.mkdirSync(root, { recursive: true, mode: 0o750 });
   fs.chownSync(root, 0, c.workerGid);
@@ -146,14 +158,23 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     await ended;
   };
 
-  async function auth(cwd, sessionChildren, readiness = false) {
-    // Even the status probe never starts in a repository or loads its settings/helpers.
-    const result = await captureAs(c.claudeUid, c.claudeGid, c.claude,
-      ['--restricted', '--setting-sources', '', 'auth', 'status'], { cwd, env: environment },
-      (child) => { sessionChildren.add(child); child.once('close', () => sessionChildren.delete(child)); return track(child); });
-    const status = nativeClaudeAuthFromStatus(result, environment);
+  async function auth(cwd, sessionChildren, readiness = false, provider = 'claude') {
+    const tracked = (child) => { sessionChildren.add(child); child.once('close', () => sessionChildren.delete(child)); return track(child); };
+    let status;
+    if (provider === 'codex') {
+      if (!codex) throw new Error('Codex is not installed on this worker');
+      // `codex login status` reads the CLI's own auth store; only its fixed sentence is classified.
+      const result = await captureAs(c.claudeUid, c.claudeGid, c.codex,
+        ['-c', 'cli_auth_credentials_store="file"', 'login', 'status'], { cwd, env: codex.env }, tracked, { stderr: true });
+      status = codex.nativeCodexAuthFromStatus({ code: result.code, output: result.stdout }, codex.env);
+    } else {
+      // Even the status probe never starts in a repository or loads its settings/helpers.
+      const result = await captureAs(c.claudeUid, c.claudeGid, c.claude,
+        ['--restricted', '--setting-sources', '', 'auth', 'status'], { cwd, env: environment }, tracked);
+      status = nativeClaudeAuthFromStatus(result, environment);
+    }
     if (readiness) return status.state === 'login_required' ? 'auth-required' : ['connected', 'expired'].includes(status.state) ? status.state : 'unavailable';
-    if (status.state !== 'connected') throw new Error(`native Claude subscription unavailable (${status.reason})`);
+    if (status.state !== 'connected') throw new Error(`native ${provider} subscription unavailable (${status.reason})`);
   }
 
   async function executeTool(runArgs, run, command, sessionChildren) {
@@ -183,8 +204,13 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     });
   }
 
-  async function claudeSession(runArgs, run, prompt, client, cancel) {
-    const dir = fs.mkdtempSync(`${scratch}/claude-`);
+  /**
+   * One official-CLI session (`provider` claude or codex) whose only repository access is the
+   * MCP exec tool below. The CLI runs as the credential identity in a private directory; every
+   * command it asks for runs in the job sandbox as the job identity.
+   */
+  async function agentSession(provider, runArgs, run, prompt, client, cancel) {
+    const dir = fs.mkdtempSync(`${scratch}/${provider}-`);
     fs.chownSync(dir, c.claudeUid, c.claudeGid);
     fs.chmodSync(dir, 0o700);
     const toolSocket = `${dir}/tools.sock`;
@@ -219,24 +245,29 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
     let child;
     cancel.stop = () => { failed = true; kill(child); for (const p of sessionChildren) kill(p); };
     try {
-      await auth(dir, sessionChildren);
+      await auth(dir, sessionChildren, false, provider);
       if (client.destroyed || failed) return 125;
-      const config = JSON.stringify({ mcpServers: { updraft: { command: process.execPath, args: [path.join(here, 'mcp.mjs'), toolSocket] } } });
-      const args = claudeArgs(run.command.slice(1), config, { egress: Boolean(egress) });
+      const mcp = { command: process.execPath, args: [path.join(here, 'mcp.mjs'), toolSocket] };
+      const args = provider === 'codex'
+        ? codexArgs(run.command.slice(1), mcp, { egress: Boolean(egress) })
+        : claudeArgs(run.command.slice(1), JSON.stringify({ mcpServers: { updraft: mcp } }), { egress: Boolean(egress) });
       await new Promise((resolve, reject) => { tools.once('error', reject); tools.listen(toolSocket, resolve); });
       // Cancellation can arrive while the socket starts, before a child exists to kill.
       if (client.destroyed || failed) return 125;
       fs.chownSync(toolSocket, c.claudeUid, c.claudeGid);
       fs.chmodSync(toolSocket, 0o600);
-      child = track(startAs(c.claudeUid, c.claudeGid, c.claude, args,
-        { cwd: dir, env: environment, stdio: ['pipe', 'pipe', 'pipe'] }));
+      child = track(startAs(c.claudeUid, c.claudeGid, provider === 'codex' ? c.codex : c.claude, args,
+        { cwd: dir, env: provider === 'codex' ? codex.env : environment, stdio: ['pipe', 'pipe', 'pipe'] }));
       child.stdin.end(prompt);
-      // Gate all output and tool calls on the official CLI's advertised tool inventory.
-      // Refuse built-in Read/Bash/Agent/etc even if a future CLI changes flag behavior.
+      // Claude: gate all output and tool calls on the official CLI's advertised tool inventory,
+      // refusing built-in Read/Bash/Agent/etc even if a future CLI changes flag behavior.
+      // Codex announces no inventory: every event is judged, and any tool but ours ends the session.
       frames(child.stdout, (event) => {
         if (failed || client.destroyed) return;
         try {
-          if (!initialized) {
+          if (provider === 'codex') {
+            if (checkCodexEvent(event)) initialized = true;
+          } else if (!initialized) {
             if (!checkInventory(event)) return;
             initialized = true;
           }
@@ -281,6 +312,13 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
         const run = validateRun(runArgs, c);
         active.set(run.name, cancel);
         try {
+          if (run.command.length === 2 && run.command[0] === 'codex' && run.command[1] === '--version') {
+            if (!codex) return 125;
+            const version = await captureAs(c.claudeUid, c.claudeGid, c.codex, ['--version'], { cwd: '/', env: codex.env },
+              (child) => { cancel.stop = () => kill(child); return track(child); });
+            if (version.code !== 0 || !/^codex-cli \d+\.\d+\.\d+\S*\s*$/.test(version.stdout)) return 125;
+            output(version.stdout); return 0;
+          }
           if (run.command.length === 2 && run.command[0] === 'claude' && run.command[1] === '--version') {
             const version = await captureAs(c.claudeUid, c.claudeGid, c.claude,
               ['--restricted', '--setting-sources', '', '--version'], { cwd: '/', env: environment },
@@ -288,7 +326,11 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
             if (version.code !== 0 || !/^\d+\.\d+\.\d+ \(Claude Code\)\s*$/.test(version.stdout)) return 125;
             output(version.stdout); return 0;
           }
-          if (run.command[0] === 'claude') return await claudeSession(runArgs, run, prompt, client, cancel);
+          if (run.command[0] === 'claude') return await agentSession('claude', runArgs, run, prompt, client, cancel);
+          if (run.command[0] === 'codex') {
+            if (!codex) throw new Error('Codex is not installed on this worker');
+            return await agentSession('codex', runArgs, run, prompt, client, cancel);
+          }
           // Updraft verification invocations are allowed arbitrary commands, always sandboxed,
           // with the same registry egress as the agent's own tool calls.
           const child = sandboxChild(['run', ...withEgress(runArgs, run, run.command, egress)]);
@@ -365,10 +407,11 @@ export async function startService(c, socketPath = DEFAULT_SOCKET, storageProbe 
   return {
     applyJobEgress,
     resetJobEgress,
-    async authStatus() {
+    /** Sanitized readiness of one provider's login: `claude` (the default) or `codex`. */
+    async authStatus(provider = 'claude') {
       const cwd = fs.mkdtempSync(`${scratch}/status-`);
       fs.chownSync(cwd, c.claudeUid, c.claudeGid);
-      try { return await auth(cwd, new Set(), true); }
+      try { return await auth(cwd, new Set(), true, provider); }
       catch { return 'unavailable'; }
       finally { fs.rmSync(cwd, { recursive: true, force: true }); }
     },

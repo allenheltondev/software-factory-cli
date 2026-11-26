@@ -24,6 +24,24 @@ describe('validateConfig', () => {
     if (!wrong.ok) expect(wrong.errors).toContainEqual({ path: 'agents.claude.authentication', message: expect.stringMatching(/Claude adapter/) });
   });
 
+  it('native-codex requires a host-native Codex adapter and no provider or key overrides', () => {
+    const cfg = example();
+    cfg.agents.codex = { enabled: true, authentication: 'native-codex', model: 'gpt-5-codex', effort: 'high' };
+    expect(validateConfig(cfg).ok).toBe(true);
+    const errorsOf = (mutate: (a: Record<string, unknown>) => void) => {
+      const c = example();
+      c.agents.codex = { enabled: true, authentication: 'native-codex' };
+      mutate(c.agents.codex);
+      const r = validateConfig(c);
+      return r.ok ? [] : r.errors;
+    };
+    expect(errorsOf((a) => { a.container = { image: 'example/codex:latest' }; })).toContainEqual({ path: 'agents.codex.authentication', message: expect.stringMatching(/credential isolation/) });
+    expect(errorsOf((a) => { a.adapter = 'claude'; })).toContainEqual({ path: 'agents.codex.authentication', message: expect.stringMatching(/Codex adapter/) });
+    expect(errorsOf((a) => { a.args = ['-c', 'model_provider="azure"']; })).toContainEqual({ path: 'agents.codex.args', message: expect.stringMatching(/model_provider/) });
+    expect(errorsOf((a) => { a.args = ['--profile', 'api']; })).toContainEqual({ path: 'agents.codex.args', message: expect.stringMatching(/--profile/) });
+    expect(errorsOf((a) => { a.env = { OPENAI_API_KEY: 'sk-test' }; })).toContainEqual({ path: 'agents.codex.env.OPENAI_API_KEY', message: expect.stringMatching(/ChatGPT sign-in/) });
+  });
+
   it('accepts the shipped example and applies defaults', () => {
     const r = validateConfig(example());
     expect(r.ok).toBe(true);

@@ -1,4 +1,4 @@
-// This prototype deliberately exposes one MCP tool and no built-in Claude tools.
+// This prototype deliberately exposes one MCP tool and no built-in agent tools (Claude or Codex).
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseRunArgs } from '../image/sandbox/updraft-sandbox.mjs';
@@ -85,7 +85,7 @@ export function validateRun(argv, config) {
   run.env.forEach(checkEnvironment);
   if (run.tmpfs.length !== 1 || run.tmpfs[0].path !== '/updraft-home') throw new Error('unexpected temporary mounts');
   // `updraft doctor` probes the executable without a repository mount or working directory.
-  if (run.command.length === 2 && run.command[0] === 'claude' && run.command[1] === '--version' && !run.workdir && !run.mounts.length) return run;
+  if (run.command.length === 2 && ['claude', 'codex'].includes(run.command[0]) && run.command[1] === '--version' && !run.workdir && !run.mounts.length) return run;
   if (!run.workdir || !inside(fs.realpathSync(run.workdir), config.workRoot)) throw new Error('worktree is outside workRoot');
   for (const mount of run.mounts) {
     if (mount.source !== mount.target || !inside(fs.realpathSync(mount.source), config.workRoot)) throw new Error('mount is outside workRoot');
@@ -135,6 +135,77 @@ export function claudeArgs(input, mcpConfig, { egress = false } = {}) {
     `Use only mcp__updraft__exec for repository work, including reading, editing, git and tests. The tool starts each command in the job worktree. ${networkNote(egress)} Commit changes when the task requires it.`, ...safe];
 }
 
+/**
+ * The official Codex CLI (docs/codex-subscription.md), restricted the way claudeArgs restricts
+ * Claude: started outside the repository with none of its own configuration, rules, hooks or
+ * project files, its built-in shell, exec, image and web-search tools switched off, its own
+ * sandbox read-only with no approvals (a second layer should a built-in tool ever remain), only
+ * the CLI-owned ChatGPT login on the OpenAI provider, and one MCP server whose one tool runs
+ * every repository command in the job sandbox. Option names are those of codex-rs (openai/codex:
+ * exec/src/cli.rs, config/src/config_toml.rs, features/src/lib.rs). `mcp` is { command, args }.
+ * Updraft's adapter flags (--json, the bypass default, the subscription overrides) are consumed;
+ * only a model and a reasoning effort pass through. Anything else is refused.
+ */
+export const CODEX_SERVER = 'updraft';
+export const CODEX_TOOL = 'exec';
+const toml = (value) => JSON.stringify(value);
+const PROFILE_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+export function codexArgs(input, mcp, { egress = false } = {}) {
+  if (input[0] !== 'exec') throw new Error('native worker runs only codex exec');
+  const safe = [];
+  let json = false;
+  for (let i = 1; i < input.length; i++) {
+    const flag = input[i];
+    if (flag === '--json' || flag === '--experimental-json') { json = true; continue; }
+    if (flag === '--dangerously-bypass-approvals-and-sandbox') continue;
+    if (flag === '--model' || flag === '-m') {
+      const value = input[++i];
+      if (typeof value !== 'string' || !PROFILE_VALUE.test(value)) throw new Error('invalid profile value');
+      safe.push('--model', value);
+      continue;
+    }
+    if (flag === '-c' || flag === '--config') {
+      const spec = input[++i];
+      if (spec === 'model_provider="openai"' || spec === 'forced_login_method="chatgpt"') continue;
+      const effort = /^model_reasoning_effort="([a-z]{1,16})"$/.exec(spec ?? '');
+      if (!effort) throw new Error('unsupported Codex configuration in isolated worker');
+      safe.push('-c', `model_reasoning_effort=${toml(effort[1])}`);
+      continue;
+    }
+    throw new Error('unsupported Codex option in isolated worker');
+  }
+  if (!json) throw new Error('only headless JSONL runs are supported');
+  const instructions = `Use only the ${CODEX_SERVER} MCP server's ${CODEX_TOOL} tool for repository work, including reading, editing, git and tests. The tool starts each command in the job worktree. ${networkNote(egress)} Commit changes when the task requires it.`;
+  return ['exec', '--json', '--skip-git-repo-check', '--ephemeral', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only',
+    '-c', 'approval_policy="never"', '-c', 'model_provider="openai"', '-c', 'forced_login_method="chatgpt"', '-c', 'cli_auth_credentials_store="file"',
+    '-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false', '-c', 'features.view_image=false', '-c', 'web_search="disabled"',
+    '-c', 'check_for_update_on_startup=false',
+    '-c', `mcp_servers.${CODEX_SERVER}.command=${toml(mcp.command)}`, '-c', `mcp_servers.${CODEX_SERVER}.args=${toml(mcp.args)}`,
+    '-c', `mcp_servers.${CODEX_SERVER}.required=true`, '-c', `mcp_servers.${CODEX_SERVER}.enabled_tools=${toml([CODEX_TOOL])}`,
+    '-c', `mcp_servers.${CODEX_SERVER}.default_tools_approval_mode="approve"`,
+    '-c', `developer_instructions=${toml(instructions)}`, ...safe];
+}
+
+/**
+ * The Codex counterpart of checkInventory. `codex exec --json` announces no tool list up front,
+ * so the supervisor judges every event instead: a turn may only think, talk, keep its to-do list
+ * and call the one Updraft tool. Any other item (a built-in command, file change, web search,
+ * collaboration call, or a type this code does not know) means a tool other than ours is in
+ * reach, and the whole session is killed before anything else it says is relayed. Returns true
+ * once the thread has started (tool calls are served only after that).
+ */
+const CODEX_EVENTS = ['thread.started', 'turn.started', 'turn.completed', 'turn.failed', 'error'];
+const CODEX_ITEMS = ['agent_message', 'reasoning', 'todo_list', 'error'];
+export function checkCodexEvent(event) {
+  if (!event || typeof event !== 'object' || typeof event.type !== 'string') throw new Error('unexpected Codex output; isolation rejected');
+  if (CODEX_EVENTS.includes(event.type)) return event.type === 'thread.started';
+  if (!['item.started', 'item.updated', 'item.completed'].includes(event.type)) throw new Error('unexpected Codex event; isolation rejected');
+  const item = event.item;
+  if (item && CODEX_ITEMS.includes(item.type)) return false;
+  if (item?.type === 'mcp_tool_call' && item.server === CODEX_SERVER && item.tool === CODEX_TOOL) return false;
+  throw new Error('Codex used a tool other than the isolated one; isolation rejected');
+}
+
 export function checkInventory(event) {
   if (event.type !== 'system' || event.subtype !== 'init') return false;
   if (!Array.isArray(event.tools) || !event.tools.includes(TOOL) || event.tools.some((t) => ![TOOL, 'EndConversation'].includes(t))) {
@@ -162,7 +233,9 @@ export function loadConfig(file) {
   trustedFile(file);
   const c = JSON.parse(fs.readFileSync(file, 'utf8'));
   const keys = ['workerUid', 'workerGid', 'claudeUid', 'claudeGid', 'credentialHome', 'workRoot', 'claude', 'sandboxConfig', 'authModule'];
-  const optional = ['egress', 'toolTimeoutSeconds'];
+  // Codex is optional: `codex` (the official executable) and `codexAuthModule` (Updraft's
+  // dist/agents/native-codex-auth.js) come together, or the worker refuses Codex runs.
+  const optional = ['egress', 'toolTimeoutSeconds', 'codex', 'codexAuthModule'];
   if (Object.keys(c).some((k) => !keys.includes(k) && !optional.includes(k)) || keys.some((k) => c[k] === undefined)) throw new Error('invalid worker configuration');
   if (c.toolTimeoutSeconds !== undefined && (!Number.isInteger(c.toolTimeoutSeconds) || c.toolTimeoutSeconds < 10 || c.toolTimeoutSeconds > 1800)) {
     throw new Error('toolTimeoutSeconds must be 10 to 1800');
@@ -179,7 +252,11 @@ export function loadConfig(file) {
   for (const key of keys.slice(4)) {
     if (typeof c[key] !== 'string' || !path.isAbsolute(c[key]) || fs.realpathSync(c[key]) !== c[key]) throw new Error('worker paths must be canonical absolute paths');
   }
-  for (const key of ['claude', 'sandboxConfig', 'authModule']) trustedFile(c[key]);
+  if ((c.codex === undefined) !== (c.codexAuthModule === undefined)) throw new Error('codex and codexAuthModule are configured together');
+  for (const key of ['codex', 'codexAuthModule']) {
+    if (c[key] !== undefined && (typeof c[key] !== 'string' || !path.isAbsolute(c[key]) || fs.realpathSync(c[key]) !== c[key])) throw new Error('worker paths must be canonical absolute paths');
+  }
+  for (const key of ['claude', 'sandboxConfig', 'authModule', ...(c.codex ? ['codex', 'codexAuthModule'] : [])]) trustedFile(c[key]);
   const home = fs.statSync(c.credentialHome);
   if (!home.isDirectory() || home.uid !== c.claudeUid || (home.mode & 0o077)) throw new Error('credential home must be private to the Claude account');
   // EFS access points replace the client's UID. The NFS root's mode alone is insufficient:
@@ -193,4 +270,14 @@ export function loadConfig(file) {
 export function claudeEnv(c) {
   return { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: c.credentialHome,
     CLAUDE_CONFIG_DIR: `${c.credentialHome}/.claude`, DISABLE_AUTOUPDATER: '1' };
+}
+
+/**
+ * The Codex CLI's environment: the same private credential home, with the CLI's own state (its
+ * ChatGPT login in auth.json, which only the CLI reads and refreshes) in CODEX_HOME beneath it.
+ * Nothing inherited, so no API key, token or endpoint override can reach it.
+ */
+export const codexHome = (c) => `${c.credentialHome}/.codex`;
+export function codexEnv(c) {
+  return { PATH: '/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8', HOME: c.credentialHome, CODEX_HOME: codexHome(c) };
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Destructive only to a fresh /var/lib test fixture. Requires Linux root + bubblewrap.
 // Exercises the real supervisor, MCP transport, Unix accounts and namespace sandbox.
-// The Claude stand-in uses ONLY synthetic credentials. No user auth files are read.
+// The Claude and Codex stand-ins use ONLY synthetic credentials. No user auth files are read.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -42,6 +42,7 @@ try {
   fs.chmodSync(shimDir, 0o755);
   fs.chmodSync(`${shimDir}/egress-shim.mjs`, 0o644);
   fs.copyFileSync(path.resolve(source, '../../../dist/agents/native-claude-auth.js'), `${fixture}/auth.mjs`);
+  fs.copyFileSync(path.resolve(source, '../../../dist/agents/native-codex-auth.js'), `${fixture}/codex-auth.mjs`);
   // Copies may retain checkout ownership as well as group-writable modes. Model a real
   // root installation explicitly, before creating the separately owned data directories.
   execFileSync('/bin/chown', ['-R', 'root:root', fixture]);
@@ -52,19 +53,27 @@ try {
   const credentialHome = `${credentialParent}/home`;
   const workRoot = `${fixture}/jobs`;
   const work = `${workRoot}/repo`;
-  for (const dir of [credentialHome, `${credentialHome}/.claude`, workRoot, work]) fs.mkdirSync(dir, { recursive: true });
+  for (const dir of [credentialHome, `${credentialHome}/.claude`, `${credentialHome}/.codex`, workRoot, work]) fs.mkdirSync(dir, { recursive: true });
   fs.chownSync(credentialParent, claudeUid, claudeUid);
   fs.chmodSync(credentialParent, 0o700);
   execFileSync('/bin/chown', ['-R', `${claudeUid}:${claudeUid}`, credentialHome]);
   execFileSync('/bin/chmod', ['-R', '0700', credentialHome]);
   fs.writeFileSync(`${credentialHome}/.claude/.credentials.json`, marker, { mode: 0o600 });
   fs.chownSync(`${credentialHome}/.claude/.credentials.json`, claudeUid, claudeUid);
+  // The Codex CLI keeps its ChatGPT login in CODEX_HOME/auth.json: a synthetic one, never a real login.
+  const codexAuthFile = `${credentialHome}/.codex/auth.json`;
+  fs.writeFileSync(codexAuthFile, JSON.stringify({ tokens: { refresh_token: marker } }), { mode: 0o600 });
+  fs.chownSync(codexAuthFile, claudeUid, claudeUid);
+  const codexState = `${credentialHome}/.codex/status.json`;
+  const setCodexStatus = (status) => { fs.writeFileSync(codexState, JSON.stringify(status), { mode: 0o600 }); fs.chownSync(codexState, claudeUid, claudeUid); };
+  setCodexStatus({ code: 0, text: 'Logged in using ChatGPT' });
   const state = `${credentialHome}/status.json`;
   const setStatus = (status) => { fs.writeFileSync(state, JSON.stringify(status), { mode: 0o600 }); fs.chownSync(state, claudeUid, claudeUid); };
   setStatus({ loggedIn: true, authMethod: 'claude.ai' });
   execFileSync('/bin/chown', ['-R', `${workerUid}:${workerUid}`, workRoot]);
   const config = { workerUid, workerGid: workerUid, claudeUid, claudeGid: claudeUid,
-    credentialHome, workRoot, claude: `${fixture}/claude`, sandboxConfig: `${fixture}/sandbox.json`, authModule: `${fixture}/auth.mjs` };
+    credentialHome, workRoot, claude: `${fixture}/claude`, sandboxConfig: `${fixture}/sandbox.json`, authModule: `${fixture}/auth.mjs`,
+    codex: `${fixture}/codex`, codexAuthModule: `${fixture}/codex-auth.mjs` };
   fs.writeFileSync(config.sandboxConfig, JSON.stringify({ image: 'native-claude-worker' }), { mode: 0o644 });
   // This fake verifies the CLI launch contract and drives the REAL MCP tool bridge.
   fs.writeFileSync(config.claude, `#!${process.execPath}
@@ -101,10 +110,60 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   child.stdin.end();
 });
 `, { mode: 0o755 });
+  // The Codex stand-in checks the restricted launch contract, then drives the same REAL MCP bridge.
+  // Its status comes from a synthetic file; `builtin` makes it act like a CLI whose built-in shell
+  // is still on: it announces a command_execution item and then tries a command anyway.
+  fs.writeFileSync(`${fixture}/codex`, `#!${process.execPath}
+const fs = require('fs'), cp = require('child_process'), rl = require('readline');
+const args = process.argv.slice(2);
+if (args[0] === '--version') { console.log('codex-cli 0.200.0'); process.exit(0); }
+const login = args.indexOf('login');
+if (login >= 0 && args[login + 1] === 'status') {
+  const status = JSON.parse(fs.readFileSync(process.env.CODEX_HOME + '/status.json', 'utf8'));
+  process.stderr.write(status.text + '\\n'); process.exit(status.code);
+}
+if (args[0] !== 'exec') process.exit(90);
+function required(...seq) { for (let i = 0; i + seq.length <= args.length; i++) if (seq.every((v, k) => args[i + k] === v)) return; process.exit(91); }
+required('--json'); required('--skip-git-repo-check'); required('--ephemeral'); required('--ignore-user-config'); required('--ignore-rules');
+required('--sandbox', 'read-only'); required('-c', 'approval_policy="never"'); required('-c', 'features.shell_tool=false'); required('-c', 'features.unified_exec=false');
+required('-c', 'model_provider="openai"'); required('-c', 'forced_login_method="chatgpt"'); required('-c', 'web_search="disabled"');
+if (args.includes('--dangerously-bypass-approvals-and-sandbox')) process.exit(93);
+if (Object.keys(process.env).some((n) => /^(OPENAI_|CODEX_API_KEY|CODEX_ACCESS_TOKEN|GIT_|NODE_OPTIONS|ANTHROPIC_)/.test(n))) process.exit(92);
+const value = (key) => { const a = args.find((x) => x.startsWith(key + '=')); return a && JSON.parse(a.slice(key.length + 1)); };
+fs.writeFileSync(process.env.HOME + '/codex-session-launched', 'synthetic launch marker');
+const emit = (e) => console.log(JSON.stringify(e));
+let prompt = ''; process.stdin.on('data', (x) => prompt += x); process.stdin.on('end', async () => {
+  const spec = JSON.parse(prompt);
+  const child = cp.spawn(value('mcp_servers.updraft.command'), value('mcp_servers.updraft.args'), { stdio: ['pipe', 'pipe', 'inherit'] });
+  let next = 0; const pending = new Map();
+  rl.createInterface({ input: child.stdout }).on('line', (line) => { const r = JSON.parse(line); pending.get(r.id)?.(r); pending.delete(r.id); });
+  const rpc = (method, params) => new Promise((resolve) => { const id = ++next; pending.set(id, resolve); child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\\n'); });
+  await rpc('initialize', {}); await rpc('tools/list', {});
+  emit({ type: 'thread.started', thread_id: 'synthetic-thread' }); emit({ type: 'turn.started' });
+  if (spec.builtin) {
+    emit({ type: 'item.started', item: { id: 'b1', type: 'command_execution', command: 'cat auth.json', status: 'in_progress' } });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  const output = [];
+  for (const [n, command] of (spec.commands || []).entries()) {
+    emit({ type: 'item.started', item: { id: 'm' + n, type: 'mcp_tool_call', server: 'updraft', tool: 'exec', arguments: { command }, status: 'in_progress' } });
+    const r = await rpc('tools/call', { name: 'exec', arguments: { command } });
+    output.push(r.result?.content?.map((c) => c.text).join('\\n') || JSON.stringify(r.error));
+    emit({ type: 'item.completed', item: { id: 'm' + n, type: 'mcp_tool_call', server: 'updraft', tool: 'exec', arguments: { command }, status: 'completed' } });
+  }
+  emit({ type: 'item.completed', item: { id: 'a1', type: 'agent_message', text: output.join('\\n') } });
+  emit({ type: 'turn.completed', usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } });
+  child.stdin.end();
+});
+`, { mode: 0o755 });
   const { loadConfig } = await import(pathToFileURL(`${fixture}/native-worker/policy.mjs`).href);
   const configFile = `${fixture}/worker.json`;
   fs.writeFileSync(configFile, JSON.stringify(config), { mode: 0o644 });
   assert.deepEqual(loadConfig(configFile), config);
+  fs.writeFileSync(configFile, JSON.stringify({ ...config, codexAuthModule: undefined }), { mode: 0o644 });
+  assert.throws(() => loadConfig(configFile), /together/);
+  fs.writeFileSync(configFile, JSON.stringify(config), { mode: 0o644 });
+  results.push('Codex needs both its official executable and the classifier in the root-owned worker config');
   fs.chmodSync(credentialParent, 0o755);
   assert.throws(() => loadConfig(configFile), /private local parent/);
   fs.chmodSync(credentialParent, 0o700);
@@ -248,6 +307,60 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   }
   results.push('API auth, signed-out and expired login fail closed; Cloud readiness returns only sanitized states');
   setStatus({ loggedIn: true, authMethod: 'claude.ai' });
+
+  // Codex (Sign in with ChatGPT): the same boundary with the Codex CLI's own login in CODEX_HOME.
+  const codexArgv = (name = `codex-${randomUUID()}`) => argv(['codex', 'exec', '--json', '--dangerously-bypass-approvals-and-sandbox', '--model', 'gpt-5-codex'], name);
+  const codexRun = (commands, other = {}) => request(codexArgv(), JSON.stringify({ commands, ...other }));
+  assert.equal(await service.authStatus('codex'), 'connected');
+  const codexDoctor = await request(['run', '--rm', '--name', 'codex-doctor', '--user', `${workerUid}:${workerUid}`, '--network', 'none',
+    '--tmpfs', '/updraft-home:rw,exec,mode=1777', '-e', 'HOME=/updraft-home', 'native-claude-worker', 'codex', '--version']);
+  assert.equal(codexDoctor.code, 0, codexDoctor.output);
+  assert(codexDoctor.output.startsWith('codex-cli '), codexDoctor.output);
+  const readableCodex = execFileSync('/usr/bin/setpriv', ['--reuid', String(claudeUid), '--regid', String(claudeUid), '--clear-groups', 'cat', codexAuthFile], { encoding: 'utf8' });
+  assert(readableCodex.includes(marker));
+  const codexAttacks = [
+    `cat ${quote(codexAuthFile)}`,
+    `cat ${quote(`${credentialHome}/.codex/status.json`)}`,
+    `${fromSupervisor} cat /proc/${process.pid}/root${codexAuthFile}`,
+    `ln -s ${quote(`${credentialHome}/.codex`)} stolen-codex; cat stolen-codex/auth.json`,
+    `node -e 'require("fs").readFileSync(${JSON.stringify(codexAuthFile)})'`,
+    'env | grep -i -E "codex_home|openai" && exit 0 || exit 1',
+  ];
+  const codexAttack = await codexRun(codexAttacks);
+  assert.equal(codexAttack.code, 0, codexAttack.output);
+  assert(!codexAttack.output.includes(marker), codexAttack.output);
+  assert(!codexAttack.output.includes('exit=0'), codexAttack.output);
+  assert(codexAttack.output.includes('"type":"turn.completed"'), codexAttack.output);
+  results.push("Codex: the CLI's ChatGPT auth.json is unreadable from repository commands (file, parent root, symlink, Node subprocess, environment)");
+  const codexGood = await codexRun(['printf "export const codex = 1;\\n" > codex.js', 'node -e \'if(!require("fs").readFileSync("codex.js","utf8").includes("codex"))process.exit(1)\'']);
+  assert.equal(codexGood.code, 0, codexGood.output);
+  assert.equal((codexGood.output.match(/exit=0/g) ?? []).length, 2, codexGood.output);
+  results.push('Codex: restricted exec launch (no built-in shell, read-only own sandbox, ChatGPT-only login on the OpenAI provider) edits and checks through the isolated tool');
+  const builtinMarker = `${work}/codex-after-builtin`;
+  const builtin = await codexRun([`touch ${quote(builtinMarker)}`], { builtin: true });
+  assert.equal(builtin.code, 125, builtin.output);
+  assert(!builtin.output.includes('command_execution'), builtin.output);
+  assert(!fs.existsSync(builtinMarker), 'a repository command ran after Codex announced a built-in tool');
+  results.push('Codex: a built-in tool item ends the session before it is relayed, and no later tool call runs');
+  for (const [status, readiness] of [[{ code: 0, text: `API key configured - ${marker}` }, 'unavailable'], [{ code: 1, text: 'Not logged in' }, 'auth-required'],
+    [{ code: 0, text: 'Logged in using access token' }, 'unavailable'], [{ code: 1, text: `Error checking login status: ${marker}` }, 'unavailable']]) {
+    setCodexStatus(status);
+    assert.equal(await service.authStatus('codex'), readiness);
+    const launched = `${credentialHome}/codex-session-launched`;
+    fs.rmSync(launched, { force: true });
+    const refused = await codexRun(['touch codex-should-not-exist']);
+    assert.equal(refused.code, 125);
+    assert(!refused.output.includes(marker));
+    assert(!fs.existsSync(`${work}/codex-should-not-exist`));
+    assert(!fs.existsSync(launched), 'Codex launched without a ChatGPT login');
+  }
+  setCodexStatus({ code: 0, text: 'Logged in using ChatGPT' });
+  for (const extra of [['--sandbox', 'danger-full-access'], ['-c', 'model_provider="azure"'], ['-c', 'mcp_servers.evil.command="/bin/sh"'], ['--profile', 'api'], ['--add-dir', '/']]) {
+    const args = argv(['codex', 'exec', '--json', ...extra]);
+    assert.equal((await request(args, JSON.stringify({ commands: ['touch codex-flag-ran'] }))).code, 125);
+    assert(!fs.existsSync(`${work}/codex-flag-ran`));
+  }
+  results.push('Codex: API-key, access-token, signed-out and unreadable logins and caller-chosen sandbox, provider, MCP or profile options fail closed; readiness stays sanitized');
   const later = `${work}/orphan-ran`;
   await request(argv(['/bin/sh', '-c', `echo started; sleep 2; touch ${quote(later)}`]), '', (text, socket) => { if (text.includes('started')) socket.destroy(); });
   await pause(2500);
@@ -375,7 +488,7 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
     'const fs=require("fs");const p=process.argv[1];let f;try{f=fs.readdirSync(p).find(n=>n.startsWith("sessions-"))}catch(e){console.log(e.code);process.exit(0)}require("net").connect(p+"/"+f+"/egress/proxy.sock").on("connect",()=>console.log("connected")).on("error",e=>console.log(e.code))',
     path.dirname(socketPath)], { encoding: 'utf8' });
   assert(!claudeConnect.stdout.includes('connected'), claudeConnect.stdout);
-  results.push('the Claude identity cannot open the egress proxy socket');
+  results.push('the Claude/Codex credential identity cannot open the egress proxy socket');
   const egressVerify = await request(argv(['/bin/sh', '-c', 'echo "verify proxy=${HTTPS_PROXY:-none}"']));
   assert.equal(egressVerify.code, 0, egressVerify.output);
   assert(/verify proxy=http:\/\/127\.0\.0\.1:\d+/.test(egressVerify.output), egressVerify.output);
@@ -418,7 +531,7 @@ let prompt=''; process.stdin.on('data',x=>prompt+=x); process.stdin.on('end',asy
   service.resetJobEgress();
   assert((await verifyVia(`${tenantHost}:443`)).output.includes('(not-allowed)'));
   results.push("an installation's registry host is reachable only through the dispatcher's per-job policy, never from a socket client or the sandbox; inward names, addresses and another job's policy stay refused, and the end of the job removes it");
-  console.log(JSON.stringify({ passed: results, limitations: ['Synthetic Claude CLI, not a model call', 'Local durable directory, not a deployed EFS mount', 'No AWS replacement or subscription end-to-end proof'] }, null, 2));
+  console.log(JSON.stringify({ passed: results, limitations: ['Synthetic Claude and Codex CLIs, not a model call; the real Codex tool surface under these flags needs live verification', 'Local durable directory, not a deployed EFS mount', 'No AWS replacement or subscription end-to-end proof'] }, null, 2));
 } finally {
   await probe?.close();
   await service?.close();
