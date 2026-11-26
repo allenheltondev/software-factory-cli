@@ -215,6 +215,30 @@ describe('createGitHubApi: the review loop', () => {
     ]);
   });
 
+  it('names the workflow run of a GitHub Actions check run, from its URL, and re-runs its failed jobs', async () => {
+    const { fn, calls } = fakeFetch((url, call) => {
+      if (call.method === 'POST') return new Response(null, { status: 201 });
+      if (url.pathname.endsWith('/status')) return json({ total_count: 0, statuses: [] });
+      return json({
+        total_count: 2,
+        check_runs: [
+          { id: 71, name: 'windows-latest / node 22', status: 'completed', conclusion: 'failure', completed_at: '2026-11-18T12:00:00Z', html_url: 'https://github.com/o/r/actions/runs/555/job/71', app: { slug: 'github-actions' } },
+          { id: 72, name: 'other', status: 'completed', conclusion: 'failure', html_url: 'https://ci.example/actions/runs/1', details_url: 'https://github.com/o/r/runs/72' },
+        ],
+      });
+    });
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const checks = await api.getCommitChecks(repo, SHA);
+    expect(checks.details?.[0]).toMatchObject({ checkRunId: 71, workflowRunId: 555, completedAt: '2026-11-18T12:00:00Z' });
+    expect(checks.details?.[1]).not.toHaveProperty('workflowRunId');
+    // 201 with no body is a re-run accepted.
+    await api.rerunFailedJobs!(repo, 555);
+    expect(calls.at(-1)).toMatchObject({ method: 'POST', url: 'https://api.github.com/repositories/42/actions/runs/555/rerun-failed-jobs' });
+
+    const refused = await createGitHubApi({ token: 't', fetch: fakeFetch(() => json({ message: 'This workflow run cannot be retried' }, { status: 403 })).fn });
+    await expect(refused.rerunFailedJobs!(repo, 555)).rejects.toMatchObject({ status: 403 });
+  });
+
   it('reads a failed check run\'s annotations and the end of its job log, sending the token only to the API', async () => {
     const seen: Array<{ url: string; auth: string | null; redirect: string | undefined }> = [];
     const fn = (async (input: string | URL | Request, init?: RequestInit) => {

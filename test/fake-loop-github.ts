@@ -37,7 +37,8 @@ type Failable =
   | 'resolveReviewThread'
   | 'unresolveReviewThread'
   | 'listReviewThreads'
-  | 'openIssue';
+  | 'openIssue'
+  | 'rerunFailedJobs';
 
 export class FakeLoopGitHub {
   login = 'updraft-bot';
@@ -61,6 +62,8 @@ export class FakeLoopGitHub {
   /** Every call, in order. */
   readonly calls: string[] = [];
   readonly merges: MergePullRequestInput[] = [];
+  /** Workflow runs whose failed jobs were re-run, in order. */
+  readonly reruns: number[] = [];
   /** Errors to throw on the next call of a method (consumed once), or on every call. */
   failNext: Partial<Record<Failable, GitHubError>> = {};
   failAlways: Partial<Record<Failable, GitHubError>> = {};
@@ -301,6 +304,12 @@ export class FakeLoopGitHub {
     this.calls.push(`getCheckRunDiagnostics ${checkRunId}`);
     this.maybeFail('getCheckRunDiagnostics');
     return this.diagnostics[checkRunId] ?? { annotations: [], logTail: null, problems: ['there is no GitHub Actions log for this check'] };
+  }
+  async rerunFailedJobs(_repo: RepoRef, workflowRunId: number): Promise<void> {
+    this.calls.push(`rerunFailedJobs ${workflowRunId}`);
+    this.maybeFail('rerunFailedJobs');
+    this.writes.push(`rerun ${workflowRunId}`);
+    this.reruns.push(workflowRunId);
   }
   async mergePullRequest(_repo: RepoRef, pull: number, input: MergePullRequestInput): Promise<{ merged: boolean; sha: string | null; message: string }> {
     this.calls.push('mergePullRequest');
