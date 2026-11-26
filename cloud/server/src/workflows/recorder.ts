@@ -6,7 +6,7 @@
  */
 import type { Job, JobFinishDetail, Store, WorkflowPause } from '../store/store.js';
 import type { WorkflowStore } from './store.js';
-import { actorOf, endedWait, keepPaused, pauseControlOf, pausedWorkflow, resumedWorkflow, stillPausedMessage, waitFrom, type PauseRef } from './timeline.js';
+import { actorOf, endedWait, keepPaused, overlayOf, pauseControlOf, pausedWorkflow, pauseNoticedMessage, resumedWorkflow, stillPausedMessage, waitFrom, type PauseRef } from './timeline.js';
 import { newWorkflow, onJobFinished, onJobQueued, onJobStarted, onJobWaiting, onQueueCovered, onQueueEnded, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
 
 type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'> & Partial<Pick<Job, 'expiresAt' | 'native'>>;
@@ -219,6 +219,30 @@ export function createWorkflowRecorder(o: {
         });
       }),
     /**
+     * A command (a GitHub mention, control/mentions.ts) paused or canceled the workflow: its PAUSE
+     * record, as written (after any takeover), overlays the workflow now, worded as the command,
+     * and the timeline shows who. Its synthetic job id (`control-<comment>`) names no job.
+     */
+    commanded: (where: { installationId: number; workflowId: string }, pause: { jobId: string; at: number; by: string; control?: unknown; reason?: string }) =>
+      safely('command', { jobId: pause.jobId, installationId: where.installationId } as JobRef, async () => {
+        const control = pauseControlOf(pause.control);
+        if (!control) return;
+        const at = now();
+        const ref: PauseRef = { jobId: pause.jobId, at: pause.at, by: pause.by, control };
+        const action = control.kind === 'cancel' ? 'canceled' : 'paused';
+        await updateWorkflow(o.store, where.installationId, where.workflowId, (w) => {
+          if (!w) return null;
+          return {
+            workflow: pausedWorkflow(w, ref, at),
+            event: {
+              id: `control:${action}:${pause.jobId}:${pause.at}`, at: new Date(at).toISOString(), kind: 'control', generation: w.generation, jobId: pause.jobId,
+              control: { action, by: actorOf(pause.by) ?? 'an owner', ...(pause.reason ? { reason: pause.reason.slice(0, 200) } : {}) },
+              message: pauseNoticedMessage(ref),
+            },
+          };
+        });
+      }),
+    /**
      * An owner resumed a pause (from the workflow or from the stopped job): the workflow says
      * what it said before, now, and the timeline shows who resumed it and how long it was paused.
      * `workflowId` when the resume named it; otherwise the stopped job's.
@@ -234,9 +258,14 @@ export function createWorkflowRecorder(o: {
         const other: PauseRef | null = found && found !== 'unknown' ? { jobId: found.jobId, at: found.at, by: found.by, ...withControl((found as { control?: unknown }).control) } : null;
         await updateWorkflow(o.store, where.installationId, id, (w) => {
           if (!w) return null;
-          const ours = w.controlPause?.jobId === pause.jobId && w.controlPause.at === pause.at;
-          const waited = waitFrom('pause', pause.at, at);
-          const next = !ours
+          const ours = overlayOf(w, pause);
+          const waited = waitFrom('pause', w.controlPause && ours ? Math.min(w.controlPause.at, pause.at) : pause.at, at);
+          // An overlay of another pause (a stop's, recorded before a command took the pause over) is
+          // lifted too, but only once the pauses were read and none holds the workflow any more.
+          const free = !ours && !!o.pauses && found === null && !!w.controlPause;
+          const next = free
+            ? resumedWorkflow(w, at)
+            : !ours
             ? { ...w, updatedAt: new Date(at).toISOString() }
             : found === 'unknown'
               // Not known to be unpaused: it stays paused, and the reconciler settles it at its next run.

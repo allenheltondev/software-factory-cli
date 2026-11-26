@@ -120,7 +120,8 @@ export interface WorkflowWait {
 
 /** A person's control action, as the timeline shows it. */
 export interface WorkflowControl {
-  action: 'stop_requested' | 'resumed';
+  /** `paused` / `canceled`: a command's (a GitHub mention's) pause or cancel. */
+  action: 'stop_requested' | 'paused' | 'canceled' | 'resumed';
   /** Who: the GitHub login (or the console caller) Updraft authorized. */
   by: string;
   /** Their own short reason, as they gave it to the console. */

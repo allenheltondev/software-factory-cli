@@ -395,7 +395,7 @@ export interface WorkflowEvent {
   routing?: { source: string; pool?: string; tier?: string; requestedTier?: string; reason?: string };
   reason?: string;
   waited?: WorkflowWait;
-  control?: { action: 'stop_requested' | 'resumed' | string; by: string; reason?: string };
+  control?: { action: 'stop_requested' | 'paused' | 'canceled' | 'resumed' | string; by: string; reason?: string };
   /** When it happened, if earlier than when it was recorded (`at`). */
   occurredAt?: string;
   subscription?: boolean;

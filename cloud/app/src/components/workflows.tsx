@@ -156,6 +156,14 @@ export function WorkflowTotalsView({ totals }: { totals: WorkflowTotals }) {
   );
 }
 
+/** A person's control action, as the timeline names it: a console stop, or a command given on GitHub. */
+const CONTROL_TITLE: Record<string, string> = {
+  stop_requested: 'Stop requested',
+  paused: 'Paused from GitHub',
+  canceled: 'Canceled from GitHub',
+  resumed: 'Automation resumed',
+};
+
 function eventTitle(e: WorkflowEvent): string {
   switch (e.kind) {
     case 'job_started':
@@ -179,7 +187,7 @@ function eventTitle(e: WorkflowEvent): string {
     case 'admitted':
       return 'Started from the queue';
     case 'control':
-      return e.control?.action === 'resumed' ? 'Automation resumed' : e.control?.action === 'stop_requested' ? 'Stop requested' : 'Control';
+      return CONTROL_TITLE[e.control?.action ?? ''] ?? 'Control';
     default:
       // A kind this console does not know (recorded by a newer or older server): shown as it is.
       return String((e as { kind: string }).kind).replace(/_/g, ' ');

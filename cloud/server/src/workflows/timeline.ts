@@ -94,19 +94,25 @@ export interface PauseRef {
   control?: PauseControl;
 }
 
-const CODE = /^[a-z][a-z0-9_-]{0,39}$/;
 /**
  * Who, as it may appear in a workflow's words: a GitHub login (an App's ends `[bot]`), or the
  * console caller's id that a stop records when the caller has no login (a Cognito sub, a UUID).
  */
 const ACTOR = /^[A-Za-z0-9-]{1,39}(\[bot\])?$/;
-export const actorOf = (by: unknown): string | undefined => (typeof by === 'string' && ACTOR.test(by) ? by : undefined);
+/** A GitHub command records its actor as `github:<login>`: named by the login. */
+export const actorOf = (by: unknown): string | undefined => {
+  if (typeof by !== 'string') return undefined;
+  const who = by.startsWith('github:') ? by.slice('github:'.length) : by;
+  return ACTOR.test(who) ? who : undefined;
+};
+/** A pause's source: a short code, or the id of the GitHub comment that gave the command. */
+const SOURCE = /^(?:[a-z][a-z0-9_-]{0,39}|[0-9]{1,20})$/;
 
 /** A PAUSE record's `control` descriptor, if it is a well-formed one (anything else is ignored). */
 export function pauseControlOf(raw: unknown): PauseControl | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const c = raw as Record<string, unknown>;
-  if ((c.kind !== 'pause' && c.kind !== 'cancel') || typeof c.source !== 'string' || !CODE.test(c.source)) return undefined;
+  if ((c.kind !== 'pause' && c.kind !== 'cancel') || typeof c.source !== 'string' || !SOURCE.test(c.source)) return undefined;
   const by = actorOf(c.by);
   return { kind: c.kind, source: c.source, ...(by ? { by } : {}) };
 }
@@ -128,7 +134,8 @@ function pauseWords(pause: PauseRef): { message: string; nextAction: string } {
 function commandPause(pause: PauseRef): string {
   const c = pause.control!;
   const who = actorOf(c.by) ?? actorOf(pause.by);
-  return `Automation was ${c.kind === 'cancel' ? 'canceled' : 'paused'}${who ? ` by ${who}` : ''} (${c.source.replace(/[_-]/g, ' ')})`;
+  const from = /^[0-9]+$/.test(c.source) ? 'from a GitHub comment' : c.source.replace(/[_-]/g, ' ');
+  return `Automation was ${c.kind === 'cancel' ? 'canceled' : 'paused'}${who ? ` by ${who}` : ''} (${from})`;
 }
 
 /** The timeline's words for a pause first noticed (by the reconciler). */
@@ -194,6 +201,17 @@ export function keepPaused(before: Workflow | null, next: Workflow, at: number):
   if (!before?.controlPause || next.controlPause) return next;
   const { previous: _p, ...pause } = before.controlPause;
   return pausedWorkflow(next, pause, at);
+}
+
+/**
+ * Whether the workflow's pause overlay is of the pause being resumed: the same stop or command
+ * (its job id), as that pause stands now or as it was before a takeover. A takeover (a `pause`
+ * made a cancel, a cancel extended) keeps the job id and moves `at` forward, so an overlay that
+ * recorded an earlier `at` is still of it. Never a newer one: a resume decided against an older
+ * identity does not lift an overlay recorded since.
+ */
+export function overlayOf(w: Pick<Workflow, 'controlPause'>, pause: { jobId: string; at: number }): boolean {
+  return w.controlPause?.jobId === pause.jobId && w.controlPause.at <= pause.at;
 }
 
 /** What the console says about how much of a workflow's history is kept. */

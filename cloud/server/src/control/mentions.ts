@@ -53,6 +53,8 @@ export interface MentionDeps {
   /** Whether a pull request with no linked issue is still Updraft's: a workflow of it, or a pause on it. */
   managedPullRequest?: (installationId: number, repositoryId: number, pullRequest: number) => Promise<boolean>;
   consoleOrigin?: string;
+  /** The workflow timeline (workflows/recorder.ts): a command's pause, cancel and resume show there at once. Best effort. */
+  workflows?: Pick<import('../workflows/recorder.js').WorkflowRecorder, 'commanded' | 'resumed'>;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
 }
@@ -194,6 +196,12 @@ export function createMentionHandler(d: MentionDeps) {
       }
       const ref = `#${issue ?? number}${onPullRequest && issue !== undefined ? ` (pull request #${number})` : ''}`;
       const workflowId = workflowIdFor(repositoryId, issue !== undefined ? { issue } : { pullRequest: number });
+      // The pause held now, on the workflow's timeline (whatever took it over last).
+      const recordHeld = async () => {
+        if (!d.workflows || !workflowId) return;
+        const p = await held().catch(() => null);
+        if (p?.control) await d.workflows.commanded({ installationId: e.installationId, workflowId }, p);
+      };
       const link = d.consoleOrigin && workflowId ? ` [Workflow](${new URL(`/installations/${e.installationId}/workflows/${workflowId}`, d.consoleOrigin).href}).` : '';
 
       // The workflow's active jobs: on one of its subjects.
@@ -246,6 +254,7 @@ export function createMentionHandler(d: MentionDeps) {
           if ((await d.store.pauseWorkflowSubjects(e.installationId, repositoryId, controlPause('pause'), subjects)) === 'held') {
             return finish('noop', `${ref} was paused in the meantime; nothing changed.${link}`);
           }
+          await recordHeld();
           const running = await activeJobs();
           const still = running.length ? ` Still running: ${running.map((j) => `job ${j.jobId}`).join(', ')}; it finishes its current step and may still publish it. \`stop\` stops it now.` : '';
           return finish('applied', `Paused ${ref}: nothing new starts until it is resumed; queued work waits and is not started.${still}${link}`);
@@ -294,6 +303,8 @@ export function createMentionHandler(d: MentionDeps) {
             if (result) { stopped.push(job.jobId); said.push(`${job.jobId} (${result.state})`); }
           }
           let unrecorded = '';
+          // After the stops, which may have recorded their own: the cancel is what holds it.
+          const recordCancel = recordHeld;
           if (stopped.length) {
             const recorded = await takeOver(null, (p) => {
               const prior = p.control?.stopped ?? (p.control ? [] : [p.jobId]);
@@ -304,6 +315,7 @@ export function createMentionHandler(d: MentionDeps) {
               unrecorded = ` The workflow changed meanwhile, so the stopped jobs are not all recorded for resume: after resuming, run ${stopped.join(', ')} again with Retry job in the console if needed.`;
             }
           }
+          await recordCancel();
           return finish('applied',
             `Canceled work on ${ref}:${queued.length ? ` queued ${queued.join(', ')} canceled;` : ''}${said.length ? ` stopping ${said.join(', ')};` : ''} commits and pull requests are kept. Nothing starts until a maintainer resumes it.${unrecorded}${link}`);
         }
@@ -313,6 +325,7 @@ export function createMentionHandler(d: MentionDeps) {
           const outcome = await resumeWorkflowPause(d.store, { installationId: e.installationId, repositoryId, subject: subjects.find((s) => (current.subjects ?? []).includes(s)) ?? subjects[0]!, expected: current, by, at: now() });
           if (outcome === 'stop_pending') return finish('refused', `The stopped job ${current.jobId} is still stopping. Resume once it is confirmed stopped.${link}`);
           if (outcome !== 'resumed') return finish('refused', `${ref} was paused again in the meantime; nothing was resumed.${link}`);
+          if (workflowId) await d.workflows?.resumed({ installationId: e.installationId, workflowId }, { jobId: current.jobId, at: current.at }, by);
           // Stopped jobs (a stop's, or every job a cancel stopped): each runs again from its own
           // event, through the console's retry (once per job, every current check).
           const toRetry = current.control ? (current.control.stopped ?? []) : [current.jobId];

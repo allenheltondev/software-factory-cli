@@ -240,7 +240,7 @@ describe('workflows in the console', () => {
       },
       { id: 'recovery:ci:1:abc:1:1', at: NOW, seq: 6, kind: 'recovery', generation: 1, jobId: 'job_abcdefgh01', headSha: 'abcdef1234567890', message: 'Started the CI step.' },
       { id: 'control:stop:job_abcdefgh01:1', at: NOW, seq: 7, kind: 'control', generation: 1, jobId: 'job_abcdefgh01', control: { action: 'stop_requested', by: 'pat', reason: 'wrong file' } },
-      { id: 'control:pause:control-abc:1', at: NOW, seq: 7, kind: 'control', generation: 1, jobId: 'control-abc', control: { action: 'stop_requested', by: 'pat' } },
+      { id: 'control:pause:control-abc:1', at: NOW, seq: 7, kind: 'control', generation: 1, jobId: 'control-abc', control: { action: 'paused', by: 'pat' } },
       { id: 'control:resume:job_abcdefgh01:1', at: NOW, seq: 8, kind: 'control', generation: 1, jobId: 'job_abcdefgh01', control: { action: 'resumed', by: 'sam' }, waited: { for: 'pause', since: NOW, seconds: 3600 } },
       { id: 'job_late00001:finished', at: NOW, occurredAt: old, seq: 9, kind: 'finish_recovered', generation: 1, jobId: 'job_late00001', outcome: 'failed', waited: { for: 'ci', since: NOW, seconds: 90 } },
     ];
@@ -284,6 +284,7 @@ describe('workflows in the console', () => {
     expect(within(resumed).getByRole('link', { name: 'Job' })).toHaveAttribute('href', '/installations/55/jobs/job_abcdefgh01');
     // An id that names no job record (a command's) gets no job link at all.
     expect(within(screen.getByTestId('event-control:pause:control-abc:1')).queryByRole('link', { name: 'Job' })).toBeNull();
+    expect(screen.getByTestId('event-control:pause:control-abc:1')).toHaveTextContent(/Paused from GitHub.*By pat/);
     const kept = screen.getByTestId('workflow-history');
     expect(kept).toHaveTextContent('Showing the latest 10 events; 3 older events are not shown.');
     expect(kept).toHaveTextContent('began more than 90 days ago');
