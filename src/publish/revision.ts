@@ -230,6 +230,7 @@ function askedFor(review: RevisionRequest['review'], trigger: RevisionRequest['t
     const link = checkLink(review.url);
     return `the checks that failed on ${code(short(review.headSha ?? '?'))}${link ? ` (${link})` : ''}`;
   }
+  if (trigger === 'suggestions') return `the review's suggestions on ${code(short(review.headSha ?? '?'))} (${review.url})`;
   return `the changes requested by ${code(review.author)} in ${review.url}`;
 }
 
@@ -319,6 +320,7 @@ export function renderNoChangeReply(o: { runId: string; agent: string; review: R
     [
       `Updraft ran a revision for ${askedFor(o.review, o.trigger)}, but the agent made no commits, so nothing was pushed.`,
       ...(o.trigger === 'ci_failure' ? ['', 'The failed checks stay failed on this commit, and Updraft will not try again for it: fixing them is up to a person.'] : []),
+      ...(o.trigger === 'suggestions' ? ['', 'Each suggestion is answered in its thread: declined with the reason, or deferred to a follow-up issue.'] : []),
       '',
       `From run ${code(o.runId)} (agent ${inline(o.agent)}).`,
       '',
@@ -346,7 +348,9 @@ export function renderNotPushedNotice(o: { runId: string; review: RevisionReques
       '',
       o.trigger === 'ci_failure'
         ? 'Updraft will not fix the checks of this commit again by itself. A new commit on this branch gets a new review and new checks.'
-        : 'To get a revision that builds on the current head, submit a new review that requests changes.',
+        : o.trigger === 'suggestions'
+          ? 'The commit the reviewer found ready is unchanged; its open suggestions go into a follow-up issue.'
+          : 'To get a revision that builds on the current head, submit a new review that requests changes.',
     ],
     revisionMarker(o.runId),
   );
@@ -490,7 +494,10 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
   };
   // Quiet notifications: a CI fix is said on the issue's status comment, not on the pull request,
   // so it posts no claim and no reply (only a refusal to push, which a person has to look at).
-  const silent = request.trigger === 'ci_failure' && quietFor(deps.config, job);
+  // A suggestion revision likewise, and not even that: whatever becomes of it, the head the
+  // reviewer found ready is merged and its suggestions answered in their threads (suggestions.ts).
+  const silent = (request.trigger === 'ci_failure' || request.trigger === 'suggestions') && quietFor(deps.config, job);
+  const mute = silent && request.trigger === 'suggestions';
   const claiming = deps.claimReviews === true && !silent;
   // ...and claims its push where no one sees it instead: a ref of its own on the remote
   // (revisionClaimRef), read the same way as a comment claim. One revision per review, still.
@@ -606,7 +613,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       // 3a. Nothing to push; the reviewer is still owed an answer (one, from whichever run gets there first).
       const first = await answeredElsewhere(null);
       if (first) throw new Superseded(first);
-      await comment(() => renderNoChangeReply({ runId, agent: run.agent, review: request.review, summary: run.summary, selection: selectionOf(run), trigger: request.trigger }), { headSha: baseSha });
+      if (!mute) await comment(() => renderNoChangeReply({ runId, agent: run.agent, review: request.review, summary: run.summary, selection: selectionOf(run), trigger: request.trigger }), { headSha: baseSha });
       const reason = `the agent made no commits on top of ${short(baseSha)}; nothing was pushed`;
       const done = finish({ state: 'skipped', error: reason });
       await runLog([`skipped: ${reason}`]);
@@ -754,7 +761,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       const refusal = err;
       try {
         hold({ moved: refusal.moved });
-        await comment(() => renderNotPushedNotice({ runId, review: request.review, reason: refusal.notice, localBranch: run.summary.branch, trigger: request.trigger }));
+        if (!mute) await comment(() => renderNotPushedNotice({ runId, review: request.review, reason: refusal.notice, localBranch: run.summary.branch, trigger: request.trigger }));
       } catch (commentErr) {
         if (commentErr instanceof RevisionSupersededError) err = commentErr;
         else {

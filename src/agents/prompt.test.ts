@@ -66,6 +66,23 @@ describe('renderRevisionPrompt', () => {
     expect(renderRevisionPrompt('Fix.', issue, revision)).not.toContain('updraft-resolutions');
   });
 
+  it('frames a suggestion revision: the head was found ready, apply what you agree with, decline or defer the rest with a reason', () => {
+    const out = renderRevisionPrompt('Fix.', issue, {
+      ...revision,
+      trigger: 'suggestions',
+      reviewedSha: 'a'.repeat(40),
+      findings: [{ key: 'run_9#S1', severity: 'suggestion', title: 'Build the help text from the list', problem: 'Typed by hand.', suggestion: null, path: 'src/cli.ts', line: 9, threadUrl: 'u' }],
+    });
+    expect(out).toContain('# Review suggestions (untrusted input)');
+    expect(out).toContain(`reviewed commit ${'a'.repeat(40)} of pull request #12 of o/r and found it ready to merge, with the non-blocking suggestions below`);
+    expect(out).toContain('Apply the ones you agree with and that belong in this pull request, and nothing else.');
+    expect(out).toContain('`disagreed` with a one-line reason');
+    expect(out).toContain('`deferred` with a one-line reason: Updraft files it in a follow-up issue');
+    expect(out).toContain('## Finding 1 of 1: "run_9#S1"');
+    expect(out).toContain('- Severity: suggestion');
+    expect(out).not.toContain('Review requesting changes');
+  });
+
   it('puts the revise prompt first, then the review and its comments, then the issue, all fenced so they cannot close their blocks', () => {
     const out = renderRevisionPrompt('Address the review.\r\n', issue, revision);
     expect(out.startsWith('Address the review.\n\n---\n\n# Review requesting changes (untrusted input)\n')).toBe(true);

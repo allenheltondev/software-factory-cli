@@ -714,6 +714,87 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     expect(remoteSha(p)).toBe(a.localSha);
   });
 
+  /** The suggestion revision of PR #100 for the head `sha`: the review id every machine gives it. */
+  const suggestionsReq = (base: RevisionRequest, sha: string): RevisionRequest => ({
+    ...base,
+    trigger: 'suggestions',
+    reviewedSha: sha,
+    review: { ...base.review, id: `suggestions:${PR}`, url: `https://github.com/${FULL}/pull/${PR}#pullrequestreview-77`, author: 'updraft-bot[bot]', body: 'Two suggestions.', headSha: sha },
+    findings: [{ key: 'run_rev#S1', severity: 'suggestion', title: 'Build the help text from the list', problem: 'p', suggestion: null, path: null, line: null, threadUrl: null }],
+  });
+
+  it('quiet notifications: a suggestion revision says nothing on the PR, pushed or not; verbose answers as before', async () => {
+    const p = await published();
+    const head = remoteSha(p)!;
+    const s = await revised(p, { req: suggestionsReq(request(p), head) });
+    const api = new FakeCommentsApi();
+    const quiet = makeConfig(s.f, { notifications: 'quiet', review: true });
+    expect((await reviseRun(deps(s, api, { config: quiet, claimReviews: true }), s.runId)).status).toBe('published');
+    expect(remoteSha(p)).toBe(s.localSha);
+    expect(api.comments).toEqual([]);
+
+    // Nothing to commit: no "made no commits" reply either; its threads are answered by the suggestion step.
+    const q = await published();
+    const none = await revised(q, { commits: 0, req: suggestionsReq(request(q), remoteSha(q)!) });
+    const api2 = new FakeCommentsApi();
+    expect((await reviseRun(deps(none, api2, { config: makeConfig(none.f, { notifications: 'quiet', review: true }) }), none.runId)).status).toBe('skipped');
+    expect(api2.comments).toEqual([]);
+
+    // A branch that moved under it (a person pushed): not pushed, and no notice either.
+    const m = await published();
+    const moved = await revised(m, { req: suggestionsReq(request(m), remoteSha(m)!) });
+    moved.f.pushCommit(moved.prBranch, 'by-hand.txt', 'pushed while the agent ran\n');
+    const api3 = new FakeCommentsApi();
+    expect(await reviseRun(deps(moved, api3, { config: makeConfig(moved.f, { notifications: 'quiet', review: true }) }), moved.runId)).toMatchObject({ status: 'failed', moved: true });
+    expect(api3.comments).toEqual([]);
+
+    // Verbose: the reply names the suggestions it was for, and one that changed nothing says where the answers are.
+    const v = await published();
+    const verbose = await revised(v, { commits: 0, req: suggestionsReq(request(v), remoteSha(v)!) });
+    const api4 = new FakeCommentsApi();
+    expect((await reviseRun(deps(verbose, api4), verbose.runId)).status).toBe('skipped');
+    expect(api4.comments).toHaveLength(1);
+    expect(api4.comments[0]!.body).toMatch(/a revision for the review's suggestions on `[0-9a-f]{12}`/);
+    expect(api4.comments[0]!.body).toContain('declined with the reason, or deferred to a follow-up issue');
+  });
+
+  it('quiet notifications: two runners running the one suggestion revision land exactly one, and the other gives way silently', async () => {
+    const p = await published();
+    const head = remoteSha(p)!;
+    const a = await revised(p, { req: suggestionsReq(request(p), head) });
+    // The second machine's job for the same pull request: the same review id (suggestions:<pr>).
+    const other = suggestionsReq(request(p), head);
+    const b = await revised(p, { req: { ...other, review: { ...other.review, id: 'suggestions-second-machine' } } });
+    const env = JSON.parse((p.db.prepare('SELECT envelope FROM jobs WHERE id = ?').get(b.jobId) as { envelope: string }).envelope) as { revision: RevisionRequest };
+    env.revision.review.id = `suggestions:${PR}`;
+    p.db.prepare('UPDATE jobs SET envelope = ? WHERE id = ?').run(JSON.stringify(env), b.jobId);
+    expect(b.baseSha).toBe(a.baseSha);
+
+    const quiet = makeConfig(p.f, { notifications: 'quiet', review: true });
+    const apiA = new FakeCommentsApi();
+    const apiB = new FakeCommentsApi();
+    let resultA: Awaited<ReturnType<typeof reviseRun>> | undefined;
+    let raced = false;
+    const racing: RunGit = async (args, opts) => {
+      if (args[0] === 'push' && !raced) {
+        raced = true;
+        resultA = await reviseRun(deps(a, apiA, { config: quiet, claimReviews: true }), a.runId);
+      }
+      return runGit(args, opts);
+    };
+    const resultB = await reviseRun(deps(b, apiB, { config: quiet, claimReviews: true, runGit: racing }), b.runId);
+    expect(resultA).toMatchObject({ status: 'published' });
+    expect(resultB).toMatchObject({ status: 'skipped' });
+    expect(getRevision(p.db, b.runId)!.error).toMatch(/^superseded: /);
+    expect(remoteSha(p)).toBe(a.localSha);
+    expect(p.f.git(p.f.clone, 'log', '--format=%H', `${head}..${a.localSha}`).split('\n')).toHaveLength(1);
+    expect(apiA.comments).toEqual([]);
+    expect(apiB.comments).toEqual([]);
+    const claims = p.f.git(p.f.root, 'ls-remote', p.f.remoteDir, 'refs/updraft/*');
+    expect(claims).toContain(`${a.localSha}\trefs/updraft/revision-claims/suggestions-${PR}/${a.runId}`);
+    expect(claims).not.toContain(b.runId);
+  });
+
   it('quiet notifications: a remote that refuses the claim ref costs only the claim, never the CI fix', async () => {
     const p = await published();
     const failedSha = remoteSha(p)!;

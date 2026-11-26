@@ -350,6 +350,19 @@ describe('the simple page', () => {
     expect(sentConfig(api).repositories['acme/web']?.notifications).toBe('verbose');
   });
 
+  it('shows and publishes the review suggestions setting: address by default, stored as nothing; follow-up or ignore when chosen', async () => {
+    const config = withRepo();
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published({ config })), publishConfig: publishedOk(2) });
+    configPage(api);
+    const web = await screen.findByTestId('repo-acme/web');
+    await userEvent.click(within(web).getByRole('button', { name: 'Settings for acme/web' }));
+    const select = within(web).getByLabelText('Review suggestions');
+    expect(select).toHaveValue('address');
+    await userEvent.selectOptions(select, 'follow-up');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(sentConfig(api).repositories['acme/web']?.suggestions).toBe('follow-up');
+  });
+
   it('drops CI repair with the last review agent, keeping the repository\'s other settings, and publishes', async () => {
     const config = withRepo();
     config.repositories['acme/web'] = { ...config.repositories['acme/web']!, publish: 'pr', verify: ['npm test'], ci: { ignore: ['preview'] } };

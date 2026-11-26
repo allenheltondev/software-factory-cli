@@ -30,7 +30,7 @@ reviews:
 | Queued | Updraft Cloud's queue, only if the work waited for capacity | that it waits for capacity; no time and no agent |
 | Assigned | the run, when its worker claims it | the table below |
 | PR opened | publication | `PR #N opened` with its link; the table gains the observed model |
-| Reviewing, Revising, Fixing checks, Changes requested, Waiting for checks, Ready to merge, Checks passed | review, revision and CI-fix jobs and the review's verdict | e.g. `Revising PR #12 for review round 2`, `Fixing failed checks on abc1234 of PR #12 (CI fix 1)` |
+| Reviewing, Revising, Fixing checks, Addressing suggestions, Changes requested, Waiting for checks, Ready to merge, Checks passed | review, revision, CI-fix and suggestion jobs and the review's verdict | e.g. `Revising PR #12 for review round 2`, `Fixing failed checks on abc1234 of PR #12 (CI fix 1)`, `Applying the review's suggestions to abc1234 of PR #12, which the review found ready` |
 | Ready for a person to merge, Revision limit reached, Changes requested, Waiting for a person | the verdict, the CI step, auto-merge or a review-loop job that failed, when the loop rests until a person acts | what the person does next (the review or the please-act comment on the PR says how) |
 | Merged, Closed | auto-merge, or the review loop seeing a merge or close by anyone | `PR #N was merged`, `... merged after CI fix N`, `PR #N was closed without being merged` |
 | Finished, Waiting | a run that succeeded without a pull request | no changes to publish, publishing off, an action that opens none, or a wait on another pull request |
@@ -110,7 +110,9 @@ to do and, when hosted, the console link:
   revision's own reply states the same merge policy as the PR body;
 - the review itself (including a verdict held back as `needs-verification`), its inline findings,
   thread replies and replies to mention commands ([controls.md](controls.md)), which are the
-  product, not status.
+  product, not status. So are the replies that close a suggestion's thread (fixed, declined with
+  the reason, or deferred) and the one follow-up issue of a pull request's suggestions
+  ([review-loop.md](review-loop.md#suggestions)).
 
 A pause an owner made is shown in the console only: the person who paused it knows.
 

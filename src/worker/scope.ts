@@ -10,11 +10,11 @@
 //   loop hangs off a pull request: reviewer jobs, revision jobs, review postings, revision
 //   pushes, the merge.
 // Everything else in the database is read and never changed.
-import { autoMergeMethod, ciSettings, reviseActive, type UpdraftConfig } from '../config/schema.js';
+import { autoMergeMethod, ciSettings, reviseActive, suggestionsActive, type UpdraftConfig } from '../config/schema.js';
 import { activeCooldowns } from '../db/capacity.js';
 import type { Db } from '../db/database.js';
 import { activeForeignHolds, holdSubject } from '../db/holds.js';
-import { listCiCandidates, listMergeCandidates, listPendingCiNotices, listPendingMergeNotices, type LoopPr } from '../db/pr-reviews.js';
+import { listCiCandidates, listMergeCandidates, listPendingCiNotices, listPendingMergeNotices, listSuggestionCandidates, type LoopPr } from '../db/pr-reviews.js';
 import { getJob, getRun } from '../db/queue.js';
 import { listPendingLimitNotices, REVISION_MAX_AUTO_ATTEMPTS } from '../db/revisions.js';
 import { MAX_CI_NOTICE_ATTEMPTS } from '../publish/ci.js';
@@ -122,7 +122,7 @@ export function pendingWork(db: Db, config: UpdraftConfig, scope: EventScope | n
   const repos = new Map(Object.values(config.repositories).map((cfg) => [cfg.id, cfg]));
   for (const cfg of repos.values()) {
     if (!autoMergeMethod(config, cfg)) continue;
-    merges.push(...listMergeCandidates(db, cfg.id, { requireCi: ciSettings(config, cfg) !== null }).filter((pr) => inScope.pr(pr.repoId, pr.prNumber)));
+    merges.push(...listMergeCandidates(db, cfg.id, { requireCi: ciSettings(config, cfg) !== null, requireSuggestions: suggestionsActive(config, cfg) }).filter((pr) => inScope.pr(pr.repoId, pr.prNumber)));
   }
   // The same conditions under which merge.ts and revision.ts post them: a notice nobody will post is not pending.
   for (const pr of listPendingMergeNotices(db, MAX_NOTICE_ATTEMPTS)) {
@@ -136,9 +136,21 @@ export function pendingWork(db: Db, config: UpdraftConfig, scope: EventScope | n
   // The CI step (ciFix): a head found ready whose checks were not looked at yet is a step to take,
   // and so is its one comment. A head that is only waiting for its checks is not: nothing has to
   // stay up for it, the next check or status event (or poll) takes the step again.
+  // The suggestion step (review.suggestions): a head found ready whose suggestions were not
+  // settled is a step to take, and so is one whose suggestion revision ended without moving it.
+  // One whose suggestion revision is queued or running waits for that job, which is pending itself.
+  const unfinished = db.prepare("SELECT 1 AS x FROM jobs WHERE id = ? AND status IN ('queued', 'running')");
+  for (const cfg of repos.values()) {
+    if (!suggestionsActive(config, cfg)) continue;
+    for (const pr of listSuggestionCandidates(db, cfg.id)) {
+      if (!inScope.pr(pr.repoId, pr.prNumber)) continue;
+      if (pr.suggestSha === pr.headSha && pr.suggestState === 'fixing' && pr.suggestJobId && unfinished.get(pr.suggestJobId)) continue;
+      notices++;
+    }
+  }
   for (const cfg of repos.values()) {
     if (!ciSettings(config, cfg)) continue;
-    for (const pr of listCiCandidates(db, cfg.id)) if (pr.ciSha !== pr.headSha || pr.ciState === null) if (inScope.pr(pr.repoId, pr.prNumber)) notices++;
+    for (const pr of listCiCandidates(db, cfg.id, { requireSuggestions: suggestionsActive(config, cfg) })) if (pr.ciSha !== pr.headSha || pr.ciState === null) if (inScope.pr(pr.repoId, pr.prNumber)) notices++;
   }
   for (const pr of listPendingCiNotices(db, MAX_CI_NOTICE_ATTEMPTS)) {
     const cfg = repos.get(pr.repoId);

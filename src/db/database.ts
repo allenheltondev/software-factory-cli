@@ -25,7 +25,10 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
+
+/** The schema version that added the suggestion step (review.suggestions, docs/review-loop.md "Suggestions"). */
+export const SUGGESTIONS_SCHEMA_VERSION = 21;
 
 /** The schema version that added the needs-verification outcome of pr_reviews (docs/acceptance.md). */
 export const ACCEPTANCE_SCHEMA_VERSION = 20;
@@ -673,7 +676,42 @@ const MIGRATIONS: Record<number, Migration> = {
   // needs-verification. SQLite cannot change a CHECK in place, so pr_reviews is rebuilt from its
   // own definition with the one value added, keeping every column, row and index.
   20: (db) => rebuildWithOutcome(db, 'needs-verification'),
+  // The suggestion step (repositories.<repo>.review.suggestions, docs/review-loop.md "Suggestions"):
+  // what became of the reviewer's non-blocking suggestions on the head in suggest_sha, once that
+  // head has a ready-to-merge verdict. suggest_state: fixing (the one suggestion revision of the
+  // pull request, suggest_job_id, is on its way; checks and merge wait), settled (every open
+  // suggestion was answered: fixed, declined or deferred to the follow-up issue); NULL: not looked
+  // at yet. The follow-up issue spans heads: one per pull request. On review_findings, settled_as
+  // says how a suggestion's thread was closed, so it is never answered twice. Each column only if
+  // missing, as for migration 18.
+  21: (db) => {
+    const have = (table: string) => new Set((db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name));
+    const prs = have('revision_prs');
+    for (const [name, decl] of SUGGESTION_COLUMNS) if (!prs.has(name)) db.exec(`ALTER TABLE revision_prs ADD COLUMN ${name} ${decl}`);
+    const findings = have('review_findings');
+    for (const [name, decl] of SETTLED_COLUMNS) if (!findings.has(name)) db.exec(`ALTER TABLE review_findings ADD COLUMN ${name} ${decl}`);
+  },
 };
+
+/** Migration 21's columns of revision_prs. */
+const SUGGESTION_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ['suggest_state', "TEXT CHECK (suggest_state IN ('fixing','settled'))"],
+  ['suggest_sha', 'TEXT'],
+  ['suggest_reason', 'TEXT'],
+  // the suggestion revision, once queued (one per pull request: its review id is suggestions:<pr>)
+  ['suggest_job_id', 'TEXT'],
+  // failed attempts to settle the head in suggest_sha; past the limit the head is settled anyway
+  ['suggest_attempts', 'INTEGER NOT NULL DEFAULT 0'],
+  // the one follow-up issue of the pull request
+  ['suggest_issue_number', 'INTEGER'],
+  ['suggest_issue_url', 'TEXT'],
+];
+
+/** Migration 21's columns of review_findings. */
+const SETTLED_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ['settled_as', "TEXT CHECK (settled_as IN ('fixed','declined','deferred'))"],
+  ['settled_at', 'TEXT'],
+];
 
 /** pr_reviews rebuilt with `value` allowed as an outcome; nothing when it already is. */
 function rebuildWithOutcome(db: Db, value: string): void {

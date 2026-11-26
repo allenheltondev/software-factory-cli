@@ -560,8 +560,8 @@ const THREE = {
 };
 
 describe('findings as threads', () => {
-  const withDiff = () => {
-    const s = setup();
+  const withDiff = (o: Options = {}) => {
+    const s = setup(o);
     s.gh.files = [{ path: 'src/a.ts', status: 'modified', patch: PATCH }];
     return s;
   };
@@ -1107,7 +1107,8 @@ describe('findings as threads', () => {
   });
 
   it('records a ready verdict only together with the findings it verified: interrupted, it is not ready; retried, it merges', async () => {
-    const s = withDiff();
+    // The open suggestion F3 is left as it is (review.suggestions: ignore): this is about the blockers.
+    const s = withDiff({ repo: { review: { suggestions: 'ignore' } } });
     const first = await post(s, 'changes-requested', structuredFindings(THREE));
     const run = nextRound(s, H2, 'ready-to-merge', structuredFindings({ findings: [], checks: [{ finding: `${first.runId}#F1`, status: 'verified' }, { finding: `${first.runId}#F2`, status: 'verified' }] }));
     s.db.exec("CREATE TRIGGER boom BEFORE UPDATE OF status ON review_findings BEGIN SELECT RAISE(ABORT, 'interrupted'); END");

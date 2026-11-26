@@ -36,7 +36,8 @@ type Failable =
   | 'replyToReviewComment'
   | 'resolveReviewThread'
   | 'unresolveReviewThread'
-  | 'listReviewThreads';
+  | 'listReviewThreads'
+  | 'openIssue';
 
 export class FakeLoopGitHub {
   login = 'updraft-bot';
@@ -77,6 +78,8 @@ export class FakeLoopGitHub {
   readonly resolved = new Set<number>();
   /** Refuse a review with inline comments (422), as GitHub does for a line outside the diff. */
   refuseInline = false;
+  /** Issues opened through the API (the follow-up issue of a pull request's suggestions). */
+  issues: Array<GitHubIssue & { user: string }> = [];
   private version = 0;
   private nextId = 1;
 
@@ -143,6 +146,24 @@ export class FakeLoopGitHub {
     this.pullAuthor = this.login;
     this.touch();
     return { number: this.pull.number, htmlUrl: `https://github.com/${this.fullName}/pull/${this.pull.number}`, state: 'open', draft: input.draft, merged: false, headRef: input.head, headRepoId: 42, baseRef: input.base, body: input.body };
+  }
+  async openIssue(_repo: RepoRef, input: { title: string; body: string }): Promise<GitHubIssue> {
+    this.maybeFail('openIssue');
+    const number = 500 + this.issues.length;
+    this.writes.push(`open issue #${number}`);
+    const issue = { number, title: input.title, body: input.body, htmlUrl: `https://github.com/${this.fullName}/issues/${number}`, state: 'open' as const, labels: [], isPullRequest: false, user: this.login };
+    this.issues.push(issue);
+    return { ...issue };
+  }
+  async updateIssueBody(_repo: RepoRef, issueNumber: number, body: string): Promise<void> {
+    const issue = this.issues.find((i) => i.number === issueNumber);
+    if (!issue) throw new GitHubError('issue not found', 404);
+    this.writes.push(`edit issue #${issueNumber}`);
+    issue.body = body;
+  }
+  async listIssuesByCreator(_repo: RepoRef, creator: string): Promise<GitHubIssue[]> {
+    this.calls.push(`listIssuesByCreator ${creator}`);
+    return this.issues.filter((i) => i.user === creator).reverse().map(({ user: _u, ...i }) => ({ ...i }));
   }
   async listIssueComments(_repo: RepoRef, issue: number): Promise<GitHubIssueComment[]> {
     this.calls.push(`listIssueComments #${issue}`);

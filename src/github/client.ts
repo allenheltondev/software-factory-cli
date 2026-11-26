@@ -965,6 +965,20 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       await request<unknown>(`${repoPath(repo)}/git/refs/${ref.replace(/^refs\//, '').split('/').map(encodeURIComponent).join('/')}`, { method: 'DELETE' });
     },
 
+    async openIssue(repo, input) {
+      const res = await request<RawIssue>(`${repoPath(repo)}/issues`, { method: 'POST', body: { title: input.title, body: input.body } });
+      return mapIssue(res.data!);
+    },
+
+    async updateIssueBody(repo, issueNumber, body) {
+      await request<unknown>(`${repoPath(repo)}/issues/${issueNumber}`, { method: 'PATCH', body: { body } });
+    },
+
+    async listIssuesByCreator(repo, creator) {
+      const res = await request<RawIssue[]>(buildUrl(`${repoPath(repo)}/issues`, { creator, state: 'all', sort: 'created', direction: 'desc', per_page: 100 }));
+      return (res.data ?? []).map(mapIssue).filter((i) => !i.isPullRequest);
+    },
+
     async listIssueComments(repo, issueNumber) {
       const raw = await paginate<RawComment>(`${repoPath(repo)}/issues/${issueNumber}/comments`);
       return raw.map(mapComment);

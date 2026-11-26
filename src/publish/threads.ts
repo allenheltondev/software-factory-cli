@@ -60,7 +60,7 @@ export function findingMarker(key: string): string {
 }
 
 /** Hidden marker on a reply the worker posts in a thread: one per kind, run and thread. */
-export function threadReplyMarker(kind: 'fix' | 'check' | 'repeat', runId: string, threadKey: string): string {
+export function threadReplyMarker(kind: 'fix' | 'check' | 'repeat' | 'decline' | 'defer', runId: string, threadKey: string): string {
   return `<!-- updraft-thread-reply: ${kind} ${runId} ${threadKey} -->`;
 }
 
@@ -332,7 +332,7 @@ type Comments = PullRequestReviewComment[];
  * request it will not take): said in `log`, and the step goes on. Anything else is rethrown: the
  * guard's own errors, and failures worth retrying, which fail the attempt so it is retried.
  */
-function settle(deps: ThreadDeps, err: unknown, log: string[], what: string): void {
+export function settle(deps: ThreadDeps, err: unknown, log: string[], what: string): void {
   if (!(err instanceof GitHubError)) throw err;
   const c = classifyFailure(err, { repoFullName: deps.repoFullName, runId: deps.runId, aborted: false });
   if (c.retryable) throw err;
@@ -340,7 +340,7 @@ function settle(deps: ThreadDeps, err: unknown, log: string[], what: string): vo
 }
 
 /** The worker's own comments of the pull request, read once per step. */
-async function ownComments(deps: ThreadDeps, repo: RepoRef, prNumber: number, login: string): Promise<Comments> {
+export async function ownComments(deps: ThreadDeps, repo: RepoRef, prNumber: number, login: string): Promise<Comments> {
   if (!deps.api.listPullRequestReviewComments) return [];
   return (await deps.api.listPullRequestReviewComments(repo, prNumber)).filter((c) => sameLogin(c.user, login));
 }
@@ -407,7 +407,7 @@ export async function recordPostedThreads(
 }
 
 /** The worker's own thread whose first comment is `rootCommentId`, among the pull request's threads (read once per step). */
-async function findThread(
+export async function findThread(
   deps: ThreadDeps,
   repo: RepoRef,
   prNumber: number,

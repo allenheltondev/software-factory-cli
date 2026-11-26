@@ -385,6 +385,18 @@ export interface GitHubApi {
   listMatchingRefs?(repo: RepoRef, prefix: string): Promise<string[]>;
   /** Write: delete one ref (`refs/...`) the worker created. */
   deleteRef?(repo: RepoRef, ref: string): Promise<void>;
+  /**
+   * Write: open an issue. Only for the one follow-up issue of a pull request's suggestions
+   * (src/publish/suggestions.ts); a client without it files none.
+   */
+  openIssue?(repo: RepoRef, input: { title: string; body: string }): Promise<GitHubIssue>;
+  /** Write: replace the body of an issue the worker opened (the follow-up issue, when more suggestions are deferred to it). */
+  updateIssueBody?(repo: RepoRef, issueNumber: number, body: string): Promise<void>;
+  /**
+   * The newest issues (not pull requests) opened by `creator`, open and closed, newest first: one
+   * page of up to 100. For finding the worker's own follow-up issue by its marker.
+   */
+  listIssuesByCreator?(repo: RepoRef, creator: string): Promise<GitHubIssue[]>;
   /** Every comment on one issue, oldest first (paginated internally). */
   listIssueComments(repo: RepoRef, issueNumber: number): Promise<GitHubIssueComment[]>;
   /** Write: comment on an issue. Used only by the publication step. */

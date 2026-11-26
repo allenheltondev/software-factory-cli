@@ -310,6 +310,26 @@ describe('createGitHubApi: publication writes', () => {
     expect(c).toEqual({ id: 4, htmlUrl: 'h4', body: 'hi', user: 'allen' });
   });
 
+  it('opens an issue, edits its body, and lists the issues one login opened (not pull requests), newest first', async () => {
+    const raw = (n: number, extra: Record<string, unknown> = {}) => ({ number: n, title: 't', body: `b${n}`, html_url: `h${n}`, state: 'open', labels: [], ...extra });
+    const { fn, calls } = fakeFetch((url, call) => {
+      if (call.method === 'POST') return json(raw(9), { status: 201 });
+      if (call.method === 'PATCH') return json(raw(9));
+      return json([raw(9), raw(8, { pull_request: {} })]);
+    });
+    const api = await createGitHubApi({ token: 't', fetch: fn });
+    const repo = { id: 42, fullName: 'o/r' };
+    expect(await api.openIssue!(repo, { title: 'Follow-up', body: 'x' })).toMatchObject({ number: 9, htmlUrl: 'h9', isPullRequest: false });
+    expect(calls[0]).toMatchObject({ method: 'POST', url: 'https://api.github.com/repositories/42/issues' });
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ title: 'Follow-up', body: 'x' });
+    await api.updateIssueBody!(repo, 9, 'y');
+    expect(calls[1]).toMatchObject({ method: 'PATCH', url: 'https://api.github.com/repositories/42/issues/9' });
+    expect(JSON.parse(calls[1]!.body!)).toEqual({ body: 'y' });
+    expect((await api.listIssuesByCreator!(repo, 'app[bot]')).map((i) => i.number)).toEqual([9]);
+    const q = new URL(calls[2]!.url).searchParams;
+    expect([q.get('creator'), q.get('state'), q.get('sort'), q.get('direction'), q.get('per_page')]).toEqual(['app[bot]', 'all', 'created', 'desc', '100']);
+  });
+
   it('replaces the body of a comment', async () => {
     const { fn, calls } = fakeFetch(() => json({ id: 4, html_url: 'h4', body: 'new', user: { login: 'allen' } }));
     const api = await createGitHubApi({ token: 't', fetch: fn });

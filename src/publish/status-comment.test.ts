@@ -216,7 +216,7 @@ const HOSTED = { origin: 'https://updraft.example', installationId: '9', cloudJo
 
 const reviewJob = () =>
   job('job_rev', envelope({ type: 'pull_request.review', review: { pullRequest: { number: 12, url: 'u', branch: 'b', baseBranch: 'main' }, headSha: 'abcdef1234567', authorAgent: 'claude', sourceRunId: 'run_1', priorReviews: [{}] } }));
-const revisionJob = (trigger: 'updraft_review' | 'ci_failure') =>
+const revisionJob = (trigger: 'updraft_review' | 'ci_failure' | 'suggestions') =>
   job('job_fix', envelope({ type: 'pull_request.changes_requested', revision: { trigger, pullRequest: { number: 12, url: 'u', branch: 'b' }, sourceRunId: 'run_1', originalEventId: '1', review: { id: 1 }, reviewedSha: '1234567abcdef' } }));
 
 function commenter(notifications?: 'quiet' | 'verbose') {
@@ -250,6 +250,9 @@ describe('the status comment through a run (quiet, the default)', () => {
     expect(api.comments[0]!.body).toContain('Revising PR #12 for review round 1.');
     await c.announce(revisionJob('ci_failure'), run('run_f'));
     expect(api.comments[0]!.body).toContain('Fixing failed checks on `1234567` of PR #12.');
+    await c.announce(revisionJob('suggestions'), run('run_s'));
+    expect(api.comments[0]!.body).toContain('**Updraft · Addressing suggestions**');
+    expect(api.comments[0]!.body).toContain("Applying the review's suggestions to `1234567` of PR #12, which the review found ready.");
     // The table written at assignment is still there.
     expect(api.comments[0]!.body).toContain('| Worker | `claude` |');
     expect(api.comments).toHaveLength(1);
@@ -537,11 +540,13 @@ describe('approval follow-ups of #181', () => {
     expect(api.comments[0]!.body).toContain('**Updraft · Reviewing**');
   });
 
-  it('deletes a closed pull request\'s CI-fix claim refs, and only those', async () => {
+  it('deletes a closed pull request\'s CI-fix and suggestion claim refs, and only those', async () => {
     const refs = [
       `refs/updraft/revision-claims/ci-failure-12-${'a'.repeat(40)}/run_1`,
       `refs/updraft/revision-claims/ci-failure-12-${'b'.repeat(40)}/run_2`,
+      'refs/updraft/revision-claims/suggestions-12/run_4',
       `refs/updraft/revision-claims/ci-failure-123-${'c'.repeat(40)}/run_3`,
+      'refs/updraft/revision-claims/suggestions-123/run_5',
     ];
     const deleted: string[] = [];
     const api = {
@@ -549,7 +554,7 @@ describe('approval follow-ups of #181', () => {
       deleteRef: async (_r: unknown, ref: string) => void deleted.push(ref),
     } as unknown as GitHubApi;
     await dropClaimRefs(api, REPO, 12, silentLogger);
-    expect(deleted).toEqual(refs.slice(0, 2));
+    expect(deleted).toEqual(refs.slice(0, 3));
     // Best effort: a failure is only logged.
     await expect(dropClaimRefs({ listMatchingRefs: async () => { throw new GitHubError('nope', 403); }, deleteRef: async () => {} } as unknown as GitHubApi, REPO, 12, silentLogger)).resolves.toBeUndefined();
   });

@@ -5,7 +5,10 @@ request Updraft opened is reviewed by a second agent. If the reviewer asks for c
 [`revise`](revisions.md) is on, the coding agent revises the PR and the new head is reviewed
 again, for up to `maxRevisions` rounds. When the reviewer finds a head ready, a draft PR is
 marked ready for review and the loop stops: a person merges. With `autoMerge` set as well,
-Updraft merges it itself once the checks listed [below](#auto-merge) hold.
+Updraft merges it itself once the checks listed [below](#auto-merge) hold. The reviewer's
+non-blocking suggestions on a ready head are not left as open threads: one revision applies
+those the coding agent agrees with, and the rest go into one follow-up issue (see
+[Suggestions](#suggestions)).
 
 ```yaml
 pools:
@@ -63,10 +66,10 @@ by GitHub until they have.
 | awaiting review | The current head has no verdict yet; its reviewer job is queued or about to be | reviewing |
 | reviewing | A reviewer run is in progress, or its review is being posted | changes requested, ready to merge, or needs a human if the run fails |
 | changes requested (round n of max) | A reviewer or an allowed person asked for changes; the revision job is queued | revising |
-| revising | The coding agent is running on the PR branch, or its commits are being pushed | awaiting review (new head), or needs a human |
+| revising | The coding agent is running on the PR branch, or its commits are being pushed; also the one [suggestion revision](#suggestions) of a ready head, queued or running | awaiting review (new head), or needs a human; a suggestion revision that changes nothing goes back to ready to merge |
 | waiting for CI | `ciFix`: the reviewer found the current head ready; its checks are pending or not looked at yet ([CI in the review loop](ci-fix.md)) | ready to merge, fixing failed checks, or needs a human |
 | fixing failed checks | `ciFix`: checks failed on the current head; a revision with their diagnostics is queued or running | awaiting review (new head), or needs a human |
-| ready to merge | The reviewer found the current head ready (and, with `ciFix`, its checks passed); a draft was marked ready for review. The end state unless `autoMerge` is on. If Updraft tried to merge and could not, the reason is shown here | merged by a person, or merging |
+| ready to merge | The reviewer found the current head ready (and, with `ciFix`, its checks passed); a draft was marked ready for review. The end state unless `autoMerge` is on. If Updraft tried to merge and could not, the reason is shown here. While its [suggestions](#suggestions) are being answered, the line says so | merged by a person, or merging |
 | merging / waiting for checks | `autoMerge`: waiting for pending checks, or the merge was requested | merged, or ready to merge with the reason it was not merged |
 | merged | Updraft merged it | none |
 | needs a human | The loop cannot continue by itself; the line says why: `maxRevisions` reached, the reviewer run failed or gave no readable verdict, a revision failed or pushed nothing, `revise` is off, or mandatory [acceptance criteria](acceptance.md) are unverified or unclear | `updraft retry JOB_ID`, a push, a new review, or a merge by hand |
@@ -353,6 +356,83 @@ Through the same path as every live run: the agent's container if it has one, th
   at that commit, marks a draft ready for review, and stops. With `ciFix`, it waits for the
   head's checks first, and a failure gets a revision: see [CI in the review loop](ci-fix.md).
 
+## Suggestions
+
+A ready-to-merge verdict may come with suggestions: findings of severity `suggestion` in the
+reviewer's [structured block](#findings-as-threads). They never hold a head back, and they are not
+left as open threads either. What happens to them is `review.suggestions`:
+
+```yaml
+repositories:
+  octo/widgets:
+    review:
+      suggestions: address   # the default; or follow-up, or ignore
+```
+
+- **`address`** (the default): when the reviewer finds the current head ready and suggestions are
+  open, Updraft queues **one** revision of the pull request for them, if the pull request has
+  revisions left (`maxRevisions`; this revision counts like any other). The coding agent applies
+  the suggestions it agrees with. It reports each one in its `updraft-resolutions` block:
+  `disagreed` with a one-line reason for a suggestion it judges wrong, `deferred` with a reason for
+  one that is right but too large or out of scope. Its push is reviewed again as usual, and only
+  that new head goes on to its checks and its merge. A pull request gets at most one suggestion
+  revision, whatever happens later.
+- **`follow-up`**: no revision. Every open suggestion goes into the follow-up issue, and the ready
+  head goes on to its checks and its merge.
+- **`ignore`**: the behaviour before this setting: suggestion threads are left open.
+
+Without `revise`, `address` works as `follow-up` (a validation warning says so).
+
+### How each suggestion ends
+
+Once a ready head has nothing more coming for its suggestions (no revision is queued, or the one
+that was queued has ended), every open suggestion is settled on that head, before its checks are
+read and before a merge:
+
+| The suggestion | Its thread |
+| --- | --- |
+| verified by a reviewer, or reported `fixed` by the coding agent in a push no reviewer found unfixed since | The coding agent's reply names the commit (`Fixed in <sha>`). Resolved |
+| reported `disagreed` | The coding agent's reply gives its reason. Resolved |
+| anything else: deferred, unable, no report, the budget spent, `follow-up` | One reply links the follow-up issue. Resolved |
+
+The follow-up issue is one per pull request. Its body lists every suggestion deferred to it as a
+task list (`- [ ]` items under *Acceptance criteria*), each with its file, line and a link to its
+thread, and the coding agent's reason where it gave one. Adding the workflow's label to the issue
+dispatches it like any other. A hidden marker (`<!-- updraft-suggestions-followup: <repo id>#<pr> -->`)
+finds it again among the worker's own issues: a later head with more suggestions, a retry or a
+state database that lost the issue's number edits that issue, and never opens a second one.
+
+Only threads the worker started are replied to or resolved. A person's thread on the pull request
+is never touched.
+
+### What it never does
+
+- **Block a merge for good.** A suggestion revision that pushes nothing, fails or is canceled
+  releases the ready head: its suggestions are settled as above (a decline still gets its reason)
+  and the head goes on to its checks and merge. That is at most one revision attempt later than
+  without suggestions. A head whose suggestions cannot be settled because GitHub keeps failing is
+  let through after five attempts.
+- **Change a verdict.** Suggestions are not blockers; the acceptance gate ([acceptance.md](acceptance.md))
+  and the CI gate ([ci-fix.md](ci-fix.md)) are unchanged. Auto-merge waits for the suggestion
+  revision's own head to be reviewed and pass its checks; it never merges the head the revision
+  was for while that revision is on its way.
+- **Run twice.** The revision's dedupe key is the pull request (`suggestions:<pr>`): a redelivered
+  review, a retry or a stale head never queues a second one. A revision queued for a head that a
+  person's push replaced is canceled before it starts, as for any verdict; the new head is
+  reviewed, and its suggestions go to the follow-up issue. Two machines that both run it (Updraft
+  Cloud, `updraft run-event` on a shared state database) race on the push exactly as two CI fixes
+  do: each claims its push with a hidden ref, `refs/updraft/revision-claims/suggestions-<pr>/<run>`,
+  and the one that loses the branch's lease gives way silently ([ci-fix.md](ci-fix.md)).
+- **Post a status comment.** With `notifications: quiet` (the default) the issue's status comment
+  shows `Addressing suggestions` while the revision is on its way, then the usual stages; the
+  revision posts no claim, no reply and no "pushed nothing" comment on the pull request. Thread
+  replies and the follow-up issue are its only GitHub writes. With `verbose`, the revision's
+  reply comment is posted as for every revision.
+
+In the Cloud console it is **Review suggestions** in a repository's settings (simple and full
+editor), shown when the repository's workflows review. Address is the default and is stored as
+nothing.
+
 ## Auto-merge
 
 Off unless `repositories.<OWNER/REPO>.autoMerge` is set to `squash`, `merge` or `rebase`.
@@ -443,6 +523,11 @@ while a watched PR is open, plus one GraphQL request per watched PR that changed
   a thread, one GraphQL listing of the threads and one GraphQL request per thread resolved;
 - per revision of structured findings, after its push: one listing of the PR's review comments
   and one reply per finding with a thread;
+- suggestions, per ready head with open suggestions: nothing to queue the revision; to settle
+  them, one request for the PR, one listing of the worker's issues (once per pull request), one
+  request to open or edit the follow-up issue when one is owed, one listing of the PR's review
+  comments and of its threads, and one reply and one GraphQL request per thread resolved. A head
+  with no open suggestion costs nothing;
 - `autoMerge`, per poll and per PR that is ready and whose merge has not settled: up to four
   requests (the PR, its reviews, commit statuses, check runs), fewer when an earlier one already
   decides; then one merge request. A PR that is merged or blocked costs nothing more. A blocked

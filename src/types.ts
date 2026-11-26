@@ -119,8 +119,10 @@ export function labelEventIdOf(job: { eventId: string; envelope?: EventEnvelope 
  * worker's database when the verdict is recorded (never read back from GitHub).
  * ci_failure: GitHub's checks failed on a head the reviewer found ready (repositories.<repo>.ciFix,
  * src/publish/ci.ts); the "review" is the worker's own summary of the failed checks.
+ * suggestions: the reviewer found a head ready and left non-blocking suggestions
+ * (repositories.<repo>.review.suggestions, src/publish/suggestions.ts); at most one per pull request.
  */
-export type RevisionTriggerKind = 'changes_requested' | 'updraft_review' | 'ci_failure';
+export type RevisionTriggerKind = 'changes_requested' | 'updraft_review' | 'ci_failure' | 'suggestions';
 
 /** One inline comment of the triggering review, as it read when the review was ingested. Untrusted text. */
 export interface ReviewCommentSnapshot {
@@ -183,11 +185,11 @@ export interface RevisionRequest {
   originalEventId: string;
   review: ReviewSnapshot;
   /**
-   * updraft_review and ci_failure: the head commit the verdict (or the failed checks) was for. The
+   * updraft_review, ci_failure and suggestions: the head commit the verdict (or the failed checks) was for. The
    * revision is dropped as stale unless the pull request is still at this commit when it starts.
    */
   reviewedSha?: string;
-  /** updraft_review with structured findings: each one to report on. Absent for a legacy review, a person's review and a CI fix. */
+  /** updraft_review with structured findings, and suggestions: each one to report on. Absent for a legacy review, a person's review and a CI fix. */
   findings?: RevisionFinding[];
   /** updraft_review: mandatory acceptance criteria the review did not find met on reviewedSha (docs/acceptance.md). */
   acceptance?: RevisionCriterion[];

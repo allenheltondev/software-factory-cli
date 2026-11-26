@@ -215,6 +215,21 @@ export function assignmentStatus(db: Db, job: Job, run: Run, ctx?: ConsoleContex
         text: sha ? `Fixing failed checks on \`${shortSha(sha)}\` of PR #${pr}.` : `Fixing failed checks of PR #${pr}.`,
       };
     }
+    if (revision.trigger === 'suggestions') {
+      const sha = revision.reviewedSha;
+      return {
+        repo,
+        issue: job.issueNumber,
+        target: { pr },
+        stage: STATUS_STAGE.loop,
+        at: startOf(run),
+        ...(sha ? { sha, latest: isLatestHead(db, job.repoId, pr, sha) } : {}),
+        title: 'Addressing suggestions',
+        text: sha
+          ? `Applying the review's suggestions to \`${shortSha(sha)}\` of PR #${pr}, which the review found ready.`
+          : `Applying the review's suggestions to PR #${pr}, which the review found ready.`,
+      };
+    }
     let round = 1;
     try {
       round = Math.max(1, countRevisions(db, job.repoId, pr));

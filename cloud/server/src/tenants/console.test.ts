@@ -162,6 +162,26 @@ describe('compiling', () => {
     expect(errorsOf(settings({ 'acme/web': repo({ notifications: 'loud' }) }))).toEqual([expect.objectContaining({ path: 'repositories.acme/web.notifications' })]);
   });
 
+  it('round-trips review suggestions: the CLI default (address) when unset, follow-up or ignore when set, and only with review on', () => {
+    // The default workflow reviews and revises every pull request.
+    const unset = compile(ok(settings()));
+    expect(unset.ok).toBe(true);
+    expect(unset.ok && JSON.stringify(yamlOf(unset.files).repositories['acme/web']!.review ?? null)).not.toContain('suggestions');
+    for (const mode of ['address', 'follow-up', 'ignore'] as const) {
+      const config = ok(settings({ 'acme/web': repo({ suggestions: mode }) }));
+      // What the console saved reads back the same.
+      expect(ok(JSON.parse(JSON.stringify(config))).repositories['acme/web']!.suggestions).toBe(mode);
+      const r = compile(config);
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect(yamlOf(r.files).repositories['acme/web']).toMatchObject({ review: { suggestions: mode } });
+    }
+    // Without review there are no suggestions: nothing is compiled for them.
+    const off = compile(ok(settings({ 'acme/web': repo({ suggestions: 'follow-up' }) }, reviewOff)));
+    expect(off.ok && yamlOf(off.files).repositories['acme/web']!.review).toBeUndefined();
+    expect(errorsOf(settings({ 'acme/web': repo({ suggestions: 'sometimes' }) }))).toEqual([expect.objectContaining({ path: 'repositories.acme/web.suggestions' })]);
+  });
+
   it('compiles the acceptance policy, and leaves it to the CLI default when unset', () => {
     const review = (over: Record<string, unknown>) => ({ review: { enabled: true, pool: 'reviewers', prompt: '# Look', allowSameAgent: false, ...over } });
     for (const acceptance of ['report', 'off', 'enforce'] as const) {

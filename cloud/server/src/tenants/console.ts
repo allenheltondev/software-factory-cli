@@ -173,7 +173,17 @@ export interface ConsoleRepository {
    * status comments of earlier versions.
    */
   notifications?: 'quiet' | 'verbose';
+  /**
+   * The reviewer's non-blocking suggestions on a head it found ready (the CLI's
+   * repositories.R.review.suggestions, #174). Absent or address: one revision applies those the
+   * coding agent agrees with, the rest go into one follow-up issue. follow-up: no revision, all into
+   * the issue. ignore: their threads stay open. Only with review on.
+   */
+  suggestions?: ConsoleSuggestions;
 }
+
+export const SUGGESTION_MODES = ['address', 'follow-up', 'ignore'] as const;
+export type ConsoleSuggestions = (typeof SUGGESTION_MODES)[number];
 
 /** What an upgrade from version 1 keeps resolvable for work in flight (see the top of this file). */
 export interface ConsoleLegacy {
@@ -500,8 +510,10 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
         c.err(path, 'must be a mapping');
         continue;
       }
-      only(c, path, r, ['enabled', 'workflows', 'allowedActors', 'baseBranch', 'publish', 'commentOnFailure', 'verify', 'verifyTimeoutMinutes', 'autoMerge', 'ci', 'notifications']);
+      only(c, path, r, ['enabled', 'workflows', 'allowedActors', 'baseBranch', 'publish', 'commentOnFailure', 'verify', 'verifyTimeoutMinutes', 'autoMerge', 'ci', 'notifications', 'suggestions']);
       if (r.notifications !== undefined && r.notifications !== 'quiet' && r.notifications !== 'verbose') c.err(`${path}.notifications`, 'must be quiet or verbose');
+      const suggestions = r.suggestions === undefined || r.suggestions === null ? undefined : SUGGESTION_MODES.find((m) => m === r.suggestions);
+      if (r.suggestions !== undefined && r.suggestions !== null && !suggestions) c.err(`${path}.suggestions`, `one of ${SUGGESTION_MODES.join(', ')}`);
 
       const runs = names(c, `${path}.workflows`, r.workflows, isObject(raw.workflows) ? raw.workflows : undefined, 'workflow', CONSOLE_LIMITS.workflowsPerRepository);
       if (Array.isArray(r.workflows) && r.workflows.length === 0) c.err(`${path}.workflows`, 'choose at least one workflow: its label is how an issue starts work here');
@@ -593,6 +605,7 @@ export function parseConsoleConfig(input: unknown): { ok: true; config: ConsoleC
         ...(autoMerge ? { autoMerge } : {}),
         ...(ci ? { ci } : {}),
         ...(r.notifications === 'quiet' || r.notifications === 'verbose' ? { notifications: r.notifications } : {}),
+        ...(suggestions ? { suggestions } : {}),
       };
     }
     if (list.length === 0) c.err('repositories', 'add at least one repository');
@@ -947,7 +960,12 @@ export function toTenantSubmission(config: ConsoleConfig): TenantSubmission {
     // The workflows of a repository agree on these (checkMeaning): the first one speaks for all.
     const first = config.workflows[r.workflows[0] ?? ''];
     const options = first?.review.enabled
-      ? { ...(first.review.allowSameAgent ? { allowSameAgent: true } : {}), ...(first.review.acceptance ? { acceptance: first.review.acceptance } : {}) }
+      ? {
+          ...(first.review.allowSameAgent ? { allowSameAgent: true } : {}),
+          ...(first.review.acceptance ? { acceptance: first.review.acceptance } : {}),
+          // A repository's own setting (#174); without review there are no suggestions to handle.
+          ...(r.suggestions ? { suggestions: r.suggestions } : {}),
+        }
       : null;
     const review = options ? (Object.keys(options).length ? options : true) : undefined;
     const revise = first?.revise.enabled ? { revise: true, ...(first.revise.maxRevisions !== undefined ? { maxRevisions: first.revise.maxRevisions } : {}) } : {};

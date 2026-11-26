@@ -110,16 +110,20 @@ function snapshotReview(review: GitHubReview, decision: Extract<ReturnType<typeo
  * a head someone else pushed gets its reviewer run. That costs no further request: the PR's
  * reviews are read whenever the PR changed, and a push changes it.
  */
-/** Deletes the CI-fix claim refs of a pull request that is closed or merged. Never throws. */
+/** Deletes the claim refs of a pull request's CI fixes and suggestion revision once it is closed or merged. Never throws. */
 export async function dropClaimRefs(api: GitHubApi, repo: RepoRef, prNumber: number, log: Logger): Promise<void> {
   try {
     if (!api.listMatchingRefs || !api.deleteRef) return;
+    const drop = (ref: string) => api.deleteRef!(repo, ref).catch((err: unknown) => log.debug('could not delete a claim ref', { ref, error: err instanceof Error ? err.message : String(err) }));
     const prefix = revisionClaimRef(`ci-failure:${prNumber}:`).replace(/\/$/, '');
     for (const ref of await api.listMatchingRefs(repo, prefix)) {
       // ci-failure-<pr>- exactly: never a longer pull request number with the same digits in front.
       if (!ref.startsWith(`${prefix}`) || !/^[0-9a-f]{7,64}\//.test(ref.slice(prefix.length))) continue;
-      await api.deleteRef(repo, ref).catch((err: unknown) => log.debug('could not delete a claim ref', { ref, error: err instanceof Error ? err.message : String(err) }));
+      await drop(ref);
     }
+    // suggestions-<pr>/ exactly, with its slash: the one suggestion revision of this pull request.
+    const suggestions = revisionClaimRef(`suggestions:${prNumber}`);
+    for (const ref of await api.listMatchingRefs(repo, suggestions)) if (ref.startsWith(suggestions)) await drop(ref);
   } catch (err) {
     log.debug('could not list claim refs', { pr: prNumber, error: err instanceof Error ? err.message : String(err) });
   }
