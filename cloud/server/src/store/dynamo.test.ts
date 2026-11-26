@@ -1377,6 +1377,12 @@ describe('dynamo store: delivery claims and finished jobs (review fixes on #80)'
     };
     await store.putJob(job);
     expect((await store.getJob(job.jobId))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
+    // None needed is kept as none (handed none), apart from none recorded (handed every key).
+    await store.putJob({ ...job, jobId: 'job_keys00002', deliveryId: 'd-2', agentKeys: [] });
+    expect((await store.getJob('job_keys00002'))?.agentKeys).toEqual([]);
+    const { agentKeys: _, ...legacy } = job;
+    await store.putJob({ ...legacy, jobId: 'job_keys00003', deliveryId: 'd-3' });
+    expect(await store.getJob('job_keys00003')).not.toHaveProperty('agentKeys');
   });
 
   it("records a key's last use only for the value the job could have read (#70)", async () => {

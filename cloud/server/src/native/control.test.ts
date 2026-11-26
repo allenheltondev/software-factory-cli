@@ -92,7 +92,7 @@ describe('native worker Cloud dispatch', () => {
   });
   it('queues without an API key or BYOK image, deduplicates deliveries and claims once across concurrent polls', async () => {
     const job = await queued();
-    expect(job.native?.workerId).toBe(route.workerId); expect(job.agentKeys).toBeUndefined();
+    expect(job.native?.workerId).toBe(route.workerId); expect(job.agentKeys).toEqual([]);
     expect(runMicrovm).not.toHaveBeenCalled();
     expect(await launch(request())).toMatchObject({ disposition: 'duplicate' });
     await control.handle(input('register'));

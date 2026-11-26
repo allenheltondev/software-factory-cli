@@ -9,7 +9,7 @@ import { createBenchmarkDispatch } from '../benchmarks/dispatch.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createBroker, hashToken } from '../broker/broker.js';
 import { createMemoryStore, type DispatchRules, type Tenant } from '../store/store.js';
-import { createBundleKeys } from '../tenants/key-needs.js';
+import { createBundleKeys, workflowKeys } from '../tenants/key-needs.js';
 import { configPrefix } from '../tenants/paths.js';
 import { dispatchRules } from '../tenants/dispatch.js';
 import { createAdminService } from '../admin/admin.js';
@@ -519,6 +519,85 @@ describe('the launcher', () => {
       const result = await createLauncher(deps)(request());
       expect(result).toMatchObject({ status: 202, disposition: 'launched' });
       expect((await store.getJob(result.jobId!))?.agentKeys).toEqual(['ANTHROPIC_API_KEY']);
+    });
+
+    describe('the keys a job is handed: its workflow\'s, in the descriptor and the session policy alike', () => {
+      // A compiled config (what config.yaml holds), its dispatch rules computed as a publish does.
+      const fromCompiled = (compiled: { agents: Record<string, unknown>; pools: Record<string, unknown>; repositories: Record<string, Record<string, unknown>> }) =>
+        activate(dispatchRules({ dispatch: { allowedActors: ['pat'] }, ...compiled }, { keysFor: (repo, wf) => workflowKeys(compiled, repo, wf) }));
+      const ALL = { claude: { adapter: 'claude' }, codex: { adapter: 'codex' }, kiro: { adapter: 'kiro' }, mistral: { adapter: 'mistral' } };
+      const POOLS = { c: { agents: ['claude'] }, x: { agents: ['codex'] }, k: { agents: ['kiro'] }, m: { agents: ['mistral'] } };
+      /** Starts the job at the broker: the key names it is handed, and the secrets its credentials reach. */
+      const started = async (jobId: string) => {
+        const policies: string[] = [];
+        const broker = createBroker({
+          store,
+          loadSettings: async () => null,
+          github: { createInstallationToken: vi.fn(), getBotUser: vi.fn() },
+          assumeRole: async ({ policy }) => (policies.push(policy), { accessKeyId: 'ASIA', secretAccessKey: 's', sessionToken: 't', expiration: new Date(NOW + 3_600_000).toISOString() }),
+          terminateMicrovm: async () => {},
+          microvmState: async () => 'RUNNING',
+          policy: { bucket: 'tenant-bucket', partition: 'aws', region: 'us-east-1', accountId: '123456789012' },
+          now: () => NOW,
+        });
+        const run = runs.find((r) => r.clientToken === jobId) ?? runs[runs.length - 1]!;
+        const { jobToken } = (JSON.parse(run.runHookPayload) as { broker: { jobToken: string } }).broker;
+        const out = await broker({ action: 'start', jobId, token: jobToken });
+        if (!out.ok || !('descriptor' in out)) throw new Error('not started');
+        const statements = (JSON.parse(policies[0]!) as { Statement: { Action: string | string[]; Resource: string | string[] }[] }).Statement;
+        const secrets = statements.filter((st) => st.Action === 'secretsmanager:GetSecretValue').flatMap((st) => (Array.isArray(st.Resource) ? st.Resource : [st.Resource]));
+        return { handed: Object.keys(out.descriptor.agentKeySecrets).sort(), secrets: secrets.sort() };
+      };
+      const arn = (name: string) => `arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/tenants/55/agent-keys/${name}-*`;
+
+      it('a Claude coder with a Codex reviewer: exactly the Anthropic and Codex keys', async () => {
+        await fromCompiled({ agents: ALL, pools: POOLS, repositories: { 'acme/web': { id: 9, review: true, workflows: [{ trigger: { label: 'updraft' }, pool: 'c', reviewPool: 'x' }, { trigger: { label: 'other' }, pool: 'k' }] } } });
+        await setKey('ANTHROPIC_API_KEY');
+        await setKey('CODEX_API_KEY');
+        const result = await createLauncher(deps)(request());
+        expect(result.disposition).toBe('launched');
+        expect((await store.getJob(result.jobId!))?.agentKeys).toEqual(['ANTHROPIC_API_KEY', 'CODEX_API_KEY']);
+        expect(await started(result.jobId!)).toEqual({ handed: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY'), arn('CODEX_API_KEY')] });
+      });
+
+      it('a Claude-only workflow: no Codex, Kiro or Mistral key, whatever else the tenant has set', async () => {
+        await fromCompiled({ agents: ALL, pools: POOLS, repositories: { 'acme/web': { id: 9, review: true, workflows: [{ trigger: { label: 'updraft' }, pool: 'c' }, { trigger: { label: 'other' }, pool: 'm' }] } } });
+        for (const k of ['ANTHROPIC_API_KEY', 'CODEX_API_KEY', 'KIRO_API_KEY', 'MISTRAL_API_KEY']) await setKey(k);
+        const result = await createLauncher(deps)(request());
+        expect(await started(result.jobId!)).toEqual({ handed: ['ANTHROPIC_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY')] });
+      });
+
+      it('a workflow that needs no key: recorded as none, and handed none (never every key)', async () => {
+        await fromCompiled({ agents: { claude: { adapter: 'claude', enabled: false } }, pools: { c: { agents: ['claude'] } }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' }, pool: 'c' }] } } });
+        await setKey('ANTHROPIC_API_KEY');
+        const result = await createLauncher(deps)(request());
+        expect(result.disposition).toBe('launched');
+        expect((await store.getJob(result.jobId!))?.agentKeys).toEqual([]);
+        expect(await started(result.jobId!)).toEqual({ handed: [], secrets: [] });
+      });
+
+      it("a revision of the pull request: its origin's keys, the reviewer's included", async () => {
+        await fromCompiled({ agents: ALL, pools: POOLS, repositories: { 'acme/web': { id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' }, pool: 'c', reviewPool: 'x' }] } } });
+        await setKey('ANTHROPIC_API_KEY');
+        await setKey('CODEX_API_KEY');
+        const launch = createLauncher(deps);
+        const issueJob = await launch(request());
+        await store.finishJob(issueJob.jobId!, 'succeeded', { at: NOW, detail: { prNumber: 40, prUrl: 'https://github.com/acme/web/pull/40' } });
+        const payload = { action: 'submitted', review: { state: 'changes_requested' }, pull_request: { number: 40, head: { ref: 'updraft/issue-12-job_abc' } }, sender: { login: 'pat' }, repository: { id: 9, full_name: 'acme/web' } };
+        const revision = await launch({ installationId: 55, deliveryId: 'review-1', eventName: 'pull_request_review', body: JSON.stringify(payload), payload } as LaunchRequest);
+        expect(revision.disposition).toBe('launched');
+        expect(await store.getJob(revision.jobId!)).toMatchObject({ pullRequest: 40, agentKeys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] });
+        expect(await started(revision.jobId!)).toEqual({ handed: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'], secrets: [arn('ANTHROPIC_API_KEY'), arn('CODEX_API_KEY')] });
+      });
+
+      it('a pull request job whose workflow is not known here: every key, as before keys were recorded', async () => {
+        await fromCompiled({ agents: ALL, pools: POOLS, repositories: { 'acme/web': { id: 9, review: true, revise: true, workflows: [{ trigger: { label: 'updraft' }, pool: 'c' }] } } });
+        const payload = { action: 'submitted', review: { state: 'changes_requested' }, pull_request: { number: 41, head: { ref: 'updraft/issue-13-job_abc' } }, sender: { login: 'pat' }, repository: { id: 9, full_name: 'acme/web' } };
+        const unknown = await createLauncher(deps)({ installationId: 55, deliveryId: 'review-2', eventName: 'pull_request_review', body: JSON.stringify(payload), payload } as LaunchRequest);
+        expect(unknown.disposition).toBe('launched');
+        expect((await store.getJob(unknown.jobId!))?.agentKeys).toBeUndefined();
+        expect(await started(unknown.jobId!)).toEqual({ handed: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY', 'KIRO_API_KEY', 'MISTRAL_API_KEY'], secrets: ['arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/tenants/55/agent-keys/*'] });
+      });
     });
 
     describe('a version published before key needs were recorded', () => {
@@ -1190,7 +1269,7 @@ describe('the launcher', () => {
         expect((await store.getJob(unknown.jobId!))?.agentKeys).toBeUndefined();
         const close = await launch({ ...onIssue(32, { action: 'closed' }, 'close-32'), eventName: 'pull_request' });
         expect(close.disposition).toBe('launched');
-        expect((await store.getJob(close.jobId!))?.agentKeys).toBeUndefined();
+        expect((await store.getJob(close.jobId!))?.agentKeys).toEqual([]);
       });
     });
 

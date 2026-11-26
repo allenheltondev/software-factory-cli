@@ -358,7 +358,9 @@ export function createLauncher(deps: LaunchDeps) {
     if (configVersion === undefined) return skip('no_config');
     const config = await deps.store.getConfigVersion(req.installationId, configVersion, { consistent: true });
     // What the job is for: an issue (its label) or a pull request (its review loop).
-    let decision: { repository: string; repositoryId: number; keys: string[] | null; label?: string; issue?: number; pullRequest?: number };
+    // `unscoped`: the workflow, and so its keys, is not known here (a pull request job): nothing is
+    // checked, and the job is recorded without keys, so the broker hands it every key (broker.ts, jobAgentKeys).
+    let decision: { repository: string; repositoryId: number; keys: string[] | null; unscoped?: true; label?: string; issue?: number; pullRequest?: number };
     const binding = benchmark ? undefined : deps.native?.route.installationId === req.installationId ? deps.native : await deps.resolveNative?.(req.installationId);
     const mode = await binding?.mode?.();
     const triggers = binding ? (mode?.triggers ?? legacyNativeTriggers(binding.route)) : [];
@@ -404,6 +406,9 @@ export function createLauncher(deps: LaunchDeps) {
       // needs none; a pull request whose origin is not known here is checked by the job itself
       // (run-event fails without the key, and says so on the job).
       let keys: string[] | null = [];
+      // A close runs no agent: no keys, and known to need none. Anything else whose workflow is not
+      // told here is unscoped (below).
+      let known = d.closing;
       let label: string | undefined;
       {
         const recent = await deps.store.listRecentJobs(req.installationId, ORIGIN_LOOKUP_JOBS);
@@ -426,13 +431,20 @@ export function createLauncher(deps: LaunchDeps) {
           // kept a week past its run), the label's when the label names one workflow's.
           if (!d.closing && origin.configVersion === tenant.activeConfigVersion) {
             const lower = origin.label.toLowerCase();
-            keys = originJob ? (originJob.agentKeys ?? []) : Object.hasOwn(d.keysByLabel, lower) ? (d.keysByLabel[lower] ?? []) : [];
+            // A revision or CI fix inherits its origin's keys: the origin's workflow, reviewer
+            // included. An origin recorded without them (launched before they were recorded, or
+            // itself unscoped) says nothing, and neither does a label two workflows share.
+            const inherited = originJob ? originJob.agentKeys : Object.hasOwn(d.keysByLabel, lower) ? d.keysByLabel[lower] ?? undefined : undefined;
+            if (inherited) {
+              keys = inherited;
+              known = true;
+            }
           }
         } else {
           log({ delivery: req.deliveryId, installationId: req.installationId, note: `no kept job names the workflow of pull request #${d.pullRequest}: its keys are left to the job` });
         }
       }
-      decision = { repository: d.repository, repositoryId: d.repositoryId, keys, pullRequest: d.pullRequest, ...(label ? { label } : {}) };
+      decision = { repository: d.repository, repositoryId: d.repositoryId, keys, ...(known ? {} : { unscoped: true as const }), pullRequest: d.pullRequest, ...(label ? { label } : {}) };
     }
     // The issue or pull request the job is for: refusals and over-quota comments name it.
     const number = (decision.issue ?? decision.pullRequest)!;
@@ -690,7 +702,9 @@ export function createLauncher(deps: LaunchDeps) {
       platformSlot: reserved.platformSlot,
       reservedSeconds: s.maximumDurationSeconds,
       quotas,
-      ...(needed.length ? { agentKeys: needed } : {}),
+      // Always recorded, even empty (a workflow that needs no key is handed none), unless the
+      // workflow is not known here: a job without agentKeys is handed every key (broker.ts).
+      ...(decision.unscoped ? {} : { agentKeys: needed }),
       ...(decision.issue !== undefined ? { issue: decision.issue } : {}),
       ...(decision.pullRequest !== undefined ? { pullRequest: decision.pullRequest } : {}),
     };
