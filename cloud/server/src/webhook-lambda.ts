@@ -133,12 +133,15 @@ const queueNotifier: QueueNotifier = {
   async post(entry, body, marker) {
     const { token, bot } = await queueToken(entry);
     const subject = (entry.issue ?? entry.pullRequest)!;
-    // A post whose answer was lost: found again, never posted twice.
+    // A post whose answer was lost: found again, never posted twice. Only among the App's own
+    // comments, so without its login nothing is posted at all (the sync logs and tries again).
+    if (!bot) throw new Error('the App slug is unknown');
     const existing = await github.findIssueComment!(token, entry.repository, subject, marker, bot);
     return existing ?? (await github.postIssueComment!(token, entry.repository, subject, body));
   },
   async find(entry, marker) {
     const { token, bot } = await queueToken(entry);
+    if (!bot) throw new Error('the App slug is unknown');
     return (await github.findIssueComment!(token, entry.repository, (entry.issue ?? entry.pullRequest)!, marker, bot)) ?? undefined;
   },
   async update(entry, commentId, body) {

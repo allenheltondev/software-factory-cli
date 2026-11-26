@@ -81,7 +81,7 @@ export interface QueueEntry {
   commentId?: number;
   commentState?: QueueState;
   /** How it ended. */
-  outcome?: { at: number; reason: string; message: string; nextAction?: string; by?: string; jobId?: string };
+  outcome?: { at: number; reason: string; message: string; nextAction?: string; by?: string; jobId?: string; launchFailed?: true };
   /** Optimistic concurrency: +1 on every write. */
   version: number;
 }

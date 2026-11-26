@@ -69,6 +69,15 @@ describe('please-act comments (#173)', () => {
     expect(posted.filter((p) => p.body.includes('updraft-blocked'))).toHaveLength(2);
   });
 
+  it('fails closed without the App slug: it never matches anyone\'s comment, so it posts nothing', async () => {
+    const { github, posted } = fakeGitHub();
+    const notices = createGitHubNotices({ github, loadSettings: async () => ({ ...SETTINGS, slug: '' }) as never, consoleOrigin: ORIGIN, log: () => {} });
+    await notices.refused(refusal());
+    await notices.blocked(workflow(), { reason: 'stalled', message: 'x', nextAction: 'y' });
+    expect(posted).toEqual([]);
+    expect(github.findIssueComment).not.toHaveBeenCalled();
+  });
+
   it('a block that cannot be said never throws', async () => {
     const { github, notices } = fakeGitHub();
     github.postIssueComment.mockRejectedValueOnce(new Error('502'));

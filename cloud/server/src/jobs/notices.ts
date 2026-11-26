@@ -85,12 +85,18 @@ export function createGitHubNotices(deps: {
   async function postOnce(installationId: number, repositoryId: number, repository: string, number: number, pullRequest: boolean, body: string, marker: string): Promise<boolean> {
     const settings = await deps.loadSettings();
     if (!settings) return false;
+    // Fails closed: without the App's own login, a comment anyone wrote could pass for ours.
+    if (!settings.slug) {
+      log({ installationId, repository, warning: 'not posting a please-act comment: the App slug is unknown, so its own comments cannot be told apart' });
+      return false;
+    }
     const { token } = await deps.github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId, {
       repositoryIds: [repositoryId],
       permissions: throttleCommentPermissions(pullRequest),
     });
-    const bot = settings.slug ? `${settings.slug}[bot]` : undefined;
-    if (deps.github.findIssueComment && (await deps.github.findIssueComment(token, repository, number, marker, bot)) !== null) return false;
+    const bot = `${settings.slug}[bot]`;
+    if (!deps.github.findIssueComment) return false;
+    if ((await deps.github.findIssueComment(token, repository, number, marker, bot)) !== null) return false;
     if (deps.github.postIssueComment) await deps.github.postIssueComment(token, repository, number, body);
     else await deps.github.createIssueComment(token, repository, number, body);
     return true;

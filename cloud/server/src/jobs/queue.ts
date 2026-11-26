@@ -146,6 +146,9 @@ export function quietQueueComment(e: QueueEntry, consoleOrigin?: string): { body
     status = { title: 'Queued', text: `Updraft queued this issue. ${waitMessage(e.reason)} It starts automatically when capacity is free; no action is needed.`, stage: STATUS_STAGE.queued };
   } else if (e.state === 'admitted' && o?.reason.startsWith('native_waiting')) {
     status = { title: 'Waiting for Claude', text: 'Capacity is free; the job now waits for the connected Claude subscription before it starts.', stage: STATUS_STAGE.waiting };
+  } else if (e.state === 'admitted' && o?.launchFailed) {
+    // No runner took it over: its launch failed. Said as an end, until a retry's run takes the comment over.
+    status = { title: 'Not started', text: 'Updraft could not start a worker for this work; the job page says why and can retry it.', stage: STATUS_STAGE.ended };
   } else if (e.state === 'admitted') {
     return null;
   } else {
@@ -164,8 +167,11 @@ export const queueActMarker = (jobId: string) => `<!-- updraft-queue-act: ${jobI
  * sentences, what to do, the console link. Null for any other state.
  */
 export function queueActComment(e: QueueEntry, consoleOrigin?: string): string | null {
-  if (e.state !== 'refused' && e.state !== 'expired') return null;
   const link = jobLink(consoleOrigin, e);
+  if (e.state === 'admitted' && e.outcome?.launchFailed) {
+    return [`Updraft could not start a worker for the queued work on ${e.issue === undefined ? 'this pull request' : 'this issue'}. Please retry the job from its page${link ? ` ([open it in Updraft](${link}))` : ' in Updraft'}.`, '', queueActMarker(e.jobId)].join('\n');
+  }
+  if (e.state !== 'refused' && e.state !== 'expired') return null;
   const what = e.issue === undefined ? 'the latest event on this pull request' : 'this issue';
   const why = (e.outcome?.message ?? 'it is no longer eligible.').replace(/\s+$/, '');
   const next = e.outcome?.nextAction ?? (e.state === 'expired' ? (e.issue === undefined ? 'Push a commit or submit the review again to try again.' : 'Remove the label and add it again to try again.') : '');
@@ -562,7 +568,7 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
     ...(e.issue !== undefined ? { issue: e.issue } : {}), ...(e.pullRequest !== undefined ? { pullRequest: e.pullRequest } : {}),
   });
 
-  async function end(e: QueueEntry, state: 'admitted' | 'canceled' | 'refused' | 'expired', outcome: { reason: string; message: string; nextAction?: string; by?: string; jobId?: string }): Promise<QueueEntry | null> {
+  async function end(e: QueueEntry, state: 'admitted' | 'canceled' | 'refused' | 'expired', outcome: { reason: string; message: string; nextAction?: string; by?: string; jobId?: string; launchFailed?: true }): Promise<QueueEntry | null> {
     const at = now();
     const { admittingUntil: _a, ...rest } = e;
     const next: QueueEntry = { ...rest, state, outcome: { at, ...outcome } };
@@ -760,7 +766,7 @@ export function createQueueDispatcher(deps: DispatcherDeps) {
           // A launch that got as far as the job's record: never relaunched from here (its VM may
           // exist). The job's own record and recovery own it now: reconciliation, or a console
           // retry of a job whose launch failed.
-          await end(e, 'admitted', { reason: 'admitted', message: 'A job was recorded for it; its page shows how its launch ended.', jobId: r.jobId });
+          await end(e, 'admitted', { reason: 'admitted', message: 'A job was recorded for it; its page shows how its launch ended.', jobId: r.jobId, launchFailed: true });
           return 'admitted';
         }
         return failed(e, r.errorClass ?? r.disposition);

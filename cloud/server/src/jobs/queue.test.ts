@@ -799,6 +799,28 @@ describe('the admission queue', () => {
       expect(notices).toEqual([]);
     });
 
+    it('an admission whose launch failed, with no run to take the comment over, ends it and asks for a retry once', async () => {
+      const launch = createLauncher(deps());
+      const a = await launch(request(1, 'delivery-a'));
+      const b = await launch(request(2, 'delivery-b'));
+      await finish(a.jobId!);
+      const failing = (async () => ({ status: 502, disposition: 'launch_failed', jobId: b.jobId })) as unknown as ReturnType<typeof createLauncher>;
+      // No job record before the launch; the failed launch got as far as recording one.
+      let launched = false;
+      const jobs = { getJob: async () => (launched ? ({ jobId: b.jobId } as never) : null), getDeliveryClaim: async () => null };
+      const recorded = failing;
+      const failingOnce = (async (req: never) => ((launched = true), recorded(req))) as unknown as ReturnType<typeof createLauncher>;
+      await dispatcherFor(failingOnce, { jobs }).dispatch();
+      expect(await queue.get(55, b.jobId!)).toMatchObject({ state: 'admitted', outcome: { launchFailed: true } });
+      expect(comments).toHaveLength(2);
+      expect(parseStatusMarker(comments[0]!.body)).toEqual({ key: b.jobId, stage: STATUS_STAGE.ended });
+      expect(comments[0]!.body).toContain('**Updraft · Not started**');
+      expect(comments[1]!.body).toMatch(/^Updraft could not start a worker for the queued work on this issue\. Please retry the job from its page/);
+      // A retry's run takes the comment over from there: the queue's end is below every runner stage.
+      await dispatcherFor(failing, { jobs }).dispatch();
+      expect(comments).toHaveLength(2);
+    });
+
     it('a canceled entry is edited quietly, with no separate comment', async () => {
       const launch = createLauncher(deps());
       await launch(request(1, 'delivery-a'));
