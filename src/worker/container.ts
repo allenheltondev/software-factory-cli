@@ -384,12 +384,18 @@ export function containInvocation(o: {
   user?: string;
   /** A reviewer run: the clone's git directory is mounted read-only (see {@link gitMounts}). */
   readOnlyGit?: boolean;
+  /**
+   * The run's base checkout (src/worker/base-check.ts): the base commit's files, mounted
+   * read-only, and a scratch directory, mounted read-write. Neither holds git metadata.
+   */
+  baseCheck?: { baseDir: string; scratchDir: string };
 }): ContainedInvocation {
   const inv = o.invocation;
   const name = containerName(o.runId);
   const mounts = worktreeMounts(o.worktree, { readOnlyGit: o.readOnlyGit === true });
   if (inv.promptVia === 'file-arg') mounts.push({ path: o.promptFile, readOnly: true });
   if (o.vibeReportDir) mounts.push({ path: o.vibeReportDir, readOnly: false });
+  if (o.baseCheck) mounts.push({ path: o.baseCheck.baseDir, readOnly: true }, { path: o.baseCheck.scratchDir, readOnly: false });
   const envNames = [...new Set([...o.container.env, ...Object.keys(inv.env ?? {}), ...Object.keys(o.agentEnv ?? {})])];
   const args = buildContainerRunArgs(
     { file: inv.file, args: inv.args },

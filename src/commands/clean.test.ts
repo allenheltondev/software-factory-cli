@@ -12,6 +12,7 @@ import type { RunOutcome } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { PrepareOnlyExecutor } from '../worker/prepare-only.js';
 import { recordError } from '../db/database.js';
+import { LAST_GC_KEY, MANAGED_CLONE_KEY } from '../git/clone.js';
 import { cleanCommand, cleanVerdict, parseAge } from './clean.js';
 import { EXIT } from './errors.js';
 import { fakeContext } from './fakes.js';
@@ -113,6 +114,28 @@ describe('updraft clean', { timeout: 60_000 }, () => {
     };
     return { f, ctx, db, run };
   }
+
+  it('collects garbage in a clone the worker made, whose agents get no automatic gc, and leaves a person\'s clone alone', async () => {
+    const { f, ctx, run } = await setup();
+    await run(1, 'succeeded');
+    const before = f.git(f.clone, 'config', '--list', '--local');
+    expect(await cleanCommand(ctx)).toBe(0);
+    expect(ctx.out.text).not.toContain('Collected garbage');
+    expect(f.git(f.clone, 'config', '--list', '--local')).toBe(before);
+    // The same clone, marked as the worker's own (as ensureClone makes it).
+    f.git(f.clone, 'config', '--local', MANAGED_CLONE_KEY, 'true');
+    f.git(f.clone, 'config', '--local', 'gc.auto', '0');
+    ctx.out.text = '';
+    expect(await cleanCommand(ctx)).toBe(0);
+    expect(ctx.err.text).toBe('');
+    expect(ctx.out.text).toContain(`Collected garbage in ${f.clone} (git gc --auto)`);
+    expect(Number(f.git(f.clone, 'config', '--get', LAST_GC_KEY))).toBeGreaterThan(0);
+    expect(f.git(f.clone, 'config', '--get', 'gc.auto')).toBe('0');
+    // Not in a dry run.
+    ctx.out.text = '';
+    expect(await cleanCommand(ctx, { dryRun: true })).toBe(0);
+    expect(ctx.out.text).not.toContain('Collected garbage');
+  });
 
   it('removes only eligible worktrees, keeps branches, and is idempotent', async () => {
     const { f, ctx, db, run } = await setup();

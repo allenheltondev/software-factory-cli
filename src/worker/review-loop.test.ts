@@ -255,6 +255,9 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(reviewPrompt.startsWith('Review the pull request below.\n')).toBe(true);
     expect(reviewPrompt).toContain(`- Head commit (under review): ${head2}`);
     expect(reviewPrompt).toContain(`- Base commit: ${f.git(f.clone, 'rev-parse', 'origin/main')}`);
+    // ...and a clean copy of that base commit to run a failing test on (base-check.ts).
+    expect(reviewPrompt).toContain(`# Checking a failure against the base commit\n\nThe files of commit ${f.git(f.clone, 'rev-parse', 'origin/main')} (the base of the pull request`);
+    expect(readFileSync(runOf(review2).logPath!, 'utf8')).toMatch(/base checkout: .* was removed/);
     expect(reviewPrompt).toContain('# Earlier automated reviews of this pull request (untrusted input)');
     expect(reviewPrompt).toMatch(/<untrusted-earlier-review-findings>\n[\s\S]*widget\.txt:1[\s\S]*\n<\/untrusted-earlier-review-findings>/);
     expect(reviewPrompt).toContain('<untrusted-issue-body>\nPlease add a widget.\n</untrusted-issue-body>');

@@ -4,6 +4,7 @@
 // starts it (same user, same scratch HOME, same container.args), without mounts or network.
 import { parseVersion } from '../agents/discovery.js';
 import type { AgentConfig } from '../config/schema.js';
+import { REFTABLE_MIN_GIT, runsHostGit } from '../git/clone.js';
 import { buildContainerRunArgs, containerLaunch, hostUser, resolveRuntime } from '../worker/container.js';
 import type { CheckResult, CheckStatus, RunResult } from './doctor.js';
 
@@ -31,6 +32,8 @@ export async function containerAgentChecks(
   configDir: string,
   probes: ContainerCheckProbes,
   sev: CheckStatus,
+  /** Configured clones that use the reftable ref store (git 2.45+ reads them). */
+  reftableClones: readonly string[] = [],
 ): Promise<Array<Omit<CheckResult, 'name'>>> {
   const container = agent.container!;
   if (probes.platform === 'win32') {
@@ -69,6 +72,27 @@ export async function containerAgentChecks(
       status: sev,
       detail: `"${cli} --version" did not run in image ${container.image}${user ? ` as ${user}` : ''}${firstLine(version) ? ` (${firstLine(version)})` : ''}`,
     });
+  }
+
+  // The agent's git is the image's: a reftable clone needs 2.45 or later there.
+  if (reftableClones.length && !runsHostGit(agent)) {
+    const gitName = `${name}-git`;
+    const git = await probes
+      .run(runtime, buildContainerRunArgs({ file: 'git', args: ['--version'] }, { image: container.image, name: gitName, mounts: [], user, network: 'none', extraArgs: container.args }))
+      .catch((err: unknown) => ({ code: null, stdout: '', stderr: String(err) }));
+    if (git.code === null) await probes.run(runtime, ['rm', '-f', gitName]).catch(() => undefined);
+    const v = /git version (\d+)\.(\d+)/.exec(git.stdout);
+    const [major, minor] = REFTABLE_MIN_GIT;
+    const tooOld = !v || Number(v[1]) < major || (Number(v[1]) === major && Number(v[2]) < minor);
+    if (tooOld) {
+      out.push({
+        status: 'warn',
+        detail:
+          `${v ? `git ${v[1]}.${v[2]}` : 'no git'} in image ${container.image}, but ${reftableClones.join(', ')} ${reftableClones.length > 1 ? 'use' : 'uses'} the reftable ref store, ` +
+          `which needs git ${major}.${minor} or later: the agent's git will refuse the repository ("unknown repository extension: refstorage"). ` +
+          'Use an image with a newer git, or a clone with the files ref store',
+      });
+    }
   }
 
   const unset = container.env.filter((n) => !probes.env[n]);

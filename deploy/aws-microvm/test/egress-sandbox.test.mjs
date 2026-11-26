@@ -14,9 +14,9 @@ import { buildContainerRunArgs } from '../../../src/worker/container.ts';
 import { buildAllowlist, createEgressProxy } from '../image/sandbox/egress-proxy.mjs';
 import { parseRunArgs } from '../image/sandbox/updraft-sandbox.mjs';
 import { EGRESS_SOCKET, IMAGE, withEgress } from '../native-worker/policy.mjs';
-import { installRuntime, networkNamespaceAvailability } from './sandbox-host.mjs';
+import { installRuntime, networkNamespaceAvailability, requireUnlessAllowedToSkip } from './sandbox-host.mjs';
 
-const availability = networkNamespaceAvailability();
+const availability = requireUnlessAllowedToSkip(networkNamespaceAvailability());
 const SHIM = fileURLToPath(new URL('../image/sandbox/egress-shim.mjs', import.meta.url));
 
 let root;

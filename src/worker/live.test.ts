@@ -27,6 +27,7 @@ import { silentLogger } from '../util/log.js';
 import { runDaemon } from './daemon.js';
 import { StartFailedError, type ExecutionContext } from './executor.js';
 import { agentLookupEnv, LiveExecutor } from './live.js';
+import { baseCheckRoot } from './base-check.js';
 import { createExecutor } from './prepare-only.js';
 import { acquireWorkerLock } from './lock.js';
 import { renderPrBody } from '../publish/publish.js';
@@ -423,6 +424,49 @@ describe('LiveExecutor (fake adapter)', { timeout: 120_000 }, () => {
     expect(log).not.toContain('secret-token');
     expect(log).toMatch(/prompt file: .*prompt\.md \(passed by path\)/);
     expect(log).toContain('fake agent: prompt has');
+  });
+
+  it('gives the agent a copy of the base commit and a scratch directory, removed with the run; the job branch is untouched by them', async () => {
+    const { f, paths, config, db, agent } = setup();
+    config.agents.claude = agentSchema.parse(agent('base-check', { args: ['--mode', 'base-check', '--received', join(f.root, 'received.md')] }));
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 15 });
+    const c = claim(db, config, paths);
+    const result = await new LiveExecutor().execute(c, context(db, config, paths, c.run.id));
+    expect(result).toMatchObject({ outcome: 'succeeded', summary: { commitCount: 1 } });
+
+    const root = baseCheckRoot(paths.dataDir, c.run.id);
+    const log = readFileSync(c.run.logPath!, 'utf8');
+    expect(log).toContain(`fake agent: base ${join(root, 'base')} scratch ${join(root, 'scratch')}`);
+    // The base commit's files only: no .git, and not the agent's change.
+    expect(log).toContain('fake agent: base holds ["README.md"]');
+    // Converted on the way out as a checkout of the clone would be (core.autocrlf on Windows).
+    expect(log).toMatch(/fake agent: base README\.md "# widgets(\\r)?\\n"/);
+    expect(log).toMatch(/base checkout: .*base \(commit [0-9a-f]{40}, no git metadata;/);
+    expect(log).toContain(`base checkout: ${root} was removed`);
+    expect(existsSync(root)).toBe(false);
+    // The prompt the agent got says where it is and how to use it.
+    const prompt = readFileSync(join(f.root, 'received.md'), 'utf8');
+    expect(prompt).toContain('# Checking a failure against the base commit');
+    expect(prompt).toContain(JSON.stringify(join(root, 'base')));
+    // The job branch has the agent's change and nothing of the base checkout.
+    const worktree = join(worktreesRoot(paths), '42', c.job.id);
+    expect(readFileSync(join(worktree, 'README.md'), 'utf8')).toBe('changed by the agent\n');
+    expect(f.git(worktree, 'status', '--porcelain')).toBe('');
+    expect(f.git(f.clone, 'worktree', 'list', '--porcelain').match(/^worktree /gm)).toHaveLength(2);
+  });
+
+  it('runs the agent without a base checkout, and says why, when the base commit cannot be checked out', async () => {
+    const { f, paths, config, db, agent } = setup();
+    config.agents.claude = agentSchema.parse(agent('success', { args: ['--mode', 'success', '--received', join(f.root, 'received.md')] }));
+    insertQueuedJob(db, { repoId: 42, fullName: 'octo/widgets', issue: 16 });
+    const c = claim(db, config, paths);
+    // A file where the base checkouts' directory would go.
+    mkdirSync(paths.dataDir, { recursive: true });
+    writeFileSync(join(paths.dataDir, 'base-checks'), 'in the way');
+    const result = await new LiveExecutor().execute(c, context(db, config, paths, c.run.id));
+    expect(result.outcome).toBe('succeeded');
+    expect(readFileSync(c.run.logPath!, 'utf8')).toMatch(/base checkout: none \(/);
+    expect(readFileSync(join(f.root, 'received.md'), 'utf8')).not.toContain('Checking a failure against the base commit');
   });
 
   it.runIf(isWindows)('runs an agent installed as an npm .cmd shim through its resolved Node entry point', async () => {

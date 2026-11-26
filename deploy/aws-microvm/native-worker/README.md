@@ -206,7 +206,11 @@ refusal is a defensive check, not a queue: a misconfigured concurrent caller sti
 
 Run Updraft as UID/GID 1000. Put clones (`checkoutPath`) and `UPDRAFT_HOME` beneath
 `/var/lib/updraft-jobs`, giving that account ownership of its clone/control/state directories.
-Generated worktrees then stay within the allowed root. Keep the existing GitHub App credentials
+Generated worktrees, and each run's base checkout (`UPDRAFT_HOME/base-checks/<run>`,
+docs/worktrees.md), then stay within the allowed root. Besides `HOME` and the App's Git
+identity, the runtime client passes on only `UPDRAFT_BASE_DIR` and `UPDRAFT_SCRATCH_DIR`, and
+the supervisor accepts each only as the path of that run's own read-only (base) or read-write
+(scratch) mount. Keep the existing GitHub App credentials
 and configuration. Run `updraft validate`, `updraft doctor`, then the existing
 `updraft run-event --event-file ... --event-name issues --delivery-id ... --json`.
 Implementation, verify, PR creation, review and revision use the existing state machine.

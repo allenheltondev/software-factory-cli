@@ -33,7 +33,7 @@ import {
 import { agentProfile, describeProfile, effectiveArgs } from '../agents/profile.js';
 import { checkNativeClaudeAuth, nativeClaudeAuthHint, type NativeAuthRunner } from '../agents/native-claude-auth.js';
 import { defaultDiscoveryProbes, locateLaunch, type LocatedLaunch } from '../agents/discovery.js';
-import { renderPrompt, renderRevisionPrompt, type IssueContext } from '../agents/prompt.js';
+import { baseCheckSection, renderPrompt, renderRevisionPrompt, type BaseCheckPrompt, type IssueContext } from '../agents/prompt.js';
 import { dependencyMergedSection, dependencyProtocolSection, MAX_DEPENDENCY_WAITS, readDependency } from '../agents/dependency.js';
 import type { DeclaredDependency } from '../db/dependency-waits.js';
 import { renderReviewPrompt } from '../agents/review-prompt.js';
@@ -80,6 +80,7 @@ import { APP_KEY_PATH_ENV, APP_TOKEN_FILE_ENV } from '../github/app-auth.js';
 import { commitIdentityEnv, type CommitIdentity } from '../github/credentials.js';
 import { processStartTime, taskkillPath } from './process.js';
 import { discardReviewWorktree, readReviewVerdict, reviewBase, type ReviewRunState } from './review-run.js';
+import { BASE_DIR_ENV, SCRATCH_DIR_ENV, baseCheckRoot, prepareBaseCheckout, removeTree, type BaseCheckout } from './base-check.js';
 import { readResolutions } from '../agents/findings.js';
 import { cleanSummaryLines, countUncommitted, hasSubmodules, headCommit, readOutput, renderSummary, summarizeRun, tailLines } from './run-summary.js';
 import { ESCALATION_MARKER } from '../escalation/escalation.js';
@@ -551,13 +552,27 @@ export class LiveExecutor implements Executor {
   constructor(private readonly opts: LiveExecutorOptions = {}) {}
 
   async execute(claim: Claim, ctx: ExecutionContext): Promise<ExecutionResult> {
+    // The run's base checkout (base-check.ts) is removed when the run ends, whatever the outcome.
+    const base: { checkout: BaseCheckout | null } = { checkout: null };
+    try {
+      return await this.executeRun(claim, ctx, base);
+    } finally {
+      if (base.checkout) {
+        const problem = removeTree(base.checkout.root);
+        const logPath = claim.run.logPath ?? join(ctx.paths.runsDir, claim.run.id, 'run.log');
+        await appendFile(logPath, `base checkout: ${problem ? `could not remove ${base.checkout.root}: ${problem}` : `${base.checkout.root} was removed`}\n`, 'utf8').catch(() => undefined);
+      }
+    }
+  }
+
+  private async executeRun(claim: Claim, ctx: ExecutionContext, base: { checkout: BaseCheckout | null }): Promise<ExecutionResult> {
     const request = reviewOf(claim.job);
-    if (!request) return this.run(claim, ctx, null);
+    if (!request) return this.run(claim, ctx, null, base);
     // A reviewer run (review-run.ts) publishes nothing: its worktree and branch are removed
     // whatever the outcome, including a failure, a timeout, a cancel and a worker shutdown.
     const review: ReviewRunState = { request, worktree: null };
     try {
-      return await this.run(claim, ctx, review);
+      return await this.run(claim, ctx, review, base);
     } finally {
       await discardReviewWorktree(review, { git: this.opts.git, logPath: claim.run.logPath ?? join(ctx.paths.runsDir, claim.run.id, 'run.log') });
       if (review.worktree) {
@@ -570,7 +585,7 @@ export class LiveExecutor implements Executor {
     }
   }
 
-  private async run(claim: Claim, ctx: ExecutionContext, review: ReviewRunState | null): Promise<ExecutionResult> {
+  private async run(claim: Claim, ctx: ExecutionContext, review: ReviewRunState | null, base: { checkout: BaseCheckout | null }): Promise<ExecutionResult> {
     const { job, run } = claim;
     const logPath = run.logPath ?? join(ctx.paths.runsDir, run.id, 'run.log');
     const runDir = dirname(logPath);
@@ -693,19 +708,21 @@ export class LiveExecutor implements Executor {
     const policy = acceptancePolicy(found.repo);
     const acceptance: AcceptanceSnapshot | null = policy ? extractCriteria(issue, policy) : null;
     // A reviewer's prompt names the base commit, which is only known once the clone was fetched (step 3).
-    const reviewPrompt = (r: ReviewRunState, base: { baseBranch: string | null; baseSha: string | null }) =>
-      renderReviewPrompt(actionPrompt, issue, r.request, { headSha: r.request.headSha, baseBranch: base.baseBranch, baseSha: base.baseSha }, acceptance);
+    const reviewPrompt = (r: ReviewRunState, target: { baseBranch: string | null; baseSha: string | null }, baseCheck: BaseCheckPrompt | null = null) =>
+      renderReviewPrompt(actionPrompt, issue, r.request, { headSha: r.request.headSha, baseBranch: target.baseBranch, baseSha: target.baseSha }, acceptance, baseCheck);
+    // A code or revision run's prompt is written again once its base checkout exists (step 3).
+    const codePrompt = (baseCheck: BaseCheckPrompt | null) =>
+      revision
+        ? renderRevisionPrompt(actionPrompt, issue, revision, [...coderAcceptanceSection(acceptance, revision.acceptance ?? []), ...baseCheckSection(baseCheck)])
+        : renderPrompt(actionPrompt, issue, [
+            ...(resume ? dependencyMergedSection(resume) : []),
+            ...(dependencies ? dependencyProtocolSection(dependencies.repositories, { waitsLeft }) : []),
+            ...coderAcceptanceSection(acceptance),
+            ...baseCheckSection(baseCheck),
+          ]);
     await writeFile(
       promptFile,
-      review
-        ? reviewPrompt(review, { baseBranch: review.request.pullRequest.baseBranch, baseSha: null })
-        : revision
-          ? renderRevisionPrompt(actionPrompt, issue, revision, coderAcceptanceSection(acceptance, revision.acceptance ?? []))
-          : renderPrompt(actionPrompt, issue, [
-              ...(resume ? dependencyMergedSection(resume) : []),
-              ...(dependencies ? dependencyProtocolSection(dependencies.repositories, { waitsLeft }) : []),
-              ...coderAcceptanceSection(acceptance),
-            ]),
+      review ? reviewPrompt(review, { baseBranch: review.request.pullRequest.baseBranch, baseSha: null }) : codePrompt(null),
       'utf8',
     );
     if (ctx.issue?.withheld) await log([`issue body: withheld from the agent (${ctx.issue.withheld})`]);
@@ -814,8 +831,33 @@ export class LiveExecutor implements Executor {
         git: this.opts.git,
         signal: ctx.workerStopping ? AbortSignal.any([ctx.signal, ctx.workerStopping]) : ctx.signal,
       });
-      await writeFile(promptFile, reviewPrompt(review, reviewedBase), 'utf8');
     }
+    // A clean copy of the base commit, for checking a failure against it (base-check.ts): for a
+    // reviewer, the pull request's base; otherwise the commit this run's branch starts from.
+    const baseCheckSha = review ? reviewedBase?.baseSha ?? null : prepared.baseSha;
+    let baseCheckPrompt: BaseCheckPrompt | null = null;
+    if (baseCheckSha) {
+      try {
+        base.checkout = await prepareBaseCheckout({ checkoutPath: checkoutSource, sha: baseCheckSha, root: baseCheckRoot(ctx.paths.dataDir, run.id), git: this.opts.git });
+        baseCheckPrompt = {
+          sha: baseCheckSha,
+          describes: review
+            ? `the base of the pull request: where it branched from ${reviewedBase?.baseBranch ?? 'its base branch'}`
+            : revision
+              ? 'the head of the pull request before this run, which this branch starts from'
+              : 'the commit this branch starts from',
+          baseDir: base.checkout.baseDir,
+          scratchDir: base.checkout.scratchDir,
+        };
+      } catch (err) {
+        await log([`base checkout: none (${message(err)})`]);
+      }
+    }
+    if (review && reviewedBase) await writeFile(promptFile, reviewPrompt(review, reviewedBase, baseCheckPrompt), 'utf8');
+    else if (baseCheckPrompt) await writeFile(promptFile, codePrompt(baseCheckPrompt), 'utf8');
+    const baseCheckEnv: Record<string, string> | undefined = base.checkout
+      ? { [BASE_DIR_ENV]: base.checkout.baseDir, [SCRATCH_DIR_ENV]: base.checkout.scratchDir }
+      : undefined;
 
     // 4. Invocation.
     let invocation: AgentInvocation;
@@ -831,7 +873,7 @@ export class LiveExecutor implements Executor {
     } catch (err) {
       throw new StartFailedError(`adapter ${adapterName} could not build the agent command: ${message(err)}`, { cause: err });
     }
-    const agentEnv = mergeEnv(baseEnv, invocation.env, commitEnv, agentCfg.env);
+    const agentEnv = mergeEnv(baseEnv, invocation.env, commitEnv, agentCfg.env, baseCheckEnv);
     // Check the exact environment and working directory that the CLI will receive. The
     // early check prevents unnecessary worktrees on bad sign-in; this final one catches
     // project-local auth settings, adapter/commit env changes, and login changes during checkout.
@@ -879,8 +921,9 @@ export class LiveExecutor implements Executor {
             worktree: prepared.worktreePath,
             promptFile,
             ...(vibeReport ? { vibeReportDir: vibeReport } : {}),
-            agentEnv: commitEnv ? { ...commitEnv, ...agentCfg.env } : agentCfg.env,
+            agentEnv: commitEnv || baseCheckEnv ? { ...commitEnv, ...agentCfg.env, ...baseCheckEnv } : agentCfg.env,
             readOnlyGit: review !== null,
+            ...(base.checkout ? { baseCheck: base.checkout } : {}),
           }),
         };
       } catch (err) {
@@ -897,6 +940,7 @@ export class LiveExecutor implements Executor {
       ...(reviewedBase ? [`review base: ${reviewedBase.baseBranch ?? '(unknown branch)'} at ${reviewedBase.baseSha ?? '(unknown)'}${reviewedBase.note ? ` (${reviewedBase.note})` : ''}`] : []),
       `branch: ${prepared.branch}`,
       `checkout: ${prepared.worktreePath}`,
+      ...(base.checkout ? [`base checkout: ${base.checkout.baseDir} (commit ${base.checkout.sha}, no git metadata; scratch ${base.checkout.scratchDir}; both removed when the run ends)`] : []),
       '',
       `agent cli: ${located.path ?? located.launch.file}${contained ? ` (inside image ${agentCfg.container!.image})` : ''}`,
       ...(contained
@@ -1073,7 +1117,9 @@ export class LiveExecutor implements Executor {
         ...(box && agentCfg.container
           ? {
               contain: (command: VerifyCommand, index: number) => {
-                const verifyMounts = box.mounts.filter((m) => m.path !== promptFile && m.path !== vibeReport);
+                // Neither the prompt, the Vibe report nor the base checkout: the commands check the worktree.
+                const baseCheckPaths = base.checkout ? [base.checkout.baseDir, base.checkout.scratchDir] : [];
+                const verifyMounts = box.mounts.filter((m) => m.path !== promptFile && m.path !== vibeReport && !baseCheckPaths.includes(m.path));
                 // Inside the container it is always a POSIX shell, whatever the host is.
                 const inner = verifyInvocation(command, 'linux');
                 const name = containerName(run.id, `verify-${index + 1}`);

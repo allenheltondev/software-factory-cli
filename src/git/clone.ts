@@ -22,9 +22,17 @@
 import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { isHttpsGitHub, publishGitEnv, redactSecret } from '../publish/publish.js';
 import { isGitRepo, runGit as defaultRunGit, type GitOptions, type GitOutput } from './git.js';
+import { withCheckoutLock } from './worktree.js';
+import type { AgentConfig } from '../config/schema.js';
 
 /** Marks a clone `ensureClone` created; a clone carrying it is always fetched with the worker's credentials. */
 export const MANAGED_CLONE_KEY = 'updraft.managedClone';
+
+/** Set in a clone ensureClone creates; see there. */
+export const MANAGED_CLONE_CONFIG: ReadonlyArray<readonly [string, string]> = [
+  ['gc.auto', '0'],
+  ['maintenance.auto', 'false'],
+];
 
 type RunGit = (args: readonly string[], opts: GitOptions) => Promise<GitOutput>;
 
@@ -48,6 +56,46 @@ export interface EnsureCloneRequest {
   git?: string;
   /** Injected in tests to record what reaches git. */
   runGit?: RunGit;
+  now?: () => number;
+  /**
+   * The ref store of a new clone: `reftable` only when every agent that may work in it runs the
+   * host's git (cloneRefFormat). Default `files`.
+   */
+  refFormat?: CloneRefFormat;
+}
+
+export type CloneRefFormat = 'reftable' | 'files';
+
+/** Git 2.45 is the first that reads (and makes) reftable repositories. */
+export const REFTABLE_MIN_GIT = [2, 45] as const;
+
+/**
+ * Images of the runtimes that run the host's own git: updraft-sandbox (bubblewrap) and the native
+ * worker bind the host's /usr, so a contained agent's git is the worker's git. Any other image
+ * brings its own git, which may be too old to read a reftable repository.
+ */
+const HOST_GIT_RUNTIMES = new Set(['updraft-sandbox', 'updraft-native-worker']);
+const HOST_GIT_IMAGES = new Set(['microvm', 'native-claude-worker']);
+
+/** Does this agent run the host's git against the clone? Without a container, or in a runtime that binds the host's /usr. */
+export function runsHostGit(agent: Pick<AgentConfig, 'container'>): boolean {
+  const c = agent.container;
+  if (!c) return true;
+  const runtime = c.runtime.split(/[\\/]/).pop() ?? '';
+  return HOST_GIT_RUNTIMES.has(runtime) && HOST_GIT_IMAGES.has(c.image);
+}
+
+/**
+ * The ref store for a clone the worker makes: reftable (see ensureClone) only when every enabled
+ * agent runs the host's git, which then reads what it made. An agent in an image of its own may
+ * have git older than 2.45, which refuses a reftable repository outright ("unknown repository
+ * extension: refstorage"); with it in the config, the clone keeps the files store, and a
+ * contained commit on git 2.45+ prints its packed-refs.lock warning as before. Every enabled
+ * agent counts, not only those a workflow names today: pools, routing and escalation can pick
+ * any of them.
+ */
+export function cloneRefFormat(agents: Record<string, Pick<AgentConfig, 'container' | 'enabled'>>): CloneRefFormat {
+  return Object.values(agents).every((a) => a.enabled === false || runsHostGit(a)) ? 'reftable' : 'files';
 }
 
 export interface EnsuredClone {
@@ -82,10 +130,77 @@ export async function ensureClone(req: EnsureCloneRequest): Promise<EnsuredClone
     return { created: false, managed: marked?.stdout.trim() === 'true' };
   }
   mkdirSync(checkoutPath, { recursive: true });
-  await run(['init', '--quiet'], opts);
+  // The reftable ref store where git has one (2.45 and later). A contained agent commits through
+  // a git directory whose top level is read-only (src/worker/container.ts, gitMounts). With the
+  // files ref store every ref deletion takes `packed-refs.lock` there, whether or not the ref is
+  // packed, and git 2.45+ `git commit` deletes its per-worktree pseudorefs (AUTO_MERGE,
+  // CHERRY_PICK_HEAD, ...) through the ref store after every commit: each agent commit printed
+  // "Unable to create '.../packed-refs.lock': Read-only file system", and `git stash pop` or
+  // `git branch -d` failed. Reftable keeps every ref, its lock and its tables in `reftable/`,
+  // one of the directories a commit may already write, so nothing needs the top level. An older
+  // git refuses the option before creating anything, and gets the files store as before.
+  // Only when every agent's git is the host's (cloneRefFormat): an older git in an agent's own
+  // image cannot open a reftable repository at all.
+  let initialized = false;
+  if (req.refFormat === 'reftable') {
+    try {
+      await run(['init', '--quiet', '--ref-format=reftable'], opts);
+      initialized = true;
+    } catch {
+      // git older than 2.45
+    }
+  }
+  if (!initialized) await run(['init', '--quiet'], opts);
   await run(['remote', 'add', 'origin', req.cloneUrl], opts);
   await run(['config', '--local', MANAGED_CLONE_KEY, 'true'], opts);
+  // No automatic housekeeping. A contained agent commits through a git directory whose top
+  // level is read-only (src/worker/container.ts, gitMounts), and the gc that `git commit` may
+  // start packs refs there: it fails, with a "packed-refs.lock: Read-only file system" warning
+  // in the agent's output. The worker collects garbage itself instead, outside any agent run
+  // (housekeepManagedClone).
+  for (const [key, value] of MANAGED_CLONE_CONFIG) await run(['config', '--local', key, value], opts);
+  await run(['config', '--local', LAST_GC_KEY, String(req.now?.() ?? Date.now())], opts);
   return { created: true, managed: true };
+}
+
+/** When the worker last ran `git gc --auto` in a clone it made (ms since the epoch). */
+export const LAST_GC_KEY = 'updraft.lastGc';
+/** How often housekeepManagedClone collects garbage in one clone. */
+export const GC_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The automatic gc that ensureClone turns off for agents, run by the worker itself: `git gc
+ * --auto` on the host, with git's default threshold, no hooks (gc --auto runs pre-auto-gc), and
+ * serialized with every other operation on the clone, so never while an agent of it runs. At most
+ * once per `intervalMs` (0: whenever asked, as `updraft clean` does). Only for a clone ensureClone
+ * made; a clone a person made keeps its own gc. Never throws: returns what it did.
+ */
+export function housekeepManagedClone(o: {
+  checkoutPath: string;
+  git?: string;
+  runGit?: RunGit;
+  now?: () => number;
+  intervalMs?: number;
+  /** A path that does not exist: core.hooksPath for gc. */
+  hooksPath: string;
+}): Promise<{ ran: boolean; why: string }> {
+  const run = o.runGit ?? defaultRunGit;
+  const opts: GitOptions = { cwd: o.checkoutPath, git: o.git };
+  const now = o.now?.() ?? Date.now();
+  return withCheckoutLock(o.checkoutPath, async () => {
+    try {
+      const marked = await run(['config', '--local', '--get', MANAGED_CLONE_KEY], opts).catch(() => null);
+      if (marked?.stdout.trim() !== 'true') return { ran: false, why: 'not a clone the worker made' };
+      const last = Number((await run(['config', '--local', '--get', LAST_GC_KEY], opts).catch(() => null))?.stdout.trim() ?? NaN);
+      const interval = o.intervalMs ?? GC_INTERVAL_MS;
+      if (interval > 0 && Number.isFinite(last) && now - last < interval) return { ran: false, why: 'collected recently' };
+      await run(['-c', 'gc.auto=6700', '-c', 'gc.autoDetach=false', '-c', 'maintenance.auto=false', '-c', `core.hooksPath=${o.hooksPath}`, 'gc', '--auto', '--quiet'], opts);
+      await run(['config', '--local', LAST_GC_KEY, String(now)], opts);
+      return { ran: true, why: 'git gc --auto' };
+    } catch (err) {
+      return { ran: false, why: `git gc --auto failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  });
 }
 
 /** What a network git command of the worker runs with, and how to keep its credential out of messages. */
