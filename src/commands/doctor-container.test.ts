@@ -51,6 +51,43 @@ describe('containerAgentChecks', () => {
     expect(calls[1]).toEqual(['/usr/bin/docker', 'image', 'inspect', '--format', '{{.Id}}', 'my-org/claude-runner:latest']);
   });
 
+  it('warns when the image\'s git is too old for a reftable clone the agent would work in', async () => {
+    const answer = (git: RunResult) => {
+      const calls: string[][] = [];
+      const probes: ContainerCheckProbes = {
+        platform: 'linux',
+        env: { ANTHROPIC_API_KEY: 'k' },
+        which: (c) => (c === 'docker' ? '/usr/bin/docker' : null),
+        run: async (file, args) => {
+          calls.push([file, ...args]);
+          if (args[0] !== 'run') return ok();
+          return args.at(-2) === 'git' ? git : ok('2.1.0 (Claude Code)\n');
+        },
+        user: '1000:1000',
+      };
+      return { probes, calls };
+    };
+    const clones = ['/work/widgets'];
+    const old = answer(ok('git version 2.39.5\n'));
+    const warned = await containerAgentChecks('claude', 'claude', claude(), '/cfg', old.probes, 'fail', clones);
+    expect(warned.at(-1)).toEqual({ status: 'warn', detail: expect.stringMatching(/^git 2\.39 in image my-org\/claude-runner:latest, but \/work\/widgets uses the reftable ref store, which needs git 2\.45 or later/) });
+    // It is asked the way the CLI is: in the image, no mounts, no network.
+    const gitRun = old.calls.find((c) => c.at(-2) === 'git')!;
+    expect(gitRun.slice(-3)).toEqual(['my-org/claude-runner:latest', 'git', '--version']);
+    expect(gitRun).not.toContain('--mount');
+    expect((await containerAgentChecks('claude', 'claude', claude(), '/cfg', answer(failed('not found', 127)).probes, 'fail', clones)).at(-1)?.detail).toMatch(/^no git in image/);
+    // New enough, no reftable clone, or the host's git (the sandbox runtime): no warning, and no extra run.
+    expect((await containerAgentChecks('claude', 'claude', claude(), '/cfg', answer(ok('git version 2.45.0\n')).probes, 'fail', clones)).map((c) => c.status)).not.toContain('warn');
+    const none = answer(ok('git version 2.39.5\n'));
+    expect((await containerAgentChecks('claude', 'claude', claude(), '/cfg', none.probes, 'fail', [])).map((c) => c.status)).not.toContain('warn');
+    expect(none.calls.some((c) => c.at(-2) === 'git')).toBe(false);
+    const host = answer(ok('git version 2.39.5\n'));
+    host.probes.which = (c) => (c === '/opt/updraft/bin/updraft-sandbox' ? c : null);
+    const sandboxed = claude({ runtime: '/opt/updraft/bin/updraft-sandbox', image: 'microvm' });
+    expect((await containerAgentChecks('claude', 'claude', sandboxed, '/cfg', host.probes, 'fail', clones)).map((c) => c.status)).not.toContain('warn');
+    expect(host.calls.some((c) => c.at(-2) === 'git')).toBe(false);
+  });
+
   it('runs the CLI in the image as a live run would start it, with no mounts, no network and no credentials', async () => {
     const { probes, calls } = runtimeProbes();
     await containerAgentChecks('claude', 'claude', claude({ args: ['--memory', '4g'] }), '/cfg', probes, 'fail');

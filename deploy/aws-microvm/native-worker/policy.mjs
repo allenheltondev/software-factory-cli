@@ -9,6 +9,14 @@ export const TOOL = 'mcp__updraft__exec';
 export const MAX_FRAME = 2 * 1024 * 1024;
 export const DEFAULT_SOCKET = '/run/updraft-native/worker.sock';
 export const GIT_IDENTITY = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'];
+/**
+ * The run's base checkout (src/worker/base-check.ts): where the base commit's files and the
+ * scratch directory are. Paths, not secrets; validateRun accepts each only when it names a
+ * directory the run mounts, so it can point the agent at nothing else.
+ */
+export const BASE_CHECK_PATHS = ['UPDRAFT_BASE_DIR', 'UPDRAFT_SCRATCH_DIR'];
+/** Variables resolved by name from the runtime client's environment (resolveRunEnvironment). */
+const BY_NAME = [...GIT_IDENTITY, ...BASE_CHECK_PATHS];
 /** Where the egress proxy's socket directory appears inside the sandbox (#147). */
 export const EGRESS_TARGET = '/updraft-egress';
 export const EGRESS_SOCKET = 'proxy.sock';
@@ -38,6 +46,7 @@ export function networkNote(egress) {
 function checkEnvironment(entry) {
   if (entry.name === 'HOME' && entry.value === '/updraft-home') return;
   if (GIT_IDENTITY.includes(entry.name) && typeof entry.value === 'string' && entry.value.length <= 1024 && !/[\0\r\n]/.test(entry.value)) return;
+  if (BASE_CHECK_PATHS.includes(entry.name) && typeof entry.value === 'string' && entry.value.startsWith('/') && entry.value.length <= 4096 && !/[\0-\x1f\x7f]/.test(entry.value)) return;
   throw new Error('agent environment overrides are forbidden or unresolved');
 }
 
@@ -57,7 +66,7 @@ export function resolveRunEnvironment(argv, env) {
     const text = out[index].slice(prefix.length);
     const equals = text.indexOf('=');
     const name = equals < 0 ? text : text.slice(0, equals);
-    const value = equals < 0 && GIT_IDENTITY.includes(name) ? env[name] : equals < 0 ? undefined : text.slice(equals + 1);
+    const value = equals < 0 && BY_NAME.includes(name) ? env[name] : equals < 0 ? undefined : text.slice(equals + 1);
     checkEnvironment({ name, value });
     out[index] = `${prefix}${name}=${value}`;
   }
@@ -82,6 +91,12 @@ export function validateRun(argv, config) {
     if (mount.source !== mount.target || !inside(fs.realpathSync(mount.source), config.workRoot)) throw new Error('mount is outside workRoot');
   }
   if (!run.mounts.some((m) => m.target === run.workdir && !m.readOnly)) throw new Error('missing worktree mount');
+  // The base checkout's variables name its mounts: the base read-only, the scratch directory read-write.
+  for (const entry of run.env) {
+    if (!BASE_CHECK_PATHS.includes(entry.name)) continue;
+    const readOnly = entry.name === 'UPDRAFT_BASE_DIR';
+    if (!run.mounts.some((m) => m.target === entry.value && m.readOnly === readOnly && m.target !== run.workdir)) throw new Error('base checkout variable does not name its mount');
+  }
   return run;
 }
 

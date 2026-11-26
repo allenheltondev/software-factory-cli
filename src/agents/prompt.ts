@@ -45,6 +45,47 @@ export function issueSection(issue: IssueContext): string[] {
   ];
 }
 
+/** A clean copy of a run's base commit (src/worker/base-check.ts), as the prompt describes it. */
+export interface BaseCheckPrompt {
+  /** The commit whose files are in `baseDir`. */
+  sha: string;
+  /** What that commit is to this run, e.g. "the commit this branch started from". */
+  describes: string;
+  baseDir: string;
+  scratchDir: string;
+}
+
+/**
+ * How to check a failing test against the base commit, for the coding agent and the reviewer.
+ * Ends with a separator, like the other sections. Empty without a base checkout.
+ */
+export function baseCheckSection(check: BaseCheckPrompt | null): string[] {
+  if (!check) return [];
+  const base = JSON.stringify(check.baseDir);
+  const scratch = JSON.stringify(check.scratchDir);
+  return [
+    '# Checking a failure against the base commit',
+    '',
+    `The files of commit ${check.sha} (${check.describes}) are in ${base} (\`$UPDRAFT_BASE_DIR\`): read-only, with no git ` +
+      `history and no credentials. ${scratch} (\`$UPDRAFT_SCRATCH_DIR\`) is empty and yours to write. Both are deleted when ` +
+      'this run ends; nothing in them is committed, pushed or kept.',
+    '',
+    'When a test fails in a file the change does not touch, do not call it unrelated or environmental without checking: run ' +
+      'the same test on the base commit, in a copy in the scratch directory, with the same install and test commands you used here:',
+    '',
+    '```sh',
+    'rm -rf "$UPDRAFT_SCRATCH_DIR/base" && cp -R "$UPDRAFT_BASE_DIR" "$UPDRAFT_SCRATCH_DIR/base" && cd "$UPDRAFT_SCRATCH_DIR/base" && <install> && <the failing test>',
+    '```',
+    '',
+    'Report what it showed as evidence, with the command: "fails on base too" or "passes on base". This leaves this ' +
+      'worktree and its branch exactly as they are. Do not use `git stash`, `git checkout` of another commit or a second ' +
+      'worktree for this: the git directory is mostly read-only here, and they would change this worktree.',
+    '',
+    '---',
+    '',
+  ];
+}
+
 /**
  * The prompt of an implementation run. `sections` (the worker's own text, each ending with a
  * separator) go between the action's prompt and the issue: the dependency protocol and, for a

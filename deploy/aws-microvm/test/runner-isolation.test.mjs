@@ -36,10 +36,10 @@ import {
 } from '../image/runner/isolation.mjs';
 import { ISOLATION_CHECK_MARKER, checkImageIsolation, runJob } from '../image/runner/job.mjs';
 import { checkConfig } from '../../../src/commands/validate.ts';
-import { installRuntime, sandboxAvailability } from './sandbox-host.mjs';
+import { installRuntime, requireUnlessAllowedToSkip, sandboxAvailability } from './sandbox-host.mjs';
 
 const onLinuxLikeHost = process.platform !== 'win32';
-const sandbox = onLinuxLikeHost ? sandboxAvailability() : { usable: false, reason: 'needs Linux' };
+const sandbox = requireUnlessAllowedToSkip(onLinuxLikeHost ? sandboxAvailability() : { usable: false, reason: 'needs Linux' });
 const FAKE_UPDRAFT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fake-updraft.mjs');
 
 const contained = (extra = {}) => ({ enabled: true, container: { image: SANDBOX_IMAGE, runtime: SANDBOX_RUNTIME, env: ['ANTHROPIC_API_KEY'], ...extra } });

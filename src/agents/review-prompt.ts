@@ -6,7 +6,7 @@
 // by an account that is not an allowed actor is in it.
 import type { AcceptanceSnapshot, ReviewRunRequest } from '../types.js';
 import { reviewerAcceptanceInstructions, reviewerAcceptanceSection } from './acceptance-prompt.js';
-import { fence, issueSection, type IssueContext } from './prompt.js';
+import { baseCheckSection, fence, issueSection, type BaseCheckPrompt, type IssueContext } from './prompt.js';
 import { FINDINGS_BLOCK } from './findings.js';
 import { findingsLine, VERDICT_TOKEN, verdictLine } from './verdict.js';
 
@@ -56,6 +56,8 @@ export function renderReviewPrompt(
   review: ReviewRunRequest,
   target: ReviewTarget,
   acceptance: AcceptanceSnapshot | null = null,
+  /** A clean copy of the pull request's base commit (src/worker/base-check.ts), or null. */
+  baseCheck: BaseCheckPrompt | null = null,
 ): string {
   const { pullRequest } = review;
   const diff = target.baseSha ? `git diff ${target.baseSha}...${target.headSha}` : `git show ${target.headSha}`;
@@ -126,6 +128,7 @@ export function renderReviewPrompt(
     'You may read anything in the repository and run its tests. Nothing you change or commit here is kept or pushed: this ' +
       'worktree is discarded when you finish. Your result is your final message and nothing else.',
     '',
+    ...baseCheckSection(baseCheck),
     '# How to answer',
     '',
     'Write your findings, with file and line references, and keep blockers (what must change before this can be merged) ' +

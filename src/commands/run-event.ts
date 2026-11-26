@@ -28,7 +28,7 @@ import { getLoopPr, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
 import { getPublication } from '../db/publications.js';
 import { getJob, latestRunOfJob, MAX_START_FAILURES, RETRYABLE, retryJob } from '../db/queue.js';
 import { countRevisions, getRevisionPr, syncRevisionPrs } from '../db/revisions.js';
-import { ensureClone, githubCloneUrl, workerNetworkGit, type NetworkGit } from '../git/clone.js';
+import { cloneRefFormat, ensureClone, githubCloneUrl, housekeepManagedClone, workerNetworkGit, type NetworkGit } from '../git/clone.js';
 import { listRemotes, runGit, selectRepoRemote, type GitOptions } from '../git/git.js';
 import { jobBranchName, withCheckoutLock } from '../git/worktree.js';
 import { GitHubError, type GitHubApi } from '../github/api.js';
@@ -880,8 +880,20 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     }
 
     // 3. The clone, and how the worker's own git commands reach GitHub from it.
-    const clone = await ensureClone({ checkoutPath, cloneUrl: deps.cloneUrl(repo.fullName), ...(deps.executor?.git ? { git: deps.executor.git } : {}) });
+    const clone = await ensureClone({
+      checkoutPath,
+      cloneUrl: deps.cloneUrl(repo.fullName),
+      // Reftable only when every agent's git is the host's one (see cloneRefFormat).
+      refFormat: cloneRefFormat(config.agents),
+      ...(deps.executor?.git ? { git: deps.executor.git } : {}),
+    });
     if (clone.created) log.info('created the clone', { path: checkoutPath });
+    // Agents' git gets no automatic gc in a clone the worker made (ensureClone); a clone that
+    // outlives one event gets it here, before this event's run, at most once a day.
+    else if (clone.managed) {
+      const gc = await housekeepManagedClone({ checkoutPath, hooksPath: join(paths.dataDir, 'no-hooks'), now: ctx.now, ...(deps.executor?.git ? { git: deps.executor.git } : {}) });
+      if (gc.ran || gc.why.includes('failed')) log.info('housekeeping of the clone', { path: checkoutPath, ran: gc.ran, detail: gc.why });
+    }
     const withWorkerCredentials = clone.managed || opts.workerGitCredentials === true;
     const local: GitOptions = { cwd: checkoutPath, ...(deps.executor?.git ? { git: deps.executor.git } : {}) };
     const selection = selectRepoRemote(await listRemotes(local), repo.fullName, repoCfg.remote);

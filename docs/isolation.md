@@ -93,6 +93,8 @@ directory, not the SSH agent socket, not the runtime's own socket.
 | `<clone>/.git/worktrees/<job>` | read-write | This worktree's `HEAD`, index and logs |
 | `commondir`, `gitdir`, `config.worktree` in that directory | read-only | See below |
 | Object stores listed in `objects/info/alternates` | read-only | Only for clones made with `--reference` or `--shared` |
+| `<state dir>/base-checks/<run>/base` | read-only | The files of the base commit, no git metadata; see [Checking a failure against the base commit](worktrees.md#checking-a-failure-against-the-base-commit) |
+| `<state dir>/base-checks/<run>/scratch` | read-write | Scratch space for running a test on a copy of the base. Removed with the run, like the base |
 | `prompt.md` of the run | read-only | Only for an adapter that passes the prompt by path. The built-in adapters use stdin, and then the run directory is not mounted at all |
 
 **User.** The container runs as the worker's own `uid:gid`, so files the agent creates in the
@@ -141,8 +143,45 @@ inside it. In particular these stay read-only:
 
 Ordinary work is unaffected: `git add`, `commit`, `checkout -b`, `stash`, `rebase`, `tag` and
 `reset` all work. Commands that rewrite files directly in the Git directory fail inside the
-container: `git gc`, `git pack-refs`, deleting a branch that is stored in `packed-refs`, and
-`git config` without `--global` (`--global` writes to the scratch home and works).
+container: `git gc`, `git pack-refs`, deleting a ref (`git branch -d`, `git stash pop` or
+`drop` of the last entry: Git locks `packed-refs` for every deletion), and `git config`
+without `--global` (`--global` writes to the scratch home and works). To compare a failure with
+the base commit an agent uses the run's base checkout instead
+([Checking a failure against the base commit](worktrees.md#checking-a-failure-against-the-base-commit)).
+
+With the files ref store, Git takes `packed-refs.lock` in the top level of the Git directory for
+every ref deletion, whether or not the ref is packed, and Git 2.45 and later delete per-worktree
+pseudorefs (`AUTO_MERGE`, `CHERRY_PICK_HEAD` and the like) through the ref store after every
+`git commit`. In a container that lock cannot be created, so each commit prints
+`error: Unable to create '.../packed-refs.lock': Read-only file system` (the commit itself
+succeeds). No configuration turns that deletion off.
+
+So a clone the worker creates itself (`updraft run-event`) uses the reftable ref store, when Git
+has it (2.45 and later) and every enabled agent runs the host's Git: no container, or the
+`updraft-sandbox` or native-worker runtime, which bind the host's `/usr`. Every ref, its lock and
+its tables then live in `reftable/`, which is mounted like `refs/`, and commits and ref deletions
+(`git update-ref -d`) work without the top level. `git branch -d` and `git stash` still also
+rewrite the clone's `config`, which stays read-only, and warn `could not lock config file`; use
+the base checkout instead of stashing. With any agent in an image of its own (Docker, Podman),
+the clone keeps the files store: the image brings its own Git, and a Git older than 2.45 (Ubuntu
+24.04, Debian bookworm, Amazon Linux 2023) refuses a reftable repository outright ("unknown
+repository extension: refstorage"). A contained agent's Git must therefore be 2.45 or later to
+work in a reftable clone; `updraft doctor` warns when an image's Git is older and a configured
+clone uses reftable. With the files store, an agent's commits on Git 2.45+ print that
+`packed-refs.lock` error and still succeed. An older host Git gets the files store, and its
+`git commit` deletes no ref.
+
+The reftable tables are written by the agent and read by host Git: the worker's `git fetch`,
+`git worktree`, `git gc` and reftable's own compaction parse `tables.list` and the tables the
+agent left, as they parse loose refs and `logs/` with the files store. A malformed table can make
+those commands fail; it cannot make host Git run anything, so the exposure is a failed run, not
+code execution.
+
+The same clone also has `gc.auto=0` and `maintenance.auto=false`, because the automatic gc that
+`git commit` starts once there are enough loose objects writes `gc.pid.lock` there too; the
+worker runs `git gc --auto` itself instead, on the host and outside any agent run (before an
+event's run at most once a day, and on `updraft clean`). A clone you made is left as you
+configured it.
 
 After the agent exits, the worker summarizes the run with `git diff` on the host, in a
 worktree whose contents the agent wrote. For a containerized run it tells Git not to look

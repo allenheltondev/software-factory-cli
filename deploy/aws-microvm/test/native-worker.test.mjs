@@ -69,6 +69,29 @@ describe('native Claude worker policy', () => {
       for (const name of GIT_IDENTITY) expect(claudeEnv({ credentialHome: '/private' })[name]).toBeUndefined();
     } finally { f.cleanup(); }
   });
+  it.skipIf(process.platform === 'win32')('accepts the base checkout of containInvocation only as the paths it mounts', () => {
+    const f = createGitFixture();
+    try {
+      const worktree = path.join(f.root, 'job');
+      f.git(f.clone, 'worktree', 'add', '--quiet', '-b', 'base-check-proof', worktree, 'HEAD');
+      const baseDir = path.join(f.root, 'base-checks', 'run', 'base');
+      const scratchDir = path.join(f.root, 'base-checks', 'run', 'scratch');
+      for (const dir of [baseDir, scratchDir]) fs.mkdirSync(dir, { recursive: true });
+      const env = { UPDRAFT_BASE_DIR: baseDir, UPDRAFT_SCRATCH_DIR: scratchDir };
+      const wrapped = containInvocation({ invocation: { file: 'claude', args: ['-p'], promptVia: 'stdin' },
+        container: containerSchema.parse({ image: IMAGE, network: 'none' }), runtime: '/runtime', runId: 'base-check-proof',
+        worktree, promptFile: path.join(f.root, 'prompt.md'), agentEnv: env, user: '1000:1000', baseCheck: { baseDir, scratchDir } });
+      const c = { workRoot: fs.realpathSync(f.root), workerUid: 1000, workerGid: 1000 };
+      const run = validateRun(resolveRunEnvironment(wrapped.invocation.args, env).slice(1), c);
+      expect(run.env.filter((entry) => entry.name.startsWith('UPDRAFT_'))).toEqual([{ name: 'UPDRAFT_BASE_DIR', value: baseDir }, { name: 'UPDRAFT_SCRATCH_DIR', value: scratchDir }]);
+      expect(run.mounts.filter((m) => [baseDir, scratchDir].includes(m.target)).map((m) => m.readOnly)).toEqual([true, false]);
+      // A value that is not the run's own mount of that kind is refused: no pointing the agent elsewhere.
+      for (const other of [{ ...env, UPDRAFT_BASE_DIR: '/etc' }, { ...env, UPDRAFT_BASE_DIR: scratchDir }, { ...env, UPDRAFT_SCRATCH_DIR: baseDir },
+        { ...env, UPDRAFT_SCRATCH_DIR: worktree }, { ...env, UPDRAFT_BASE_DIR: 'relative' }, { ...env, UPDRAFT_BASE_DIR: `${baseDir}\nX=1` }]) {
+        expect(() => validateRun(resolveRunEnvironment(wrapped.invocation.args, other).slice(1), c)).toThrow();
+      }
+    } finally { f.cleanup(); }
+  });
   it('resolves only explicit Git identity fields from the runtime client environment', () => {
     const args = ['run', '--rm', '--name', 'test', '-e', 'HOME=/updraft-home', ...GIT_IDENTITY.flatMap((name) => ['-e', name]), IMAGE, 'claude', '-p'];
     const env = Object.fromEntries(GIT_IDENTITY.map((name) => [name, name.endsWith('EMAIL') ? '42+updraft[bot]@users.noreply.github.com' : 'updraft[bot]']));
