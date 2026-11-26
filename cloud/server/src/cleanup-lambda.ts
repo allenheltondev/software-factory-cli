@@ -46,10 +46,13 @@ export async function handler(event?: { task?: unknown }): Promise<unknown> {
   if (event?.task === 'reconcile') {
     const report = await reconcile();
     const sessions = await nativeWorker.managed?.reconcile();
+    // Codex's sessions (#125) are reconciled on their own, whatever Claude's did; each judges only its own leases.
+    const codexSessions = await nativeWorker.managedCodex?.reconcile().catch(() => ({ released: 0, failed: 1 }));
     if (sessions?.failed) throw new Error(`Claude session reconciliation failed for ${sessions.failed} session(s)`);
+    if (codexSessions?.failed) throw new Error(`Codex session reconciliation failed for ${codexSessions.failed} session(s)`);
     // The next run (five minutes on) retries what failed; fail this one so alarms see it.
     if (report.failed > 0) throw new Error(`reconciliation failed for ${report.failed} job(s)`);
-    return { ...report, sessions };
+    return { ...report, sessions, ...(codexSessions ? { codexSessions } : {}) };
   }
   // Both run whatever the other did; a failure of either fails the run (retried, alarmed) at the end.
   let report: Awaited<ReturnType<typeof cleanupTenants>> | undefined;

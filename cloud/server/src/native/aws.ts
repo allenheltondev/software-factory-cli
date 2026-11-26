@@ -9,6 +9,7 @@ import { createNativeModeStore, createNativeStore } from './store.js';
 import { classifyReadiness, needsVmState, sessionPhase } from './readiness.js';
 import { createImagePolicies } from './image-policy.js';
 import { STARTUP_MS } from './admission.js';
+import { parseManagedWorkerId, type NativeProvider } from './provider.js';
 
 export { classifyReadiness, HEARTBEAT_FRESH_MS, WORKER_LOST_MS } from './readiness.js';
 
@@ -17,6 +18,14 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
   const e = process.env;
   const pinned = nativeRoute(e.NATIVE_WORKER_ROUTE);
   const managed = managedClaude(e, disabled ? { disabled } : {});
+  // Codex on a ChatGPT plan (#125): its own managed sessions, on the same image as Claude's.
+  const managedCodex = managedClaude(e, { ...(disabled ? { disabled } : {}), provider: 'codex' });
+  const managedOf = (provider: NativeProvider) => provider === 'codex' ? managedCodex : managed;
+  /** The managed stack of a managed worker id, or undefined (a pinned route, or none deployed). */
+  const managedFor = (workerId: string | undefined) => {
+    const parsed = parseManagedWorkerId(workerId);
+    return parsed ? { ...parsed, managed: managedOf(parsed.provider) } : undefined;
+  };
   const imagePolicy = createImagePolicies(e.TABLE_NAME ?? '', e.NATIVE_MANAGED_IMAGE_VERSION ?? '');
   const mode = createNativeModeStore(e.TABLE_NAME ?? '');
   const workers = createNativeStore(e.TABLE_NAME ?? '');
@@ -24,8 +33,9 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
   const microvms = new LambdaMicrovmsClient({});
   const secret = async (route?: NativeRoute) => {
     if (!route) throw new Error('native worker route is disabled');
-    if (route.generation && managed) return managed.secret(route.installationId, route.generation);
-    if (managed && route.workerId.startsWith('managed-')) throw new Error('Managed worker has not started');
+    const own = managedFor(route.workerId)?.managed;
+    if (route.generation && own) return own.secret(route.installationId, route.generation);
+    if (own) throw new Error('Managed worker has not started');
     const value = (await secrets.send(new GetSecretValueCommand({ SecretId: route.controlSecretArn }))).SecretString;
     if (!value || value.length < 32 || value.length > 256) throw new Error('invalid worker control credential');
     return value;
@@ -49,9 +59,10 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
       route, secret: () => secret(route), mode: () => mode.snapshot(route.installationId, route.workerId),
       async ready() { return (await readiness()) === 'ready'; },
       readiness,
-      ...(managed && route.workerId.startsWith('managed-') ? {
+      ...(managedFor(route.workerId)?.managed ? {
+        provider: managedFor(route.workerId)!.provider,
         async retirement() {
-          const session = await managed.sessions.session(route.installationId);
+          const session = await managedFor(route.workerId)!.managed!.sessions.session(route.installationId);
           return session?.retiring ? session.retirementReason ?? 'reconnect' : undefined;
         },
       } : {}),
@@ -61,8 +72,8 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
     const worker = await workers.get(route.installationId, route.workerId);
     // A managed route is judged against the session record itself: route() leaves out the
     // generation of a session that has not bound a VM yet, which is starting, not lost.
-    const session = managed && route.workerId.startsWith('managed-')
-      ? sessionPhase(await managed.sessions.session(route.installationId), route, STARTUP_MS) : undefined;
+    const own = managedFor(route.workerId)?.managed;
+    const session = own ? sessionPhase(await own.sessions.session(route.installationId), route, STARTUP_MS) : undefined;
     const first = classifyReadiness(route, worker, Date.now(), latestImageVersion, { session, ...(latestImageVersion ? { imagePolicy: await imagePolicy(route.imageVersion) } : {}) });
     if (!needsVmState(first, route, session)) return first;
     // Only on these paths does dispatch ask AWS: it tells a suspended or ended environment from a
@@ -76,23 +87,29 @@ export function nativeAws(store: Store, disabled?: () => Promise<boolean>) {
   return {
     control: { ...control,
       async canServe(job: import('../store/store.js').Job) {
-        if (job.native?.workerId.startsWith('managed-')) return managed
-          ? makeControl(await managed.route(job.installationId)).canServe(job) : false;
+        const own = managedFor(job.native?.workerId);
+        if (own) return own.managed
+          ? makeControl(await own.managed.route(job.installationId)).canServe(job) : false;
         return control.canServe(job);
       },
       async reconcile(job: import('../store/store.js').Job) {
-        return job.native?.workerId.startsWith('managed-') && managed
-          ? makeControl(await managed.route(job.installationId)).reconcile(job) : control.reconcile(job);
+        const own = managedFor(job.native?.workerId)?.managed;
+        return own ? makeControl(await own.route(job.installationId)).reconcile(job) : control.reconcile(job);
       },
       async handle(event: unknown) {
-      const id = /^(?:managed-)([1-9]\d*)$/.exec(String((event as { workerId?: unknown } | null)?.workerId))?.[1];
-      if (!managed || !id || !Number.isSafeInteger(Number(id))) return control.handle(event);
-      const route = await managed.route(Number(id));
+      // A managed worker's id names its installation and provider (`managed-<id>`, `managed-codex-<id>`).
+      const own = managedFor((event as { workerId?: unknown } | null)?.workerId as string | undefined);
+      if (!own?.managed) return control.handle(event);
+      const route = await own.managed.route(own.installationId);
       if (!route.generation) return { ok: false };
       return makeControl(route).handle(event);
     } },
     launch: pinned ? forLaunch(pinned) : undefined,
     resolveNative: managed ? async (id: number) => forLaunch(await managed.route(id), managed.imageVersion) : undefined,
+    /** The installation's Codex session (ChatGPT plan), as dispatch sees it. */
+    resolveCodex: managedCodex ? async (id: number) => forLaunch(await managedCodex.route(id), managedCodex.imageVersion) : undefined,
     managed,
+    managedCodex,
+    managedOf,
   };
 }

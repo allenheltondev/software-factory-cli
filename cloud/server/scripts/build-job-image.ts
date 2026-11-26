@@ -44,7 +44,7 @@ import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { createAdminClients } from './admin-clients.js';
 import { checkImageVersionIsolation } from './job-image-check.js';
-import { buildContext, CLOUD_BUILD_ENV, IMAGE_DIR, repoRoot } from './job-image-context.js';
+import { buildContext, IMAGE_DIR, NATIVE_BUILD_ENV, repoRoot } from './job-image-context.js';
 import { pruneImageVersions, pruneNativeImageVersions } from './job-image-prune.js';
 import { describeInputs, fingerprintOf, IMAGE_INPUTS, imageInputFiles, imageInputFingerprint, inputsFromDescription } from './job-image-inputs.js';
 import { checkNativeClaudeImage } from './native-claude-image-check.js';
@@ -54,7 +54,6 @@ const ARCHITECTURE = 'ARM_64';
 const MEMORY_MIB = 4096;
 const HOOK_PORT = 9000;
 const BUILD_TIMEOUT_MS = 45 * 60 * 1000;
-const NATIVE_BUILD_ENV = CLOUD_BUILD_ENV.replace('@anthropic-ai/claude-code', '@anthropic-ai/claude-code@2.1.330');
 const NATIVE_INPUTS = [...IMAGE_INPUTS, 'src/', 'tsconfig.json', 'tsconfig.build.json', 'scripts/copy-telemetry.mjs', 'cloud/package-lock.json',
   'deploy/aws-microvm/native-worker/', 'cloud/server/scripts/native-claude-image-check.ts'];
 

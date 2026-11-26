@@ -15,6 +15,20 @@ VIBE_VERSION="3.1.4"
 `;
 
 /**
+ * The subscription worker image (`build-job-image.ts --native-claude`): one image for both
+ * subscription CLIs, each pinned to an exact release so a rebuild never changes either CLI.
+ * Codex (Sign in with ChatGPT, docs/codex-subscription.md) is pinned to the release whose
+ * feature, sub-agent and model lockdown was audited; native-worker/install.sh records its
+ * official native binary (the platform package's vendor/<triple>/bin/codex), never the npm
+ * wrapper. Re-run that audit before moving either pin.
+ */
+export const NATIVE_CLAUDE_VERSION = '2.1.330';
+export const NATIVE_CODEX_VERSION = '0.172.0';
+export const NATIVE_BUILD_ENV = CLOUD_BUILD_ENV
+  .replace('@anthropic-ai/claude-code', `@anthropic-ai/claude-code@${NATIVE_CLAUDE_VERSION}`)
+  .replace('@openai/codex', `@openai/codex@${NATIVE_CODEX_VERSION}`);
+
+/**
  * Text as the repository stores it (LF): a Windows checkout has CRLF, and the build sources
  * build.env and runs these files on Linux, where a CR breaks them. Binary files stay as they are.
  */

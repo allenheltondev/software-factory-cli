@@ -1,4 +1,5 @@
 import type { RetirementReason } from './sessions.js';
+import { providerKeys, type NativeProvider } from './provider.js';
 
 /**
  * What a managed session's retirement means for the work waiting on it (#176).
@@ -12,7 +13,7 @@ import type { RetirementReason } from './sessions.js';
  */
 export const REPLACEMENT_KEEPS_SIGN_IN = false;
 
-const WORDS: Record<RetirementReason, string> = {
+const WORDS = (name: string): Record<RetirementReason, string> => ({
   reconnect: 'an owner reconnected it',
   idle: 'it was idle for its whole idle limit',
   lifetime: 'it reached its maximum lifetime',
@@ -20,18 +21,18 @@ const WORDS: Record<RetirementReason, string> = {
   expired: 'its VM ended or it reached its maximum lifetime',
   suspended: 'its VM was suspended, and it is never resumed',
   'worker-lost': 'its worker stopped answering',
-  disabled: 'an operator paused Claude connections',
+  disabled: `an operator paused ${name} connections`,
   'startup-failed': 'it never became ready',
   'image-revoked': 'its image was revoked',
   'image-blocked': 'its image was no longer approved before it started',
-};
+});
 
 /** A known reason's words for people; anything else (a newer writer's reason) is named as is. */
-export function retirementWords(reason: string | undefined): string {
+export function retirementWords(reason: string | undefined, provider: NativeProvider = 'claude'): string {
   if (!reason) return 'it was retired';
-  return (WORDS as Record<string, string>)[reason] ?? `it was retired (${reason})`;
+  return (WORDS(providerKeys(provider).name) as Record<string, string>)[reason] ?? `it was retired (${reason})`;
 }
 
-/** The reason as a timeline code: `claude_session_<reason>`, in the timeline's own style. */
-export const retirementCode = (reason: string | undefined) =>
-  `claude_session_${/^[a-z][a-z-]{0,39}$/.test(reason ?? '') ? reason!.replace(/-/g, '_') : 'retired'}`;
+/** The reason as a timeline code: `claude_session_<reason>` (or `codex_session_…`), in the timeline's own style. */
+export const retirementCode = (reason: string | undefined, provider: NativeProvider = 'claude') =>
+  `${providerKeys(provider).code}_session_${/^[a-z][a-z-]{0,39}$/.test(reason ?? '') ? reason!.replace(/-/g, '_') : 'retired'}`;

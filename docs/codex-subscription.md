@@ -6,10 +6,10 @@ that already runs Claude Code on a Claude subscription
 ([persistent-claude-worker.md](persistent-claude-worker.md),
 [native worker](../deploy/aws-microvm/native-worker/README.md)), generalized by provider.
 
-**Status:** the sign-in, the status checks before every run, and the worker's isolated Codex
-session are built and checked in CI with a synthetic Codex CLI. Cloud routing of Codex jobs to
-a Codex session and the console's Connect ChatGPT panel are follow-ups (see the end). Nothing
-here has run against a real ChatGPT account yet.
+**Status:** the sign-in, the status checks before every run, the worker's isolated Codex
+session, Cloud's Codex sessions and routing, the per-provider waiting notice and the console's
+Connect ChatGPT page are built and checked in CI with a synthetic Codex CLI. Nothing here has
+run against a real ChatGPT account yet (see the end).
 
 ## The rule
 
@@ -233,26 +233,79 @@ storage or logs.
 - **Sign out.** `codex logout` as the credential identity, or end the worker and remove its
   storage.
 
-## Cloud routing (follow-up)
+## Cloud: a Codex session per installation
 
-Cloud today keeps one managed Claude session per installation (`cloud/server/src/native/*`),
-routes a trigger there only when its workflow needs `ANTHROPIC_API_KEY`, and posts the one
-sign-in notice when that session needs a sign-in. A Codex workflow needs `CODEX_API_KEY`, so it
-is never sent to the Claude session; it stays on the API-key path (a test pins this). Codex
-subscription routing needs:
+Cloud keeps a managed session per installation **and provider**: Claude's, as before, and a
+Codex session beside it on the same worker image. The two logins never share a VM, and a Codex
+job never waits on a Claude sign-in.
 
-1. A session per provider (session rows, admission, readiness, retirement and fencing keyed by
-   provider, and a worker image with the pinned Codex CLI), so Claude and Codex logins never share
-   a session and a Codex job never waits on a Claude sign-in.
-2. Routing that selects the Codex session for triggers that need `CODEX_API_KEY`, drops that key
-   from the job, and is exclusive with the API-key path, as Claude's is.
-3. `native-config.mjs` / `isolation.mjs` on the job runner accepting the native runtime for Codex
-   profiles, as they do for Claude.
-4. The waiting notice and timeline words per provider ("Codex needs you to sign in with ChatGPT").
-5. The console: a Connect ChatGPT card beside Claude's in the shared connected-account UI (#123),
-   and a Codex frame that shows the page and the code instead of a code input.
+**Stored data.** Claude's records keep their exact keys, so nothing is migrated and a live Claude
+session is never retired by the deploy: the session row `TENANT#<id>` / `CLAUDE_SESSION`, waiting
+jobs `CLAUDE_WAIT#<job>`, the worker `managed-<id>` (its `WORKER`, `MODE` and `QUEUE#` rows), the
+waiting job id salt `claude-wait`, image policy records `NATIVE_IMAGE#<version>`, and the timeline
+codes `claude_…`. Codex gets new keys beside them: `CODEX_SESSION`, `CODEX_WAIT#<job>`, worker
+`managed-codex-<id>`, salt `codex-wait`, codes `codex_…` (`cloud/server/src/native/provider.ts`).
+The capacity registry (`CLAUDE_CAPACITY`) is shared, so the platform's concurrent environments and
+daily budgets count both; a lease carries `provider: "codex"` only for Codex, and a lease without
+it is Claude's. Each provider's cleanup lists only its own leases, and each lease's session check
+names its own session record. A stored worker id, job or queue route that names no Codex worker is
+Claude's.
+
+**Worker.** A Codex session's run hook adds `"provider": "codex"` to the cloud settings; Claude's
+run hook is byte-for-byte as before, so an existing Claude VM on an older image is unaffected. The
+worker then reports Codex's login (`codex login status`) as its readiness, tells the root job runner
+(`UPDRAFT_NATIVE_PROVIDER`, from the run hook, never from the job) to put the workflow's Codex
+profiles on the native runtime, and leaves every other agent on its sandbox and API key.
+
+**Routing.** The console's ChatGPT page chooses the published workflow triggers (repository and
+label) whose workflows use Codex, exactly as the Claude page does for Claude. A delivery is routed
+once, to one place:
+
+1. Claude's subscription is decided first, exactly as before (a trigger the Claude page chose, for a
+   workflow that needs `ANTHROPIC_API_KEY`).
+2. Only if Claude's does not take it: Codex's, for a workflow that needs `CODEX_API_KEY` on a trigger
+   the ChatGPT page chose, with Codex routing on.
+3. Otherwise the API-key path, as before.
+
+Work pinned to a worker (a pull request's revision or CI fix, a console retry) stays on that worker
+or is refused; it never moves between Claude, Codex and API keys. A trigger taken by one
+subscription is not offered on the other's page. The delivery claim and the stable waiting job id
+make a label start one job at most, whatever the route.
+
+**Keys.** A Codex session's job is never given `CODEX_API_KEY` (and a Claude session's never
+`ANTHROPIC_API_KEY`): the launcher records the job's scoped `agentKeys` without it and the broker
+drops the session provider's own key again. Another agent's key in the same workflow (a Claude
+reviewer, say) stays BYOK.
+
+**Waiting.** A Codex job that needs a sign-in is parked like Claude's and gets one comment, only
+when a person must act: "Codex needs you to sign in with ChatGPT before this job can start", with a
+link to the installation's ChatGPT page. A retirement says which Codex session ended and why; the
+timeline records it as `codex_session_<reason>` or `codex_<readiness>`.
+
+**Console.** *Connect ChatGPT* (`/installations/<id>/codex`, linked from the Claude page and Agent
+keys) starts the Codex session and opens the worker's private `/codex-login` frame, which shows only
+OpenAI's verification page and the one-time code. The frame sends nothing to the worker, and the
+page gets only a status. The page shows the session's sanitized state (connected, needs sign-in,
+offline) and the routing choices.
+
+**Image.** One image for both CLIs (`build-job-image.ts --native-claude`): Claude Code and Codex are
+each pinned to an exact release (`NATIVE_CLAUDE_VERSION`, `NATIVE_CODEX_VERSION` in
+`job-image-context.ts`); `install.sh` records Codex's native binary from the pinned platform package.
+The audit above was read at `openai/codex` 8727186, a `main` commit after the last release; the image
+pins the latest release then, 0.172.0, so the feature, sub-agent and model audit must be re-checked
+against it (below).
+
+Still to do: a separate credential UID per CLI, the readiness checklist's Codex entry, and a
+connected-account page shared with Claude's (#123).
 
 ## Verify live, with a real ChatGPT account
+
+- The pinned Codex release (0.172.0) still matches the 8727186 audit: every flag accepted under
+  `--strict-config`, and the feature, sub-agent and direct-mode model lists unchanged.
+- On staging: Connect ChatGPT starts a Codex session on the current image, the frame shows the page
+  and the code, and the page turns connected; an existing Claude session keeps running through the
+  deploy; a label on a ChatGPT-routed workflow starts one job on the Codex session with no
+  `CODEX_API_KEY` anywhere in the job.
 
 - Device code sign-in on a worker (and whether the account first has to enable it), then
   `updraft native-auth --codex` reports `connected`; restart the process and the VM and it still

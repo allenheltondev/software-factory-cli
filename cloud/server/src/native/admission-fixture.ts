@@ -5,7 +5,8 @@ type Session = { generation: string; retiring?: boolean };
 /** Actual registry writes and session conditions are validated atomically by this in-memory client. */
 export function admissionFixture(
   initial?: Record<string, unknown>,
-  lookupSession?: (id: number) => Session | undefined,
+  /** The session a check names: `sk` is the record (`CLAUDE_SESSION`, or `CODEX_SESSION`). */
+  lookupSession?: (id: number, sk: string) => Session | undefined,
   beforeCommit?: () => void,
 ) {
   let item: Record<string, unknown> | undefined = initial ? structuredClone(initial) : undefined;
@@ -26,11 +27,11 @@ export function admissionFixture(
       beforeCommit?.();
       const put = command.input.TransactItems?.[0]?.Put;
       const check = command.input.TransactItems?.[1]?.ConditionCheck;
-      if (!put || !check || command.input.TransactItems?.length !== 2 || check.Key?.sk !== 'CLAUDE_SESSION')
+      if (!put || !check || command.input.TransactItems?.length !== 2 || !['CLAUDE_SESSION', 'CODEX_SESSION'].includes(String(check.Key?.sk)))
         throw Error('Unexpected admission transaction');
-      const id = Number(String(check.Key.pk).replace(/^TENANT#/, ''));
+      const id = Number(String(check.Key!.pk).replace(/^TENANT#/, ''));
       if (!Number.isSafeInteger(id) || id <= 0) throw Error('Unexpected session partition');
-      const session = lookupSession?.(id);
+      const session = lookupSession?.(id, String(check.Key!.sk));
       const generation = check.ExpressionAttributeValues?.[':generation'];
       const expr = check.ConditionExpression;
       let allowed: boolean;

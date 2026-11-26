@@ -253,6 +253,54 @@ describe('root subscription worker Cloud loop', () => {
   });
 });
 
+// #125: a Codex session runs on the same image; its run hook names the provider, Claude's does not.
+describe('a Codex session on the subscription worker image', () => {
+  const codex = { ...config, provider: 'codex' };
+  it('accepts a Codex run hook beside the unchanged Claude one, and nothing else', () => {
+    expect(cloudConfig(config)).toEqual(config);
+    expect(cloudConfig(codex)).toEqual(codex);
+    expect(bootPayload(JSON.stringify({ storage: 'ephemeral', cloud: { ...codex, controlSecretArn: undefined, controlToken: 'a'.repeat(43) } })).cloud.provider).toBe('codex');
+    for (const provider of ['claude', 'kiro', '', null, 1]) expect(() => cloudConfig({ ...config, provider })).toThrow();
+    expect(() => cloudConfig({ ...codex, chatgptToken: 'never' })).toThrow();
+  });
+  it('tells the root runner its provider only for Codex, from the run hook and never the job', () => {
+    expect(runnerEnvironment(config, { payload: {} })).not.toHaveProperty('UPDRAFT_NATIVE_PROVIDER');
+    expect(runnerEnvironment(codex, { payload: {} }).UPDRAFT_NATIVE_PROVIDER).toBe('codex');
+    expect(runnerEnvironment(config, { payload: { provider: 'codex' } }, { UPDRAFT_NATIVE_PROVIDER: 'codex' })).not.toHaveProperty('UPDRAFT_NATIVE_PROVIDER');
+  });
+  it('reports the Codex login to Cloud on a Codex session and the Claude login, as before, otherwise', async () => {
+    for (const [settings, expected] of [[config, []], [codex, ['codex']]]) {
+      const authStatus = vi.fn(async () => 'auth-required');
+      const calls = [];
+      const worker = await startCloudWorker(settings, 'mvm-native', { authStatus }, {
+        call: async (p) => { calls.push(p); return { ok: true, busy: false }; }, launch: vi.fn(), interval: 5,
+      });
+      await until(() => calls.some((p) => p.op === 'poll'));
+      await worker.close();
+      expect(authStatus.mock.calls.every((args) => JSON.stringify(args) === JSON.stringify(expected))).toBe(true);
+      expect(calls[0]).toMatchObject({ op: 'register', auth: 'auth-required' });
+      expect(calls[0]).not.toHaveProperty('provider');
+    }
+  });
+  it('runs only the Codex profiles on the native worker for a Codex session, leaving Claude on its sandbox and key', () => {
+    const input = { agents: {
+      codex: { adapter: 'codex', authentication: 'native-codex', model: 'gpt-5.5', container: { image: 'other', env: ['CODEX_API_KEY'] } },
+      reviewer: { adapter: 'claude', container: { runtime: SANDBOX_RUNTIME, image: SANDBOX_IMAGE, env: ['ANTHROPIC_API_KEY'] } },
+    } };
+    const output = nativeConfig(JSON.parse(JSON.stringify(input)), 'codex');
+    expect(output.agents.codex).toMatchObject({ command: 'codex', maxConcurrent: 1, container: { runtime: NATIVE_RUNTIME, network: 'none', env: [] } });
+    expect(output.agents.codex.authentication).toBeUndefined();
+    expect(output.agents.reviewer.container.runtime).toBe(SANDBOX_RUNTIME);
+    expect(checkAgentConfig(output, { nativeWorker: true, nativeProvider: 'codex' })).toEqual([]);
+    // Judged as a Claude session, the same config is refused: the Codex profile is not on the sandbox.
+    expect(checkAgentConfig(output, { nativeWorker: true })).not.toEqual([]);
+    // The Claude default is unchanged.
+    expect(nativeConfig(JSON.parse(JSON.stringify(input))).agents.reviewer.container.runtime).toBe(NATIVE_RUNTIME);
+    expect(() => nativeConfig({ agents: { reviewer: input.agents.reviewer } }, 'codex')).toThrow('no enabled Codex profile');
+    expect(() => nativeConfig(JSON.parse(JSON.stringify(input)), 'kiro')).toThrow();
+  });
+});
+
 // #176: a backend redeploy (a throttled, cold, or updating broker) must not end a healthy session.
 describe('transient broker failures', () => {
   const flaky = (message = 'worker broker unavailable') => Object.assign(new Error(message), { transient: true });

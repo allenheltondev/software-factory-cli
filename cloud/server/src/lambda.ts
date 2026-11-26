@@ -26,6 +26,7 @@ import { nativeAws } from './native/aws.js';
 import { quotasFromEnv } from './jobs/quotas.js';
 import { createDynamoStore } from './store/dynamo.js';
 import { managedClaude } from './native/managed.js';
+import { managedWorkerId } from './native/provider.js';
 import { browserLoginGrant } from './native/browser-login.js';
 import { legacyNativeTriggers, nativeRoute } from './native/route.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
@@ -57,6 +58,16 @@ if (!clientId) console.error('USER_POOL_CLIENT_ID is not set; every /api/v1 requ
 const userPoolId = process.env.USER_POOL_ID ?? '';
 const verifier = userPoolId && clientId ? CognitoJwtVerifier.create({ userPoolId, clientId, tokenUse: 'id' }) : null;
 const managedWorker = managedClaude();
+const managedCodexWorker = managedClaude(process.env, { provider: 'codex' });
+/** The triggers each subscription holds, so the other's page never offers them (settings.ts). */
+const codexTriggers = async (id: number) => managedCodexWorker
+  ? (await createNativeModeStore(tableName).snapshot(id, managedWorkerId(id, 'codex'))).triggers ?? [] : [];
+const claudeTriggers = async (id: number) => {
+  const pinned = nativeRoute(process.env.NATIVE_WORKER_ROUTE);
+  const workerId = pinned?.installationId === id ? pinned.workerId : managedWorkerId(id);
+  const mode = await createNativeModeStore(tableName).snapshot(id, workerId);
+  return mode.triggers ?? (pinned?.installationId === id ? legacyNativeTriggers(pinned) : []);
+};
 const tableName = process.env.TABLE_NAME ?? '';
 const store = tableName ? createDynamoStore(tableName) : undefined;
 /** Records stops and resumes on their workflows (#139): one recorder for the stopper and the status service. */
@@ -175,7 +186,13 @@ const app = createApp({
           ...(managedWorker ? { managed: { ...managedWorker, grant: (route) => browserLoginGrant(managedWorker.imageArn, route) } } : {}),
           route: nativeRoute(process.env.NATIVE_WORKER_ROUTE),
           loginGrant: browserLoginGrant(process.env.NATIVE_WORKER_LOGIN_IMAGE_ARN ?? '', nativeRoute(process.env.NATIVE_WORKER_ROUTE)),
-          mode: createNativeModeStore(tableName), workers: createNativeStore(tableName) }),
+          mode: createNativeModeStore(tableName), workers: createNativeStore(tableName),
+          otherTriggers: codexTriggers }),
+        // Codex on a ChatGPT plan (#125): a managed session only, on the same image. No pinned route.
+        ...(managedCodexWorker ? { nativeCodex: createNativeSettingsService({ github, store, provider: 'codex',
+          managed: { ...managedCodexWorker, grant: (route) => browserLoginGrant(managedCodexWorker.imageArn, route, '/codex-login') },
+          mode: createNativeModeStore(tableName), workers: createNativeStore(tableName),
+          otherTriggers: claudeTriggers }) } : {}),
         workflows: createWorkflowService({ store: createDynamoWorkflowStore(tableName), jobs: store, pauses: store, github }),
         status: createStatusService({
           store,

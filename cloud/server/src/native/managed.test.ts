@@ -42,7 +42,7 @@ vi.mock('@aws-sdk/client-ssm', async (original) => ({
 }));
 vi.mock('./sessions.js', () => ({
   managedWorkerId: (id: number) => `managed-${id}`,
-  createClaudeSessions: () => ({
+  createManagedSessions: () => ({
     session: mocks.session,
     requestSession: mocks.reserve,
     bind: mocks.bind,
@@ -115,6 +115,47 @@ describe('managed connection reservation', () => {
     mocks.vm.mockImplementation(async (command) =>
       command instanceof RunMicrovmCommand ? { microvmId: 'mvm-fixture' } : { state: 'RUNNING' },
     );
+  });
+  it('starts a Codex session on the same image under its own worker id, and leaves Claude\'s run hook exactly as before (#125)', async () => {
+    const payloads = () => mocks.vm.mock.calls.map(([command]) => command)
+      .filter((command) => command instanceof RunMicrovmCommand)
+      .map((command) => ({ image: command.input.imageIdentifier, version: command.input.imageVersion, ...JSON.parse(command.input.runHookPayload!) }));
+    await managed().start(55);
+    const [claude] = payloads();
+    // The Claude payload's keys are the ones every earlier image accepts: no provider.
+    expect(Object.keys(claude.cloud).sort()).toEqual(['brokerFunctionName', 'controlToken', 'imageVersion', 'region', 'workerId', 'workerVersion']);
+    expect(claude.cloud.workerId).toBe('managed-55');
+    vi.clearAllMocks();
+    mocks.vm.mockImplementation(async (command) => command instanceof RunMicrovmCommand ? { microvmId: 'mvm-codex' } : { state: 'RUNNING' });
+    mocks.secret.mockResolvedValue({ SecretString: 'fixture-control-root-'.repeat(3) });
+    current = undefined;
+    const codexAdmission = createClaudeAdmission('test', admissionFixture(undefined, () => current).db, 'codex');
+    const codex = managedClaude(env, { admission: codexAdmission, provider: 'codex', disabled: async () => false, now: () => clock })!;
+    expect(codex.provider).toBe('codex');
+    await codex.start(55);
+    const [started] = payloads();
+    expect(started).toMatchObject({ image: env.NATIVE_MANAGED_IMAGE_ARN, version: '10', storage: 'ephemeral',
+      cloud: { workerId: 'managed-codex-55', provider: 'codex', workerVersion: 'tenant-browser-1' } });
+    expect((await codex.route(55)).workerId).toBe('managed-codex-55');
+    expect((await codexAdmission.list()).map((lease) => lease.provider)).toEqual(['codex']);
+  });
+  it('never judges, seals or stops a live Claude session from Codex\'s cleanup (#125)', async () => {
+    // One shared registry, as deployed. A Claude session started before Codex sessions existed.
+    const fixture = admissionFixture(undefined, (id) => (id === 55 ? current : undefined));
+    const claudeAdmission = createClaudeAdmission('test', fixture.db);
+    await managedClaude(env, { admission: claudeAdmission, disabled: async () => false, now: () => clock })!.start(55);
+    const [lease] = await claudeAdmission.list();
+    expect(lease).toBeDefined();
+    expect(lease).not.toHaveProperty('provider');
+    vi.clearAllMocks();
+    // Codex's cleanup, long past every idle and lifetime limit and with connections paused, sees none of it.
+    clock += 9 * 60 * 60_000;
+    const codex = managedClaude(env, { admission: createClaudeAdmission('test', fixture.db, 'codex'), provider: 'codex', disabled: async () => true, now: () => clock })!;
+    expect(await codex.reconcile()).toEqual({ released: 0, failed: 0 });
+    expect(mocks.retire).not.toHaveBeenCalled();
+    expect(mocks.vm).not.toHaveBeenCalled();
+    expect((await claudeAdmission.list()).map((l) => l.generation)).toEqual([lease!.generation]);
+    expect(current?.retiring).toBeUndefined();
   });
   it('uses the same generation and bounded lifetime for concurrent connect requests', async () => {
     await Promise.all([managed().start(55), managed().start(55)]);

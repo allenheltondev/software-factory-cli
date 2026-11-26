@@ -296,7 +296,7 @@ export function createNftFilter({ endpoints, hookPort, table = 'updraft_isolatio
  * escalation can all pick agents, and an enabled agent without a container is one edit away
  * from running on the host.
  */
-export function checkAgentConfig(config, { runtime = SANDBOX_RUNTIME, image = SANDBOX_IMAGE, nativeWorker = false } = {}) {
+export function checkAgentConfig(config, { runtime = SANDBOX_RUNTIME, image = SANDBOX_IMAGE, nativeWorker = false, nativeProvider = 'claude' } = {}) {
   const problems = [];
   if (config === null || typeof config !== 'object') return ['the validated config is missing'];
   const agents = config.agents && typeof config.agents === 'object' ? config.agents : {};
@@ -310,7 +310,8 @@ export function checkAgentConfig(config, { runtime = SANDBOX_RUNTIME, image = SA
       problems.push(`${at} has no container block: it would run as the job user, next to the GitHub App key and the state database (give it container: { image: ${image}, runtime: ${runtime}, env: [<its key variable>] }, or enabled: false)`);
       continue;
     }
-    const native = nativeWorker && (agent.adapter ?? name) === 'claude';
+    // On a native worker, the session's provider (Claude, or Codex on a ChatGPT plan) runs there.
+    const native = nativeWorker && (agent.adapter ?? name) === (nativeProvider === 'codex' ? 'codex' : 'claude');
     const requiredRuntime = native ? '/opt/updraft/bin/updraft-native-worker' : runtime;
     const requiredImage = native ? 'native-claude-worker' : image;
     if (container.runtime !== requiredRuntime) problems.push(`${at}.container.runtime is ${JSON.stringify(container.runtime)}, not ${requiredRuntime}`);
@@ -698,7 +699,7 @@ export async function verifyIsolation(report, { stateDir, protectedFiles }, deps
     const errors = Array.isArray(answer.errors) ? answer.errors.map((e) => `${e?.path ? `${e.path}: ` : ''}${e?.message ?? ''}`).slice(0, 10) : [];
     fail('config', [`the config is not valid${errors.length ? `: ${errors.join('; ')}` : ''}`]);
   }
-  const configProblems = checkAgentConfig(answer.config, { runtime: iso.runtime, image: iso.image, nativeWorker: iso.nativeWorker });
+  const configProblems = checkAgentConfig(answer.config, { runtime: iso.runtime, image: iso.image, nativeWorker: iso.nativeWorker, ...(iso.nativeProvider ? { nativeProvider: iso.nativeProvider } : {}) });
   if (configProblems.length) fail('config', configProblems);
   report.checks.config = { agents: Object.entries(answer.config.agents ?? {}).filter(([, agent]) => agent?.enabled !== false).map(([name]) => name), runtime: iso.runtime };
 

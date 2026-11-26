@@ -21,7 +21,8 @@ import {
 import type { ManagedSession } from './sessions.js';
 import { FlowError } from '../flows/github.js';
 import type { NativeRoute } from './route.js';
-import { createClaudeSessions, managedWorkerId } from './sessions.js';
+import { createManagedSessions } from './sessions.js';
+import { managedWorkerId, providerKeys, type NativeProvider } from './provider.js';
 import { createNativeModeStore, createNativeStore, type Worker } from './store.js';
 import { classifyReadiness } from './readiness.js';
 
@@ -31,8 +32,13 @@ export const SUSPENDED_STATES = ['SUSPENDING', 'SUSPENDED'];
 
 export function managedClaude(
   env = process.env,
-  options: { disabled?: () => Promise<boolean>; now?: () => number; admission?: ClaudeAdmission } = {},
+  options: { disabled?: () => Promise<boolean>; now?: () => number; admission?: ClaudeAdmission; provider?: NativeProvider } = {},
 ) {
+  // One image for both CLIs (#125): a Codex session is the same image, told its provider.
+  const provider = options.provider ?? 'claude';
+  const keys = providerKeys(provider);
+  const name = keys.name;
+  const workerOf = (id: number) => managedWorkerId(id, provider);
   const imageArn = env.NATIVE_MANAGED_IMAGE_ARN;
   const imageVersion = env.NATIVE_MANAGED_IMAGE_VERSION;
   const executionRoleArn = env.NATIVE_MANAGED_ROLE_ARN;
@@ -41,10 +47,10 @@ export function managedClaude(
   if (!imageArn || !imageVersion || !controlSecretArn) return undefined;
 
   const imagePolicy = createImagePolicies(env.TABLE_NAME ?? '', imageVersion);
-  const sessions = createClaudeSessions(env.TABLE_NAME ?? '');
+  const sessions = createManagedSessions(env.TABLE_NAME ?? '', undefined, provider);
   const workers = createNativeStore(env.TABLE_NAME ?? '');
   const mode = createNativeModeStore(env.TABLE_NAME ?? '');
-  const admission = options.admission ?? createClaudeAdmission(env.TABLE_NAME ?? '');
+  const admission = options.admission ?? createClaudeAdmission(env.TABLE_NAME ?? '', undefined, provider);
   const now = options.now ?? Date.now;
   const policy = managedPolicy(env);
   const ssm = new SSMClient({});
@@ -68,7 +74,7 @@ export function managedClaude(
   const base = (installationId: number): NativeRoute => ({
     installationId,
     imageVersion,
-    workerId: managedWorkerId(installationId),
+    workerId: workerOf(installationId),
     microvmId: 'mvm-pending',
     controlSecretArn,
   });
@@ -102,12 +108,12 @@ export function managedClaude(
       }
     } else {
       const read = await imagePolicy(session.imageVersion);
-      if (imageDecision(read) !== 'approved') throw new FlowError('invalid_settings', 409, `Reserved Claude image cannot start: ${read.reason}`);
+      if (imageDecision(read) !== 'approved') throw new FlowError('invalid_settings', 409, `Reserved ${name} image cannot start: ${read.reason}`);
       // A session must never outlive its image's approval just because later rollouts moved the
       // latest image on (#176): record a bootstrap approval before the VM exists. A drain or
       // revocation that won the race is honored here, before launch.
       const image = imagePolicy.durable ? await imagePolicy.durable(read) : read;
-      if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `Reserved Claude image cannot start: ${image.reason}`);
+      if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `Reserved ${name} image cannot start: ${image.reason}`);
     }
     const region = env.AWS_REGION ?? '';
     const brokerFunctionName = env.BROKER_FUNCTION_NAME;
@@ -136,10 +142,12 @@ export function managedClaude(
           cloud: {
             region,
             brokerFunctionName,
-            workerId: managedWorkerId(id),
+            workerId: workerOf(id),
             imageVersion: session.imageVersion,
             workerVersion: 'tenant-browser-1',
             controlToken: token,
+            // Claude's payload is unchanged; only a Codex session names its provider.
+            ...(provider === 'codex' ? { provider } : {}),
           },
         }),
       }),
@@ -162,11 +170,11 @@ export function managedClaude(
       throw new FlowError(
         'invalid_settings',
         409,
-        'The Claude environment changed. Check its current status before reconnecting.',
+        `The ${name} environment changed. Check its current status before reconnecting.`,
       );
     if (!session) return { preparing: false, startupFailed: false, retiring: false };
     const lease = await admission.get(session.generation);
-    const worker = await workers.get(id, managedWorkerId(id));
+    const worker = await workers.get(id, workerOf(id));
     const ready =
       !!worker &&
       worker.microvmId === session.microvmId &&
@@ -181,7 +189,7 @@ export function managedClaude(
     const startupFailed =
       !session.readyAt && !ready && now() >= (session.startupDeadline ?? session.requestedAt + STARTUP_MS);
     const idleMs = lease?.idleMs ?? policy.idleMs ?? IDLE_MS;
-    const busy = worker?.active || worker?.settling || (await workers.queued(id, managedWorkerId(id))).length > 0;
+    const busy = worker?.active || worker?.settling || (await workers.queued(id, workerOf(id))).length > 0;
     const lifetimeAt = session.requestedAt + SESSION_SECONDS * 1000;
     const idleAt = lease
       ? Math.max(lease.idleAt, (worker?.lastWorkAt ?? 0) + idleMs, busy ? now() + idleMs : 0)
@@ -213,33 +221,33 @@ export function managedClaude(
     const session = await sessions.session(id);
     if (!session || session.generation !== generation) return false;
     if (!session.retiring) {
-      const snapshot = await mode.snapshot(id, managedWorkerId(id));
-      const worker = await workers.get(id, managedWorkerId(id));
+      const snapshot = await mode.snapshot(id, workerOf(id));
+      const worker = await workers.get(id, workerOf(id));
       if (stillDue && !stillDue(worker)) {
-        console.log(JSON.stringify({ claudeSession: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'recovered' }));
+        console.log(JSON.stringify({ [keys.logKey]: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'recovered' }));
         return false;
       }
       const image = await imagePolicy(session.imageVersion);
       const emergency = reason === 'image-revoked' && image.state === 'revoked' ? image : undefined;
       if (reason === 'image-revoked' && !emergency) return false;
       const mandatory = imageDecision(image) !== 'approved';
-      if ((!emergency && (worker?.active || worker?.settling)) || (!mandatory && (await workers.queued(id, managedWorkerId(id))).length)) {
+      if ((!emergency && (worker?.active || worker?.settling)) || (!mandatory && (await workers.queued(id, workerOf(id))).length)) {
         throw new FlowError(
           'invalid_settings',
           409,
-          'Wait for active, settling, and queued Claude jobs to finish before reconnecting.',
+          `Wait for active, settling, and queued ${name} jobs to finish before reconnecting.`,
         );
       }
       if (!(await sessions.retire(id, session, snapshot, worker, reason, ...(emergency ? [emergency] as const : [])))) {
         // For cleanup, a worker that changed after this read is one that is alive: keep it.
         if (stillDue) {
-          console.log(JSON.stringify({ claudeSession: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'changed' }));
+          console.log(JSON.stringify({ [keys.logKey]: 'keep', installationId: id, generation, microvmId: session.microvmId, reason, why: 'changed' }));
           return false;
         }
         throw new FlowError(
           'invalid_settings',
           409,
-          'The Claude environment or its work changed. Try reconnecting again.',
+          `The ${name} environment or its work changed. Try reconnecting again.`,
         );
       }
     }
@@ -275,21 +283,21 @@ export function managedClaude(
 
   async function start(id: number) {
     const image = await imagePolicy(imageVersion!);
-    if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `Claude image cannot start: ${image.reason}`);
+    if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `${name} image cannot start: ${image.reason}`);
     if (await disabled())
       throw new FlowError(
         'throttled',
         503,
-        'Claude connections are temporarily paused by an operator. Try again later.',
+        `${name} connections are temporarily paused by an operator. Try again later.`,
       );
     if (!executionRoleArn || !env.BROKER_FUNCTION_NAME || !env.AWS_REGION)
-      throw new FlowError('invalid_settings', 409, 'Claude launch configuration is incomplete. Contact an operator.');
+      throw new FlowError('invalid_settings', 409, `${name} launch configuration is incomplete. Contact an operator.`);
     let session = await sessions.session(id);
     if (session && !session.retiring && !session.microvmId) {
       const reservedImage = await imagePolicy(session.imageVersion);
       if (imageDecision(reservedImage) !== 'approved') {
         const reason = reservedImage.state === 'revoked' ? 'image-revoked' : 'image-blocked';
-        if (!await retire(id, session.generation, reason)) throw new FlowError('invalid_settings', 409, 'The blocked Claude environment is stopping. Try again shortly.');
+        if (!await retire(id, session.generation, reason)) throw new FlowError('invalid_settings', 409, `The blocked ${name} environment is stopping. Try again shortly.`);
         session = { ...session, retiring: true };
       }
     }
@@ -299,12 +307,12 @@ export function managedClaude(
         (!session.microvmId && now() >= (session.startupDeadline ?? session.requestedAt + STARTUP_MS)))
     ) {
       if (!(await retire(id, session.generation)))
-        throw new FlowError('invalid_settings', 409, 'The previous Claude environment is stopping. Try again shortly.');
+        throw new FlowError('invalid_settings', 409, `The previous ${name} environment is stopping. Try again shortly.`);
       session = { ...session, retiring: true };
     } else if (session?.microvmId) {
       const state = await stateOf(session.microvmId);
       if (state !== null && state !== 'TERMINATED') {
-        const worker = await workers.get(id, managedWorkerId(id));
+        const worker = await workers.get(id, workerOf(id));
         if (worker?.fenced && worker.microvmId === session.microvmId)
           throw new FlowError(
             'invalid_settings',
@@ -315,7 +323,7 @@ export function managedClaude(
           throw new FlowError(
             'invalid_settings',
             409,
-            'This Claude environment did not become ready. Reconnect Claude to replace it safely.',
+            `This ${name} environment did not become ready. Reconnect ${name} to replace it safely.`,
           );
         await admission.reserve(id, session.generation, now(), policy);
         await admission.bind(session.generation, session.microvmId);
@@ -331,7 +339,7 @@ export function managedClaude(
     const reservedImage = await imagePolicy(session.imageVersion);
     if (imageDecision(reservedImage) !== 'approved') {
       await retire(id, session.generation, reservedImage.state === 'revoked' ? 'image-revoked' : 'image-blocked');
-      throw new FlowError('invalid_settings', 409, `Reserved Claude image cannot start: ${reservedImage.reason}`);
+      throw new FlowError('invalid_settings', 409, `Reserved ${name} image cannot start: ${reservedImage.reason}`);
     }
     await admission.reserve(id, session.generation, now(), policy);
     // Fetch the secret before the launch marker. Failure here can be sealed/released without a VM.
@@ -345,7 +353,7 @@ export function managedClaude(
     await admission.launching(session.generation, now());
     const current = await sessions.session(id);
     if (!current || current.generation !== session.generation || current.retiring)
-      throw new FlowError('invalid_settings', 409, 'This Claude environment is retiring. Try again shortly.');
+      throw new FlowError('invalid_settings', 409, `This ${name} environment is retiring. Try again shortly.`);
     const vm = await launch(session, id, token);
     await admission.bind(session.generation, vm);
     await sessions.bind(id, session.generation, vm);
@@ -373,7 +381,7 @@ export function managedClaude(
         // current policy or busy/queue state: reapproval cannot make this generation usable.
         if (session.retiring) {
           const reason = session.retirementReason ?? 'reconnect';
-          console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation, microvmId: session.microvmId, reason, retry: true }));
+          console.log(JSON.stringify({ [keys.logKey]: 'retire', installationId: lease.installationId, generation: lease.generation, microvmId: session.microvmId, reason, retry: true }));
           if (await retire(lease.installationId, lease.generation, reason)) released++;
           continue;
         }
@@ -381,15 +389,15 @@ export function managedClaude(
         // owning an active job. Never-started queue entries survive generation retirement.
         const image = await imagePolicy(session.imageVersion);
         if (image.state === 'revoked') {
-          console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation, microvmId: session.microvmId, reason: 'image-revoked' }));
+          console.log(JSON.stringify({ [keys.logKey]: 'retire', installationId: lease.installationId, generation: lease.generation, microvmId: session.microvmId, reason: 'image-revoked' }));
           if (await retire(lease.installationId, lease.generation, 'image-revoked')) released++;
           continue;
         }
-        const worker = await workers.get(lease.installationId, managedWorkerId(lease.installationId));
+        const worker = await workers.get(lease.installationId, workerOf(lease.installationId));
         if (
           worker?.active ||
           worker?.settling ||
-          (await workers.queued(lease.installationId, managedWorkerId(lease.installationId))).length
+          (await workers.queued(lease.installationId, workerOf(lease.installationId))).length
         ) {
           await admission.touch(lease.generation, now());
           continue;
@@ -418,7 +426,7 @@ export function managedClaude(
         };
         const reason = due(worker);
         if (reason) {
-          console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation,
+          console.log(JSON.stringify({ [keys.logKey]: 'retire', installationId: lease.installationId, generation: lease.generation,
             microvmId: session.microvmId, vmState: state ?? null, reason, idleMs, imageVersion: session.imageVersion,
             requestedAt: session.requestedAt, heartbeatAt: worker?.heartbeatAt ?? null }));
           if (await retire(lease.installationId, lease.generation, reason, (fresh) => due(fresh) !== undefined)) released++;
@@ -436,7 +444,7 @@ export function managedClaude(
       throw new FlowError(
         'invalid_settings',
         409,
-        'The Claude environment changed. Check its current status before reconnecting.',
+        `The ${name} environment changed. Check its current status before reconnecting.`,
       );
     if (!session?.microvmId) return null;
     try {
@@ -460,6 +468,7 @@ export function managedClaude(
   }
 
   return {
+    provider,
     route,
     start,
     stop,

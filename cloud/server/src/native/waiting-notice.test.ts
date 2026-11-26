@@ -159,3 +159,47 @@ describe('the notice claim on the waiting record', () => {
     expect((send.mock.calls[3]![0] as QueryCommand).input.FilterExpression).toContain('attribute_not_exists(noticeAt)');
   });
 });
+
+describe('a parked Codex job gets the same one notice, in Codex\'s words (#125)', () => {
+  function codexHarness(jobs: WaitingClaudeJob[]) {
+    const sessions = waitingStore(jobs);
+    let readiness: NativeReadiness = 'worker-starting';
+    const comments: string[] = [];
+    const workflowStore = createMemoryWorkflowStore();
+    const notify = createWaitingNotifier({
+      provider: 'codex',
+      tenants: { listTenants: async () => [{ installationId: 55, status: 'active' }] as never },
+      sessions, consoleOrigin: 'https://console.example', now: () => NOW, log: () => {},
+      workflows: createWorkflowRecorder({ store: workflowStore, log: () => {}, now: () => NOW }),
+      resolveNative: async () => ({
+        provider: 'codex',
+        route: { installationId: 55, workerId: 'managed-codex-55', microvmId: 'mvm-c', imageVersion: '7', generation: 'g', controlSecretArn: '' },
+        secret: async () => 'x', readiness: async () => readiness, retirement: async () => 'idle',
+      }),
+      comment: async (_job, body) => { comments.push(body); },
+    });
+    return { notify, comments, workflowStore, set(next: NativeReadiness) { readiness = next; } };
+  }
+
+  it('posts nothing while the Codex session starts, then one ChatGPT sign-in comment linking the Codex page', async () => {
+    const h = codexHarness([parked('job_c')]);
+    expect(await h.notify()).toMatchObject({ noticed: 0 });
+    expect(h.comments).toEqual([]);
+    h.set('auth-required');
+    expect(await h.notify()).toMatchObject({ noticed: 1, failed: 0 });
+    expect(h.comments).toEqual([
+      'Codex needs you to sign in with ChatGPT before this job can start: [sign in from Updraft](https://console.example/installations/55/codex?request=job_c) and it starts on its own.',
+    ]);
+    expect(await h.workflowStore.listWorkflowEvents(55, '9-i12', 10)).toContainEqual(expect.objectContaining({ kind: 'waiting', reason: 'codex_auth_required', jobId: 'job_c' }));
+    expect(await h.notify()).toMatchObject({ noticed: 0 });
+    expect(h.comments).toHaveLength(1);
+  });
+
+  it('names the ended Codex session on a retirement', async () => {
+    const h = codexHarness([parked('job_r')]);
+    h.set('environment-retiring');
+    await h.notify();
+    expect(h.comments[0]).toContain('Codex needs you to sign in with ChatGPT again because the previous Codex session ended (it was idle for its whole idle limit)');
+    expect(await h.workflowStore.listWorkflowEvents(55, '9-i12', 10)).toContainEqual(expect.objectContaining({ reason: 'codex_session_idle' }));
+  });
+});

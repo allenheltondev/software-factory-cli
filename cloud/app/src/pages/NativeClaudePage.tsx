@@ -1,6 +1,6 @@
 import { ClaudeNavigation } from '../components/ClaudeNavigation';
 import { PackageRegistries, type PackageRegistriesApi } from '../components/PackageRegistries';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router';
 import {
   Alert,
@@ -22,6 +22,7 @@ import {
   type NativeClaudeView,
 } from '../api/client';
 import { claudeLoginFrame } from './claudeLoginFrame';
+import { codexLoginFrame } from './codexLoginFrame';
 type Api = Pick<
   ApiClient,
   | 'nativeClaude'
@@ -31,21 +32,131 @@ type Api = Pick<
   | 'nativeClaudeStart'
   | 'nativeClaudeRestart'
 >;
+type CodexApi = Pick<
+  ApiClient,
+  'nativeCodex' | 'setNativeCodexMode' | 'nativeCodexLogin' | 'nativeCodexWaiting' | 'nativeCodexStart' | 'nativeCodexRestart'
+>;
+/** The calls one subscription page makes, whichever provider it is for. */
+interface SubscriptionApi {
+  view: ApiClient['nativeClaude'];
+  setMode: ApiClient['setNativeClaudeMode'];
+  login: ApiClient['nativeClaudeLogin'];
+  waiting: ApiClient['nativeClaudeWaiting'];
+  start: ApiClient['nativeClaudeStart'];
+  restart: ApiClient['nativeClaudeRestart'];
+}
+/** What a subscription page says and which sign-in frame it shows. */
+interface Provider {
+  id: 'claude' | 'codex';
+  title: string;
+  connectTitle: string;
+  signIn: string;
+  reconnect: string;
+  frameTitle: string;
+  frameKind: string;
+  frame: typeof claudeLoginFrame;
+  entryState: 'connectClaude' | 'connectCodex';
+  waitingLoadError: string;
+  generationChanged: string;
+  offline: string;
+  retired: string;
+  startupFailed: string;
+  apiKey: string;
+  apiKeyText: string;
+  subscription: string;
+  subscriptionText: string;
+  confirm: string;
+  publish: string;
+  unavailable: string;
+}
+const CLAUDE: Provider = {
+  id: 'claude',
+  title: 'Claude account',
+  connectTitle: 'Connect Claude account',
+  signIn: 'Sign in to Claude',
+  reconnect: 'Reconnect Claude',
+  frameTitle: 'Private Claude sign-in',
+  frameKind: 'updraft-claude-login',
+  frame: claudeLoginFrame,
+  entryState: 'connectClaude',
+  waitingLoadError: 'Could not load the waiting job. You can still connect your Claude account.',
+  generationChanged: 'Your Claude environment changed during sign-in. Reconnect Claude to continue.',
+  offline: 'The worker is offline or Claude is not signed in. An operator can sign in through the existing AWS shell route.',
+  retired: 'This connection has ended. Reconnect Claude when you are ready; opening this page does not start another environment.',
+  startupFailed: 'Your Claude environment did not become ready. Reconnect Claude to replace it safely.',
+  apiKey: 'Anthropic API key',
+  apiKeyText: 'Keep using the API key saved under Agent keys. Existing Cloud jobs work as before.',
+  subscription: 'Claude Code subscription',
+  subscriptionText:
+    'Run the official Claude CLI signed into your subscription on a dedicated worker. Choose published workflow triggers below. Other workflows keep their existing execution mode.',
+  confirm: 'Use your Claude subscription for the selected workflows? Other workflows keep their existing billing.',
+  publish: 'Publish a workflow that uses Claude in',
+  unavailable:
+    'Claude subscription is unavailable in this deployment. An Updraft operator needs to enable the worker image before you can select triggers.',
+};
+/** Codex on a ChatGPT plan (#125): the official Codex CLI signs in with its own device code. */
+const CODEX: Provider = {
+  id: 'codex',
+  title: 'ChatGPT account',
+  connectTitle: 'Connect ChatGPT',
+  signIn: 'Sign in with ChatGPT',
+  reconnect: 'Reconnect ChatGPT',
+  frameTitle: 'Private ChatGPT sign-in',
+  frameKind: 'updraft-codex-login',
+  frame: codexLoginFrame,
+  entryState: 'connectCodex',
+  waitingLoadError: 'Could not load the waiting job. You can still connect your ChatGPT account.',
+  generationChanged: 'Your Codex environment changed during sign-in. Reconnect ChatGPT to continue.',
+  offline: 'The worker is offline or Codex is not signed in with ChatGPT.',
+  retired: 'This connection has ended. Reconnect ChatGPT when you are ready; opening this page does not start another environment.',
+  startupFailed: 'Your Codex environment did not become ready. Reconnect ChatGPT to replace it safely.',
+  apiKey: 'OpenAI API key',
+  apiKeyText: 'Keep using the Codex API key saved under Agent keys. Existing Cloud jobs work as before.',
+  subscription: 'ChatGPT plan',
+  subscriptionText:
+    'Run the official Codex CLI signed in with your ChatGPT account on a dedicated worker. Updraft never sees your ChatGPT sign-in. Choose published workflow triggers below. Other workflows keep their existing execution mode.',
+  confirm: 'Use your ChatGPT plan for Codex in the selected workflows? Other workflows keep their existing billing.',
+  publish: 'Publish a workflow that uses Codex in',
+  unavailable:
+    'Codex with ChatGPT is unavailable in this deployment. An Updraft operator needs to enable the subscription worker image before you can select triggers.',
+};
 const triggerKey = (t: NativeClaudeTrigger) =>
   JSON.stringify([t.repositoryId, t.repository.toLowerCase(), t.label.toLowerCase()]);
-export function NativeClaudePage({ api }: { api?: Api }) {
+export function NativeClaudePage({ api = defaultApi }: { api?: Api }) {
   const { id } = useParams();
-  return <ClaudeConnectionPage key={id} api={api} />;
+  const calls = useMemo<SubscriptionApi>(() => ({
+    view: (...a) => api.nativeClaude(...a),
+    setMode: (...a) => api.setNativeClaudeMode(...a),
+    login: (...a) => api.nativeClaudeLogin(...a),
+    waiting: (...a) => api.nativeClaudeWaiting(...a),
+    start: (...a) => api.nativeClaudeStart(...a),
+    restart: (...a) => api.nativeClaudeRestart(...a),
+  }), [api]);
+  return <SubscriptionConnectionPage key={id} api={calls} source={api} provider={CLAUDE} />;
 }
 
-function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
+/** Connect ChatGPT (#125): the Codex CLI on the owner's ChatGPT plan, beside Claude's page. */
+export function NativeCodexPage({ api = defaultApi }: { api?: CodexApi }) {
+  const { id } = useParams();
+  const calls = useMemo<SubscriptionApi>(() => ({
+    view: (...a) => api.nativeCodex(...a),
+    setMode: (...a) => api.setNativeCodexMode(...a),
+    login: (...a) => api.nativeCodexLogin(...a),
+    waiting: (...a) => api.nativeCodexWaiting(...a),
+    start: (...a) => api.nativeCodexStart(...a),
+    restart: (...a) => api.nativeCodexRestart(...a),
+  }), [api]);
+  return <SubscriptionConnectionPage key={id} api={calls} source={api} provider={CODEX} />;
+}
+
+function SubscriptionConnectionPage({ api, source, provider: t }: { api: SubscriptionApi; source: object; provider: Provider }) {
   const { id } = useParams();
   // Shown when the client can load the list (the real one always can).
-  const candidate = api as Partial<PackageRegistriesApi>;
+  const candidate = source as Partial<PackageRegistriesApi>;
   const registriesApi = candidate.packageRegistries && candidate.setPackageRegistries ? (candidate as PackageRegistriesApi) : undefined;
   const location = useLocation();
   const navigate = useNavigate();
-  const connectRequested = (location.state as { connectClaude?: unknown } | null)?.connectClaude === true;
+  const connectRequested = (location.state as Record<string, unknown> | null)?.[t.entryState] === true;
   const [params] = useSearchParams();
   const requestId = params.get('request');
   const installationId = Number(id);
@@ -91,7 +202,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
       checking = true;
       const version = revision.current;
       try {
-        const next = await api.nativeClaude(installationId, controller.signal);
+        const next = await api.view(installationId, controller.signal);
         if (!live || version !== revision.current) return;
         setView(next);
         if (!restored) {
@@ -107,9 +218,9 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
             setPhase('preparing');
             try {
               const replacement = next.upgrade ?? next.updateAvailable ?? next.recovery;
-              if (connectRequested && replacement?.state === 'required') await api.nativeClaudeRestart(installationId);
+              if (connectRequested && replacement?.state === 'required') await api.restart(installationId);
               else if (next.preparing || (connectRequested && replacement?.state !== 'stopping'))
-                await api.nativeClaudeStart(installationId);
+                await api.start(installationId);
             } catch (err) {
               flow.current = false;
               setPhase('idle');
@@ -126,13 +237,13 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
         }
         if (requestId && !requestMissing) {
           try {
-            const waiting = await api.nativeClaudeWaiting(installationId, requestId, controller.signal);
+            const waiting = await api.waiting(installationId, requestId, controller.signal);
             if (!live || version !== revision.current) return;
             setRequest(waiting);
           } catch (err) {
             if (err instanceof ApiError && [401, 403].includes(err.status)) throw err;
             requestMissing = err instanceof ApiError && err.status === 404;
-            if (live) setError('Could not load the waiting job. You can still connect your Claude account.');
+            if (live) setError(t.waitingLoadError);
           }
         }
         if (!next.startupFailed && !next.retired) recoveryRequested.current = false;
@@ -153,9 +264,9 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
           setLoginPage(undefined);
           setPhase('idle');
           setGenerationChanged(true);
-          setError('Your Claude environment changed during sign-in. Reconnect Claude to continue.');
+          setError(t.generationChanged);
         } else if (flow.current && !mutationPending.current && (next.upgrade ?? next.updateAvailable ?? next.recovery)?.state === 'stopped') {
-          await api.nativeClaudeStart(installationId);
+          await api.start(installationId);
         } else if (flow.current && !mutationPending.current && !next.upgrade && !next.recovery && next.worker?.online) {
           if (
             next.worker.status === 'connected' &&
@@ -167,7 +278,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
           } else if (['auth-required', 'expired'].includes(next.worker.status) && !grantRequested.current) {
             grantRequested.current = true;
             generation.current = next.worker.generation;
-            const grant = await api.nativeClaudeLogin(installationId, controller.signal).catch((err) => {
+            const grant = await api.login(installationId, controller.signal).catch((err) => {
               if (live && version === revision.current) grantRequested.current = false;
               throw err;
             });
@@ -177,7 +288,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
             }
             generation.current = grant.generation ?? generation.current;
             setLoginPage(
-              claudeLoginFrame(
+              t.frame(
                 grant,
                 document.documentElement.dataset.theme === 'dark'
                   ? 'dark'
@@ -225,13 +336,13 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
       window.removeEventListener('focus', wake);
       document.removeEventListener('visibilitychange', wake);
     };
-  }, [api, installationId, requestId, connectRequested, navigate, location.pathname, location.search]);
+  }, [api, t, installationId, requestId, connectRequested, navigate, location.pathname, location.search]);
   useEffect(() => {
     const receive = (event: MessageEvent) => {
       if (
         event.source !== frame.current?.contentWindow ||
         event.origin !== 'null' ||
-        event.data?.kind !== 'updraft-claude-login'
+        event.data?.kind !== t.frameKind
       )
         return;
       if (
@@ -254,7 +365,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
     };
     window.addEventListener('message', receive);
     return () => window.removeEventListener('message', receive);
-  }, []);
+  }, [t.frameKind]);
   async function connect() {
     const version = ++revision.current;
     mutationPending.current = true;
@@ -272,8 +383,8 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
       if (replacement?.state === 'stopping') return;
       const updated =
         replacement?.state === 'required'
-          ? await api.nativeClaudeRestart(installationId)
-          : await api.nativeClaudeStart(installationId);
+          ? await api.restart(installationId)
+          : await api.start(installationId);
       if (version === revision.current) setView(updated);
     } catch (err) {
       if (version === revision.current) {
@@ -290,7 +401,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
     setBusy(true);
     setError(undefined);
     try {
-      setView(await api.setNativeClaudeMode(installationId, enabled, triggers));
+      setView(await api.setMode(installationId, enabled, triggers));
       setDraft(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save routing.');
@@ -312,7 +423,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
   const options = new Map([...(view?.triggers ?? []).map((t) => [triggerKey(t), t] as const), ...available]);
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
-      {phase === 'idle' && <ClaudeNavigation />}
+      {phase === 'idle' && t.id === 'claude' && <ClaudeNavigation />}
       {phase === 'idle' && (
         <Link className="auth-link" to={`/installations/${id}/keys`}>
           ← Agent keys
@@ -321,7 +432,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
       {phase === 'idle' && (
         <header>
           <h1 ref={title} tabIndex={-1} className="text-2xl font-semibold">
-            Claude account
+            {t.title}
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
             Connect your subscription, then choose which workflows use it.
@@ -339,7 +450,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
         <>
           <Card>
             <CardHeader>
-              <CardTitle>{phase === 'idle' ? 'Connection' : 'Connect Claude account'}</CardTitle>
+              <CardTitle>{phase === 'idle' ? 'Connection' : t.connectTitle}</CardTitle>
             </CardHeader>
             <CardBody className="flex flex-col gap-4">
               {phase === 'idle' && (
@@ -384,14 +495,11 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                         setPhase('preparing');
                       }}
                     >
-                      Sign in to Claude
+                      {t.signIn}
                     </Button>
                   )}
                   {view.configured && !view.browserLogin && !ready && (
-                    <p>
-                      The worker is offline or Claude is not signed in. An operator can sign in through the existing AWS
-                      shell route.
-                    </p>
+                    <p>{t.offline}</p>
                   )}
                   {view.owner && view.managed && !ready && phase === 'idle' && (
                     <div>
@@ -399,8 +507,8 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                         {view.upgrade
                           ? 'Update and reconnect'
                           : view.worker || view.startupFailed || view.retired
-                            ? 'Reconnect Claude'
-                            : 'Connect Claude account'}
+                            ? t.reconnect
+                            : t.connectTitle}
                       </Button>
                     </div>
                   )}
@@ -415,15 +523,10 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                   )}
                   {view.upgrade?.reason && <p role="status">Update required: {view.upgrade.reason}</p>}
                   {view.retired && (
-                    <p role="status">
-                      This connection has ended. Reconnect Claude when you are ready; opening this page does not start
-                      another environment.
-                    </p>
+                    <p role="status">{t.retired}</p>
                   )}
                   {view.startupFailed && (
-                    <Alert variant="error">
-                      Your Claude environment did not become ready. Reconnect Claude to replace it safely.
-                    </Alert>
+                    <Alert variant="error">{t.startupFailed}</Alert>
                   )}
                   {upgradeBusy && !ready && (
                     <p role="status">Wait for the current job to finish before reconnecting.</p>
@@ -436,12 +539,12 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                   ref={(node) => {
                     if (node && !node.contains(document.activeElement)) node.focus();
                   }}
-                  aria-label="Connect Claude account"
+                  aria-label={t.connectTitle}
                   className="flex flex-col gap-4"
                 >
                   <ProgressIndicator
                     aria-label="Connection progress"
-                    steps={['Preparing your environment', 'Sign in to Claude', 'Verifying connection', 'Connected'].map(
+                    steps={['Preparing your environment', t.signIn, 'Verifying connection', 'Connected'].map(
                       (label, i) => ({
                         id: String(i),
                         label,
@@ -464,7 +567,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                   {loginPage && (
                     <iframe
                       ref={frame}
-                      title="Private Claude sign-in"
+                      title={t.frameTitle}
                       style={{ height: frameHeight }}
                       className="w-full rounded-lg border border-border"
                       sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
@@ -512,12 +615,10 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                   <div className="flex flex-col gap-4">
                     <section className="rounded-lg border border-border p-4">
                       <div className="flex flex-wrap items-center gap-2">
-                        <strong>Anthropic API key</strong>
+                        <strong>{t.apiKey}</strong>
                         {!view.enabled && <StatusBadge tone="success">Selected</StatusBadge>}
                       </div>
-                      <p className="my-2 text-sm text-muted-foreground">
-                        Keep using the API key saved under Agent keys. Existing Cloud jobs work as before.
-                      </p>
+                      <p className="my-2 text-sm text-muted-foreground">{t.apiKeyText}</p>
                       <Button
                         type="button"
                         variant="secondary"
@@ -529,13 +630,10 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                     </section>
                     <section className="rounded-lg border border-border p-4">
                       <div className="flex flex-wrap items-center gap-2">
-                        <strong>Claude Code subscription</strong>
+                        <strong>{t.subscription}</strong>
                         {view.enabled && <StatusBadge tone="success">Selected</StatusBadge>}
                       </div>
-                      <p className="my-2 text-sm text-muted-foreground">
-                        Run the official Claude CLI signed into your subscription on a dedicated worker. Choose
-                        published workflow triggers below. Other workflows keep their existing execution mode.
-                      </p>
+                      <p className="my-2 text-sm text-muted-foreground">{t.subscriptionText}</p>
                       <Button
                         type="button"
                         disabled={
@@ -549,9 +647,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                         }
                         onClick={() => {
                           if (
-                            window.confirm(
-                              'Use your Claude subscription for the selected workflows? Other workflows keep their existing billing.',
-                            )
+                            window.confirm(t.confirm)
                           )
                             void choose(true, draft ?? undefined);
                         }}
@@ -574,7 +670,7 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                     </p>
                     {options.size === 0 && (
                       <p className="text-sm">
-                        Publish a workflow that uses Claude in{' '}
+                        {t.publish}{' '}
                         <Link className="auth-link" to={`/installations/${installationId}/config`}>
                           Configuration
                         </Link>{' '}
@@ -625,13 +721,33 @@ function ClaudeConnectionPage({ api = defaultApi }: { api?: Api }) {
                   </CardBody>
                 </Card>
               )}
+              {t.id === 'claude' && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Connect ChatGPT</CardTitle>
+                  </CardHeader>
+                  <CardBody className="flex flex-col gap-3">
+                    <p className="text-sm text-muted-foreground">
+                      Run Codex on your ChatGPT plan instead of an OpenAI API key. It has its own environment and sign-in,
+                      next to this one.
+                    </p>
+                    <Link className="auth-link" to={`/installations/${installationId}/codex`}>
+                      ChatGPT account →
+                    </Link>
+                  </CardBody>
+                </Card>
+              )}
+              {t.id === 'codex' && (
+                <Link className="auth-link" to={`/installations/${installationId}/claude`}>
+                  Claude account →
+                </Link>
+              )}
               {view.configured && registriesApi && (
                 <PackageRegistries api={registriesApi} installationId={installationId} />
               )}
               {!view.configured && (
                 <Alert variant="info">
-                  Claude subscription is unavailable in this deployment. An Updraft operator needs to enable the worker
-                  image before you can select triggers.
+                  {t.unavailable}
                   <a
                     className="auth-link ml-1"
                     href="https://github.com/allenheltondev/software-factory-cli/blob/main/deploy/aws-microvm/native-worker/CLOUD.md"

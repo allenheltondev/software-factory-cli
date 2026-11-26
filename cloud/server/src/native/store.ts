@@ -2,6 +2,7 @@ import { imageDecision, imagePolicyKey, type ImagePolicy } from './image-policy.
 import type { NativeTrigger } from './route.js';
 import type { Job } from '../store/store.js';
 import { workflowAdmissionChecks } from '../jobs/workflow-gate.js';
+import { providerKeys, providerOfWorker } from './provider.js';
 import { ConditionalCheckFailedException, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, DeleteCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -54,7 +55,7 @@ export function createNativeStore(table: string, db = DynamoDBDocumentClient.fro
       if (!job.native?.generation || !route.generation || job.native.workerId !== route.workerId || job.installationId !== route.installationId) return false;
       try {
         await db.send(new TransactWriteCommand({ TransactItems: [
-          { ConditionCheck: { TableName: table, Key: { pk: `TENANT#${job.installationId}`, sk: 'CLAUDE_SESSION' },
+          { ConditionCheck: { TableName: table, Key: { pk: `TENANT#${job.installationId}`, sk: providerKeys(providerOfWorker(job.native.workerId)).sessionSk },
             ConditionExpression: 'generation = :g AND microvmId = :vm AND imageVersion = :image AND attribute_not_exists(retiring)',
             ExpressionAttributeValues: { ':g': route.generation, ':vm': route.microvmId, ':image': route.imageVersion } } },
           { Update: { TableName: table, Key: { pk: `JOB#${job.jobId}`, sk: 'META' },

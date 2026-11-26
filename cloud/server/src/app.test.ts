@@ -107,3 +107,33 @@ describe('package registry routes (#157)', () => {
     expect((await app.request('/api/v1/installations/-1/package-registries')).status).toBe(404);
   });
 });
+
+describe('subscription routes per provider (#125)', () => {
+  const service = (name: string) => ({
+    view: vi.fn(async () => ({ name })), waiting: vi.fn(async () => ({ name })), start: vi.fn(async () => ({ name })),
+    restart: vi.fn(async () => ({ name })), login: vi.fn(async () => ({ name })), update: vi.fn(async () => ({ name })),
+  });
+  const claude = service('claude');
+  const codex = service('codex');
+  const app = createApp({ resolveCaller: () => ({ sub: 'user-1' }), nativeClaude: claude as never, nativeCodex: codex as never });
+
+  it('serves Claude under claude-subscription exactly as before, and Codex under codex-subscription', async () => {
+    expect(await (await app.request('/api/v1/installations/55/claude-subscription')).json()).toEqual({ name: 'claude' });
+    expect(await (await app.request('/api/v1/installations/55/codex-subscription')).json()).toEqual({ name: 'codex' });
+    const login = await app.request('/api/v1/installations/55/codex-subscription/login', { method: 'POST' });
+    expect(login.headers.get('cache-control')).toBe('no-store');
+    expect(codex.login).toHaveBeenCalledWith({ sub: 'user-1' }, 55);
+    expect(claude.login).not.toHaveBeenCalled();
+    const put = await app.request('/api/v1/installations/55/codex-subscription', { method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: true, triggers: [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }] }) });
+    expect(put.status).toBe(200);
+    expect(codex.update).toHaveBeenCalledWith({ sub: 'user-1' }, 55, true, [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }]);
+    expect(claude.update).not.toHaveBeenCalled();
+    expect((await app.request('/api/v1/installations/55/codex-subscription/requests/not-a-job')).status).toBe(404);
+  });
+
+  it('has no Codex routes where no Codex session is deployed', async () => {
+    const claudeOnly = createApp({ resolveCaller: () => ({ sub: 'user-1' }), nativeClaude: claude as never });
+    expect((await claudeOnly.request('/api/v1/installations/55/codex-subscription')).status).toBe(404);
+  });
+});

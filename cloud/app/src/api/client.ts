@@ -994,6 +994,19 @@ export function createApiClient({ getToken, onUnauthorized, fetch: fetchImpl = (
     nativeClaude: (installationId: number, signal?: AbortSignal) => request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000) }),
     setNativeClaudeMode: (installationId: number, enabled: boolean, triggers?: NativeClaudeTrigger[]) =>
       request<NativeClaudeView>('/installations/' + installationId + '/claude-subscription', { method: 'PUT', body: JSON.stringify({ enabled, triggers }) }),
+    // Codex on a ChatGPT plan (#125): the same calls under codex-subscription. The view carries
+    // only sanitized status; the sign-in grant opens the worker's device-code frame directly.
+    nativeCodexWaiting: (installationId: number, id: string, signal?: AbortSignal) =>
+      request<ClaudeWaitingRequest>(`/installations/${installationId}/codex-subscription/requests/${encodeURIComponent(id)}`, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000) }),
+    nativeCodexStart: (installationId: number, id?: string) =>
+      request<NativeClaudeView>(id ? `/installations/${installationId}/codex-subscription/requests/${encodeURIComponent(id)}/start` : `/installations/${installationId}/codex-subscription/connect`, { method: 'POST', signal: AbortSignal.timeout(30000) }),
+    nativeCodexRestart: (installationId: number) =>
+      request<NativeClaudeView>(`/installations/${installationId}/codex-subscription/restart`, { method: 'POST', signal: AbortSignal.timeout(30000) }),
+    nativeCodexLogin: (installationId: number, signal?: AbortSignal) =>
+      request<NativeClaudeLoginGrant>(`/installations/${installationId}/codex-subscription/login`, { method: 'POST', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000) }),
+    nativeCodex: (installationId: number, signal?: AbortSignal) => request<NativeClaudeView>('/installations/' + installationId + '/codex-subscription', { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15000)]) : AbortSignal.timeout(15000) }),
+    setNativeCodexMode: (installationId: number, enabled: boolean, triggers?: NativeClaudeTrigger[]) =>
+      request<NativeClaudeView>('/installations/' + installationId + '/codex-subscription', { method: 'PUT', body: JSON.stringify({ enabled, triggers }) }),
     packageRegistries: (installationId: number) => request<PackageRegistriesView>(`/installations/${installationId}/package-registries`),
     /** Replaces the list over `version`; a 409 means someone else saved first. */
     setPackageRegistries: (installationId: number, hosts: string[], version: number) =>
