@@ -158,9 +158,9 @@ succeeds). No configuration turns that deletion off.
 
 So a clone the worker creates itself (`updraft run-event`) uses the reftable ref store where Git
 has it (2.45 and later): every ref, its lock and its tables live in `reftable/`, which is mounted
-like `refs/`, and commits and ref deletions (`git branch -d`, `git update-ref -d`) work without
-the top level. (`git stash` on Git 2.56 still tries to write the clone's `config` and warns; use the
-base checkout instead of stashing.) An
+like `refs/`, and commits and ref deletions (`git update-ref -d`) work without the top level.
+`git branch -d` and `git stash` still also rewrite the clone's `config`, which stays read-only,
+and warn `could not lock config file`; use the base checkout instead of stashing. An
 older Git gets the files store, and its `git commit` deletes no ref. The same clone also has
 `gc.auto=0` and `maintenance.auto=false`, because the automatic gc that `git commit` starts once
 there are enough loose objects writes `gc.pid.lock` there too; the worker runs `git gc --auto`

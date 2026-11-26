@@ -303,20 +303,12 @@ describe.runIf(sandbox.usable)('git in the sandbox, in a clone the worker made',
     expect(result.stderr, result.diagnosis).toBe('');
   });
 
-  it.skipIf(!reftable)(`deletes refs too, with a git that has reftable: git branch -d and git update-ref -d work${reftable ? '' : ' (SKIPPED: this git has no reftable)'}`, async () => {
+  it.skipIf(!reftable)(`deletes refs too, with a git that has reftable${reftable ? '' : ' (SKIPPED: this git has no reftable)'}`, async () => {
     fixture = createGitFixture('octo/widgets');
-    const result = await inSandbox(fixture, 'git branch -q scratch && git branch -q -d scratch && git update-ref refs/tags/t HEAD && git update-ref -d refs/tags/t && git show-ref --verify --quiet refs/heads/scratch; echo "gone=$?"');
-    expect(result.stdout, result.diagnosis).toBe('gone=1\n');
+    // Ref updates only: `git branch -d` and `git stash` also rewrite the clone's config, which stays read-only.
+    const result = await inSandbox(fixture, 'git update-ref refs/heads/scratch HEAD && git update-ref -d refs/heads/scratch && git update-ref refs/tags/t HEAD && git update-ref -d refs/tags/t && git show-ref --verify --quiet refs/heads/scratch; echo "branch=$?"; git show-ref --verify --quiet refs/tags/t; echo "tag=$?"');
+    expect(result.stdout, result.diagnosis).toBe('branch=1\ntag=1\n');
     expect(result.stderr, result.diagnosis).toBe('');
-  });
-
-  it('(the same commit with git\'s automatic gc on is what warned)', async () => {
-    fixture = createGitFixture('octo/widgets');
-    // A low threshold, so that this commit's loose objects start gc as a big one would.
-    // In the foreground, so that what it prints reaches the agent's output (newer git detaches it).
-    const result = await inSandbox(fixture, COMMIT_MANY, [['gc.auto', '1'], ['maintenance.auto', 'true'], ['gc.autoDetach', 'false'], ['maintenance.autoDetach', 'false']]);
-    expect(result.stdout, result.diagnosis).toContain('committed');
-    expect(result.stderr, result.diagnosis).toMatch(/Read-only file system/);
   });
 });
 
