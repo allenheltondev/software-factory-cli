@@ -32,6 +32,110 @@ any known-compatible preexisting session images that predate this registry; do
 not seed arbitrary versions just because their version strings look older.
 No policy is cached in application code. An unreadable policy fails closed.
 
+Approval records are never deleted, so an image a session launched on stays
+approved however many rollouts later (seeding is additive). A launch on the
+bootstrap approval (the latest image, with no record yet) writes that approval
+down before the VM starts, so a later rollout that skips seeding, such as a
+manual parameter change, cannot turn a live session's image into
+"no approval". The write is conditional: a drain or revocation that commits
+first wins and stops the launch.
+
+## Image pruning
+
+Each build deletes old versions of the image beyond the newest five, because an
+image may hold only so many. For the Claude image it also keeps every version
+that a microVM not yet terminated runs (from `lambda:ListMicrovms`), besides the
+active and latest versions. If the live microVMs cannot be listed, nothing is
+pruned: the build fails at the version cap, loudly, rather than deleting a
+version a session may be using. Pruning never reads or writes an approval.
+
+## Retirement reasons and sign-in
+
+Cleanup records the most specific reason it can: `idle`, `lifetime` (the
+eight-hour hard limit), `vm-ended` (AWS no longer runs the VM before its
+lifetime ends), `suspended`, `worker-lost`, `startup-failed`, `disabled`,
+`image-revoked`, `image-blocked`, or `reconnect` (an owner). Records sealed
+before #176 may say `expired`, which meant either `lifetime` or `vm-ended`. The
+retire log line also carries the session's image version, request time, and
+last heartbeat. A job that waits on a sealed session records the reason on its
+workflow timeline (event reason `claude_session_<reason>`), and the dispatch
+log line carries `retirementReason`.
+
+The Claude login lives only on the session VM's ephemeral disk and is never
+copied. So no replacement environment can inherit it, and every retirement
+needs a person to sign in again. Updraft does not start a replacement on its
+own: it would spend a launch and then wait for the same sign-in. That is why
+routine rollouts must never cause a retirement. The waiting-job comment is
+posted only when that sign-in is needed. It is one sentence that says why the
+previous session ended and links to the console. A wait that ends by itself
+(startup, a heartbeat gap, an unreadable auth probe) gets no comment.
+
+## Investigation: the 2026-11-26 01:18 UTC retirement (#176)
+
+This section is code analysis only. Confirming it needs the production records
+listed at the end.
+
+`environment-retiring` means that the session record was already sealed
+(`retiring: true`) when the job was dispatched. Only cleanup's reconcile, an
+owner action, or a connect on a blocked pending reservation writes that seal.
+An unapproved or draining image on a bound session would have been reported as
+`image-unapproved` or `image-draining`, not as `environment-retiring`. So the
+cause was a seal with one of these reasons: `idle`, `expired` (lifetime or VM
+gone), `suspended`, `worker-lost`, `disabled`, or `startup-failed`.
+
+From the merge history, six of the merges after #155 (21:41 UTC) changed the
+Claude image's inputs and built a new version: #155, #162, #163, #167, #169 and
+#168, the last at about 00:31. The others reused the active version, because
+the build compares input fingerprints. Every merge still redeployed the
+backend.
+
+Ranked by likelihood:
+
+1. **Pruning deleted the session's image version, and the VM ended with it
+   (reason `expired`, now `vm-ended`).** Before this change, pruning kept only
+   the newest five versions plus the active and latest ones. With six new
+   versions in three hours, any session that started before about 22:12 had
+   its version deleted by the #169 or #168 build (about 23:57 or 00:35). If
+   AWS stops or breaks a microVM whose version is deleted, the next five-minute
+   reconcile sees the VM as gone and seals the session. This is the only path
+   that the number of rollouts drives directly.
+2. **The dispatcher stopped after one failed broker call during a backend
+   deploy (reason `worker-lost`).** The in-VM loop stops for good on any
+   refusal, `FunctionError`, or 15-second timeout (`native-worker/cloud.mjs`).
+   Three minutes after the last heartbeat, reconcile seals the session. Each
+   merge updated the broker Lambda twice: once in the backend deploy and once
+   for the image parameter. #170's deploy ran at about 01:00–01:15 and built
+   no image, which matches a seal shortly before 01:18. This change does not
+   alter the dispatcher (that is #177's area). It is the main remaining risk.
+3. **Hard lifetime or idle.** The default idle limit and the hard lifetime are
+   both eight hours. A session sealed at 01:18 would have started before about
+   17:18. Under the code before #155, rollouts at 19:36, 21:00 and 21:33 would
+   have needed a reconnect anyway, so this is unlikely unless
+   `ManagedClaudeIdleMinutes` is set lower in Production.
+4. **An unseeded image.** A session that started on #158's image (about 21:00)
+   was never seeded, because #160 was deployed by the workflow from before
+   #155. It would read as `image-unapproved`, and its worker would be fenced on
+   its next poll. That shows as `image-unapproved` or `fenced`, not
+   `environment-retiring`, until a later seal. This explains a reconnect only
+   together with cause 1 or 3.
+5. **Kill switch (`disabled`) or revocation (`image-revoked`).** Unlikely,
+   because no operator action was reported.
+
+To confirm, check these records:
+
+- The cleanup log's `claudeSession: 'retire'` line for the session's
+  generation between 00:00 and 01:18. Its `reason` and `vmState` settle the
+  question (`expired` with `vmState: null` or `TERMINATED` means cause 1;
+  `worker-lost` with `RUNNING` means cause 2).
+- `CLAUDE_SESSION` (`imageVersion`, `requestedAt`, `retirementReason`) and the
+  worker row's `heartbeatAt`.
+- The `deleted N old image versions: ...` lines of the Claude image builds for
+  #169 and #168. Do they include the session's version?
+- The broker Lambda's errors and duration around each deploy, and the VM's own
+  log line `Cloud worker stopped`.
+- The `NATIVE_IMAGE#<version>` policy record and revision for the session's
+  version, and the stack's `ManagedClaudeIdleMinutes`.
+
 ## Mandatory upgrade and emergency revocation
 
 Run from `cloud/server` with operator AWS credentials (add `--region`/`--stack`

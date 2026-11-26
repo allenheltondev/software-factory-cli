@@ -101,7 +101,12 @@ export function managedClaude(
         throw new FlowError('invalid_settings', 409, 'Recovery requires the exact sealed generation and its launch marker');
       }
     } else {
-      const image = await imagePolicy(session.imageVersion);
+      const read = await imagePolicy(session.imageVersion);
+      if (imageDecision(read) !== 'approved') throw new FlowError('invalid_settings', 409, `Reserved Claude image cannot start: ${read.reason}`);
+      // A session must never outlive its image's approval just because later rollouts moved the
+      // latest image on (#176): record a bootstrap approval before the VM exists. A drain or
+      // revocation that won the race is honored here, before launch.
+      const image = imagePolicy.durable ? await imagePolicy.durable(read) : read;
       if (imageDecision(image) !== 'approved') throw new FlowError('invalid_settings', 409, `Reserved Claude image cannot start: ${image.reason}`);
     }
     const region = env.AWS_REGION ?? '';
@@ -409,12 +414,13 @@ export function managedClaude(
           const suspendedVm = SUSPENDED_STATES.includes(state ?? '');
           if (!(paused || session.retiring || lease.retiring || gone || suspendedVm || lost || startupFailed || idle || lifetimeOver())) return undefined;
           return session.retirementReason ?? (paused ? 'disabled' : startupFailed ? 'startup-failed' : suspendedVm ? 'suspended'
-            : lost ? 'worker-lost' : gone || lifetimeOver() ? 'expired' : 'idle');
+            : lost ? 'worker-lost' : lifetimeOver() ? 'lifetime' : gone ? 'vm-ended' : 'idle');
         };
         const reason = due(worker);
         if (reason) {
           console.log(JSON.stringify({ claudeSession: 'retire', installationId: lease.installationId, generation: lease.generation,
-            microvmId: session.microvmId, vmState: state ?? null, reason, idleMs }));
+            microvmId: session.microvmId, vmState: state ?? null, reason, idleMs, imageVersion: session.imageVersion,
+            requestedAt: session.requestedAt, heartbeatAt: worker?.heartbeatAt ?? null }));
           if (await retire(lease.installationId, lease.generation, reason, (fresh) => due(fresh) !== undefined)) released++;
         }
       } catch {

@@ -6,6 +6,8 @@ import { nativePartition, type NativeMode, type Worker } from './store.js';
 import { STARTUP_MS } from './admission.js';
 import type { LaunchRequest } from '../jobs/launch.js';
 
+export type RetirementReason = 'reconnect' | 'idle' | 'lifetime' | 'vm-ended' | 'expired' | 'suspended' | 'worker-lost' | 'disabled' | 'startup-failed' | 'image-revoked' | 'image-blocked';
+
 export interface ManagedSession {
   generation: string;
   imageVersion: string;
@@ -14,7 +16,12 @@ export interface ManagedSession {
   startupDeadline?: number;
   readyAt?: number;
   retiring?: boolean;
-  retirementReason?: 'reconnect' | 'idle' | 'expired' | 'suspended' | 'worker-lost' | 'disabled' | 'startup-failed' | 'image-revoked' | 'image-blocked';
+  /**
+   * Why it was sealed, as specifically as cleanup could tell (#176). `lifetime` is the eight-hour
+   * hard limit; `vm-ended` a VM that AWS no longer runs before that. `expired` is either, and is
+   * only on records sealed before the two were told apart.
+   */
+  retirementReason?: RetirementReason;
   admissionRequired?: boolean;
 }
 

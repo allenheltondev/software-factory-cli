@@ -147,21 +147,24 @@ function launcher(): Launcher | undefined {
         const id = waitingId(request.installationId, request.deliveryId);
         return (await nativeWorker.managed!.sessions.get(request.installationId, id))?.id;
       },
-      async waitForClaude(request, repository, repositoryId, issue, reason) {
+      async waitForClaude(request, repository, repositoryId, issue, reason, retirement) {
         const { installationId, deliveryId, eventName, appBot } = request;
         const id = waitingId(installationId, deliveryId);
         const eventKey = `tenants/${installationId}/events/claude-wait/${id}.json`;
         await s3.send(new PutObjectCommand({ Bucket: env.TENANT_BUCKET, Key: eventKey, Body: request.body, Tagging: 'updraft-retention=claude-wait' }));
         const waiting = await nativeWorker.managed!.sessions.park({ installationId, deliveryId, eventName, appBot }, eventKey);
-        if (waiting.created && env.CLAUDE_CONSOLE_ORIGIN) {
+        // Only a wait a person must end (a sign-in) is commented on; one that ends by itself is not (#176).
+        let comment: string | undefined;
+        try {
+          if (env.CLAUDE_CONSOLE_ORIGIN) comment = waitingComment(new URL(`/installations/${installationId}/claude?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN).href, reason, retirement);
+        } catch { comment = undefined; }
+        if (waiting.created && comment) {
           try {
             const settings = await loadSettings();
             if (settings) {
               const { token } = await github.createInstallationToken(appJwt(settings.appId, settings.privateKey, Date.now()), installationId,
                 { repositoryIds: [repositoryId], permissions: { issues: 'write' } });
-              const url = new URL(`/installations/${installationId}/claude?request=${id}`, env.CLAUDE_CONSOLE_ORIGIN);
-              await github.createIssueComment(token, repository, issue,
-                waitingComment(url.href, reason));
+              await github.createIssueComment(token, repository, issue, comment);
             }
           } catch (error) { console.error(JSON.stringify({ claudeWaiting: 'issue comment failed', name: (error as Error)?.name })); }
         }

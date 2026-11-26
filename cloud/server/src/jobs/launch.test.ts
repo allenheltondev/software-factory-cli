@@ -231,6 +231,34 @@ describe('the launcher', () => {
     expect(runs).toEqual([]);
   });
 
+  it('records which retirement ended the Claude session on the workflow timeline (#176)', async () => {
+    const version = await store.createConfigVersion(55, { sha256: 'retired', files: [], publishedBy: 's', publishedAt: '', dispatch: dispatchRules({
+      dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
+    }, { keysFor: () => ['ANTHROPIC_API_KEY'] }) });
+    await store.markConfigReady(55, version as number);
+    await store.activateConfig(55, version as number);
+    const logs: Record<string, unknown>[] = [];
+    deps.log = (entry) => logs.push(entry);
+    deps.resolveNative = async () => ({
+      route: { installationId: 55, workerId: 'managed-55', microvmId: 'mvm-native', imageVersion: '7', generation: 'session-a',
+        controlSecretArn: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/root' },
+      secret: async () => 'scoped-worker-secret-01234567890',
+      mode: async () => ({ enabled: true, revision: 1, triggers: [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }] }),
+      readiness: async () => 'environment-retiring',
+      retirement: async () => 'vm-ended',
+    });
+    deps.waitForClaude = vi.fn(async () => 'job_waiting');
+    const workflowStore = createMemoryWorkflowStore();
+    deps.workflows = createWorkflowRecorder({ store: workflowStore, log: () => {} });
+    expect(await createLauncher(deps)(request())).toMatchObject({ reason: 'native_waiting_for_reconnect', jobId: 'job_waiting' });
+    expect(deps.waitForClaude).toHaveBeenCalledWith(expect.anything(), 'acme/web', 9, 12, 'environment-retiring', 'vm-ended');
+    expect(logs).toContainEqual(expect.objectContaining({ nativeDispatch: 'wait', readiness: 'environment-retiring', retirementReason: 'vm-ended' }));
+    expect(await workflowStore.getWorkflow(55, '9-i12')).toMatchObject({ status: 'waiting', reason: 'reconnect_required',
+      message: expect.stringContaining('its VM stopped running before its lifetime ended') });
+    const events = await workflowStore.listWorkflowEvents(55, '9-i12', 50);
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'waiting', reason: 'claude_session_vm_ended', jobId: 'job_waiting' }));
+  });
+
   it('resumes a job parked on a transient auth probe once the worker reports connected, with no sign-in', async () => {
     const version = await store.createConfigVersion(55, { sha256: 'transient', files: [], publishedBy: 's', publishedAt: '', dispatch: dispatchRules({
       dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
@@ -260,12 +288,22 @@ describe('the launcher', () => {
     expect(runs).toEqual([]);
   });
 
-  it('asks for sign-in in the issue comment only when the login is gone', () => {
-    expect(waitingComment('https://console/x', 'expired')).toMatch(/waiting for Claude subscription sign-in/);
-    expect(waitingComment('https://console/x')).toMatch(/sign-in/);
-    expect(waitingComment('https://console/x', 'auth-unavailable')).toMatch(/no sign-in is needed/);
-    expect(waitingComment('https://console/x', 'heartbeat-stale')).not.toMatch(/sign in|sign-in\./);
-    expect(waitingComment('https://console/x', 'environment-suspended')).toMatch(/reconnect Claude/);
+  it('comments only when a person must sign in, in one friendly sentence with the console link (#176)', () => {
+    const sentences = (text: string | undefined) => (text ?? '').replace(/\[[^\]]*\]\([^)]*\)/g, 'LINK').split(/[.!?](\s|$)/).filter((s) => s.trim()).length;
+    for (const reason of ['expired', 'auth-required', 'not-connected', undefined] as const) {
+      const comment = waitingComment('https://console/x', reason);
+      expect(comment).toMatch(/^Claude needs you to sign in before this job can start: \[sign in from Updraft\]\(https:\/\/console\/x\)/);
+      expect(sentences(comment)).toBe(1);
+    }
+    // A wait that ends by itself posts nothing.
+    for (const reason of ['auth-unavailable', 'heartbeat-stale', 'worker-starting'] as const) expect(waitingComment('https://console/x', reason)).toBeUndefined();
+    // A session that ended says why, from its own recorded retirement reason.
+    const retired = waitingComment('https://console/x', 'environment-retiring', 'lifetime');
+    expect(retired).toBe('Claude needs you to sign in again because the previous Claude session ended (it reached its eight-hour lifetime): [sign in from Updraft](https://console/x) and this job starts on its own.');
+    expect(sentences(retired)).toBe(1);
+    expect(waitingComment('https://console/x', 'environment-retiring', 'vm-ended')).toMatch(/its VM stopped running before its lifetime ended/);
+    expect(waitingComment('https://console/x', 'environment-suspended')).toMatch(/sign in again .*suspended/);
+    expect(waitingComment('https://console/x', 'environment-retiring', 'some-new-reason')).toMatch(/\(it was retired \(some-new-reason\)\)/);
     expect(readinessAction('ready')).toBe('none');
   });
 

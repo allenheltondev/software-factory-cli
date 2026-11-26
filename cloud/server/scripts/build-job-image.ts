@@ -8,7 +8,8 @@
 //      a version built from such a tarball records no fingerprint, so CI's next check rebuilds it
 //   2. zips deploy/aws-microvm/image/ (the same image the self-hosted stack builds) with it
 //   3. uploads the zip to the stack's JobImageBucket, deletes old versions beyond the newest few
-//      (an image holds a limited number; never the active one), and creates or updates the image
+//      (an image holds a limited number; never the active one, and for --native-claude never one
+//      a live microVM runs), and creates or updates the image
 //   4. waits for the version to build, and reports the reason if it fails
 //   5. runs one microVM from the version that proves a job's isolation holds on it (the packet
 //      filter loads, the sandbox self-test passes; job-image-check.ts), and fails if it does not
@@ -44,7 +45,7 @@ import { GetParameterCommand, ParameterNotFound, PutParameterCommand } from '@aw
 import { createAdminClients } from './admin-clients.js';
 import { checkImageVersionIsolation } from './job-image-check.js';
 import { buildContext, CLOUD_BUILD_ENV, IMAGE_DIR, repoRoot } from './job-image-context.js';
-import { pruneImageVersions } from './job-image-prune.js';
+import { pruneImageVersions, pruneNativeImageVersions } from './job-image-prune.js';
 import { describeInputs, fingerprintOf, IMAGE_INPUTS, imageInputFiles, imageInputFingerprint, inputsFromDescription } from './job-image-inputs.js';
 import { checkNativeClaudeImage } from './native-claude-image-check.js';
 import { zip } from './zip.js';
@@ -185,13 +186,15 @@ reason=${reason}
     const exists = Boolean(existing);
     // An image may hold only so many versions; make room before adding one. The version jobs
     // start with and the latest active one stay, and so do the newest few (rollback targets).
-    if (exists) {
-      const inUse = native
-        ? parameter('ManagedClaudeImageVersion')
-        : (await clients.ssm.send(new GetParameterCommand({ Name: outputs.JobImageVersionParameter! })).catch((err: unknown) => {
-            if (!(err instanceof ParameterNotFound)) throw err;
-            return undefined;
-          }))?.Parameter?.Value;
+    // A Claude session keeps its version for its whole life, however many rollouts later, so for
+    // that image every version a live microVM runs stays too (#176).
+    if (exists && native) {
+      await pruneNativeImageVersions(microvms, imageArn, { active: parameter('ManagedClaudeImageVersion'), latestActive: existing?.latestActiveImageVersion });
+    } else if (exists) {
+      const inUse = (await clients.ssm.send(new GetParameterCommand({ Name: outputs.JobImageVersionParameter! })).catch((err: unknown) => {
+        if (!(err instanceof ParameterNotFound)) throw err;
+        return undefined;
+      }))?.Parameter?.Value;
       await pruneImageVersions(microvms, imageArn, { protect: [inUse, existing?.latestActiveImageVersion] });
     }
     const version = exists
