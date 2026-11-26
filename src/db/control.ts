@@ -75,8 +75,15 @@ export function pauseWorkflow(
   return transaction(db, () => {
     const current = activeControlPause(db, repoId, issue);
     const strength = (k: PauseKind) => (k === 'pause' ? 0 : 1);
+    const upgraded = current !== null && strength(p.kind) > strength(current.kind);
+    // An upgrade (a `pause` becoming a stop or a cancel) changes the pause's identity (its time), as
+    // in Cloud: a resume decided against the earlier pause (resumeWorkflow) then lifts nothing.
+    const at = (() => {
+      const t = nowIso(now);
+      return current && t <= current.at ? new Date(Date.parse(current.at) + 1).toISOString() : t;
+    })();
     const pause: WorkflowControlPause = current
-      ? { ...current, kind: strength(p.kind) > strength(current.kind) ? p.kind : current.kind, held: [...new Set([...current.held, ...p.held])] }
+      ? { ...current, ...(upgraded ? { kind: p.kind, at } : {}), held: [...new Set([...current.held, ...p.held])] }
       : { state: 'paused', kind: p.kind, by: p.by, at: nowIso(now), reason: p.reason, source: p.source, held: [...new Set(p.held)] };
     writeJson(db, pauseKey(repoId, issue), pause);
     return { pause, created: !current };

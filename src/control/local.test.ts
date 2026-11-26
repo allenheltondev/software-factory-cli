@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
-import { activeControlPause, getControlPause } from '../db/control.js';
+import { activeControlPause, getControlPause, resumeWorkflow } from '../db/control.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { getLoopPr, observeHead } from '../db/pr-reviews.js';
 import { getJob } from '../db/queue.js';
@@ -71,7 +71,7 @@ function world(opts: { pr?: boolean } = {}) {
   const run = (command: LocalControlRequest['command'], over: Partial<LocalControlRequest> = {}) =>
     applyLocalControl(db, config, {
       command, repo: REPO, cfg, issue: ISSUE, pullRequest: opts.pr === false ? null : PR, headSha: opts.pr === false ? null : HEAD, subjectState: 'open',
-      actor: 'allen', source: String(1000 + ++seq), url: `https://github.com/${REPO.fullName}/pull/${PR}#issuecomment-${seq}`, text: '', target: null, ...over,
+      actor: 'allen', source: String(1000 + ++seq), url: `https://github.com/${REPO.fullName}/pull/${PR}#issuecomment-${seq}`, text: '', target: null, authority: 'maintain', ...over,
     }, now);
   /** A running job under a live worker (so a cancel request is recorded, not stale). */
   const running = (id = insertQueuedJob(db, { repoId: REPO.id, fullName: REPO.fullName, issue: ISSUE })) => {
@@ -189,6 +189,28 @@ describe('stop and cancel', () => {
     expect(getJob(w.db, queued)!.status).toBe('canceled');
     expect(activeControlPause(w.db, REPO.id, ISSUE)).toMatchObject({ kind: 'cancel', held: [queued, active] });
     expect(getLoopPr(w.db, REPO.id, PR)!.state).toBe('open');
+  });
+
+  it('checks the authority against the pause it lifts, inside the resume', () => {
+    const w = world();
+    w.run('pause');
+    // Decided as a plain pause by the caller; a cancel lands before the resume runs.
+    const before = activeControlPause(w.db, REPO.id, ISSUE)!;
+    w.run('cancel');
+    const after = activeControlPause(w.db, REPO.id, ISSUE)!;
+    expect(after.kind).toBe('cancel');
+    // The upgrade changed the pause's identity: a resume of the earlier one lifts nothing.
+    expect(after.at).not.toBe(before.at);
+    expect(resumeWorkflow(w.db, REPO.id, ISSUE, before, 'pat')).toBeNull();
+    expect(w.run('resume', { actor: 'pat', authority: 'write' })).toMatchObject({ outcome: 'refused', message: expect.stringContaining('needs maintain') });
+    expect(activeControlPause(w.db, REPO.id, ISSUE)).not.toBeNull();
+    expect(w.run('resume', { authority: 'maintain' })).toMatchObject({ outcome: 'applied' });
+  });
+
+  it('lets write access lift a plain pause', () => {
+    const w = world();
+    w.run('pause');
+    expect(w.run('resume', { actor: 'pat', authority: 'write' })).toMatchObject({ outcome: 'applied' });
   });
 
   it('a stop after a pause makes the resume need maintain', () => {

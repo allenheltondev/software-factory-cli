@@ -161,6 +161,7 @@ async function handleComment(deps: ControlPollDeps, repo: RepoRef, cfg: Reposito
     result = applyLocalControl(db, config, {
       command: parsed.command, repo, cfg, issue, pullRequest: pr?.prNumber ?? (c.onPullRequest ? c.issueNumber : null), headSha,
       subjectState: subjectState!, actor: c.user!, source, url: c.htmlUrl, text: parsed.text, target: parsed.target,
+      authority: permission === 'admin' || permission === 'maintain' ? 'maintain' : 'write',
     }, now);
     record(result.outcome, result.message, headSha);
   });

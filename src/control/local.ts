@@ -43,6 +43,12 @@ export interface LocalControlRequest {
   url: string;
   text: string;
   target: string | null;
+  /**
+   * What the person may do, as the caller confirmed it: `maintain` lifts a stop's or a cancel's
+   * pause, `write` only a `pause`. Checked here, in the same transaction as the resume, against the
+   * pause that is lifted (a cancel that lands after the caller's check still wins).
+   */
+  authority: 'write' | 'maintain';
 }
 
 export interface LocalControlResult {
@@ -158,6 +164,9 @@ export function applyLocalControl(db: Db, config: UpdraftConfig, r: LocalControl
       if (closed) return { outcome: 'refused', message: `${ref} is ${r.subjectState}, so there is nothing to resume. Reopen it and apply the trigger label to start new work.` };
       const current = activeControlPause(db, r.repo.id, r.issue);
       if (!current) return { outcome: 'noop', message: `${ref} is not paused. ${r.pullRequest !== null ? '`review` reviews the current head again.' : ''}`.trim() };
+      if (current.kind !== 'pause' && r.authority !== 'maintain') {
+        return { outcome: 'refused', message: `${ref} was ${current.kind === 'stop' ? 'stopped' : 'canceled'}; resuming it needs maintain or admin access, so nothing was done.` };
+      }
       const stillRunning = current.held.filter((id) => getJob(db, id)?.status === 'running');
       if (stillRunning.length) return { outcome: 'refused', message: `Job ${stillRunning.join(', ')} is still stopping. Resume once it has ended.` };
       if (!resumeWorkflow(db, r.repo.id, r.issue, current, r.actor, now)) return { outcome: 'refused', message: `${ref} was paused again in the meantime; nothing was resumed.` };

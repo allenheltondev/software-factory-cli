@@ -60,6 +60,8 @@ export async function controlCommand(ctx: CommandContext, ref: string, command: 
       const r = applyLocalControl(db, config, {
         command: cmd as ControlCommand, repo, cfg, issue, pullRequest: pr?.prNumber ?? (loopPr ? n : null), headSha, subjectState,
         actor, source, url: '', text, target: cmd === 'stop' && words[0] ? words[0] : null,
+        // Whoever runs the CLI owns the state database.
+        authority: 'maintain',
       }, ctx.now);
       recordControlCommand(db, { source, repoId: repo.id, issue, pullRequest: loopPr ? n : null, actor, command: cmd, receivedAt: nowIso(ctx.now), headSha, outcome: r.outcome, message: r.message });
       return r;
