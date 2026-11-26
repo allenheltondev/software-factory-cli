@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
 import { fakeAdapter } from '../../test/fake-adapter.js';
-import { FakeLoopGitHub } from '../../test/fake-loop-github.js';
+import { FakeLoopGitHub, laggingHead } from '../../test/fake-loop-github.js';
 import { createGitFixture, type GitFixture } from '../../test/git-fixtures.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { registerAdapter } from '../agents/adapters/registry.js';
@@ -414,6 +414,92 @@ describe('updraft run-event: the whole review loop in one run', { timeout: 180_0
     expect(w.gh.merges).toEqual([{ sha: head, method: 'squash' }]);
     // The blocked note for that commit was not posted again.
     expect(w.gh.comments.filter((c) => c.body.includes(`<!-- updraft-merge-blocked: ${head} -->`))).toHaveLength(1);
+  });
+});
+
+// #197 (PR #195 on Updraft Cloud): the head a suggestion revision pushes was never reviewed. The
+// App's own pushes start no job there (the launcher drops a `synchronize` its own identity sent:
+// the run that pushed handles what follows), and GitHub showed the commit the push replaced for a
+// moment after it, so the review of the pushed head was canceled as "moved", for good.
+describe('updraft run-event: the suggestion step on Updraft Cloud (#197)', { timeout: 180_000 }, () => {
+  const SUGGEST = { ...LOOP, notifications: 'quiet', ciFix: true };
+  const reviewerArgs = ['--mode', 'review', '--suggest'];
+  const pending = { total: 1, failing: [], pending: ['ci / build'], succeeded: [], complete: true };
+  const green = { total: 1, failing: [], pending: [], succeeded: ['ci / build'], complete: true };
+  /** CI finished on `head`: the check suite's delivery, sent by the App itself (it pushed the head). */
+  const suiteOf = (w: World, head: string) => ({
+    action: 'completed',
+    repository: { id: REPO_ID, full_name: FULL },
+    sender: { login: w.gh.login },
+    check_suite: { head_branch: BRANCH, head_sha: head, pull_requests: [{ number: PR, head: { ref: BRANCH } }] },
+  });
+  const statusOf = (w: World) => w.gh.comments.find((c) => c.issue === ISSUE)?.body ?? '';
+  const suggestionWorld = (lagReads: number) => {
+    const w = world();
+    w.gh.files = [{ path: 'FAKE_AGENT.md', status: 'added', patch: '@@ -0,0 +1,3 @@\n+# Done\n+\n+Implement the issue below.' }];
+    const real = () => remoteHead(w.f, BRANCH);
+    w.gh.headSha = laggingHead(real, lagReads);
+    w.gh.checks = pending;
+    return { w, real };
+  };
+
+  it('the run that pushed the suggestion revision reviews its head, though GitHub shows the old head for a moment; CI and the merge follow, and the status ends at "Merged"', async () => {
+    const { w } = suggestionWorld(3);
+    const one = vm(w, 'vm one', { repo: SUGGEST, reviewerArgs });
+    const r = await one.run({ deliveryId: 'd-1' });
+    expect(r.err).not.toContain('ERROR');
+    expect(r.code).toBe(0);
+    const head2 = remoteHead(w.f, BRANCH);
+    expect(jobsOf(one.state)).toEqual([
+      ['issue.labeled', 'succeeded'],
+      ['pull_request.review', 'succeeded'],
+      ['pull_request.changes_requested', 'succeeded'],
+      ['pull_request.review', 'succeeded'],
+    ]);
+    // The pushed head was reviewed and found ready; the run ends while its checks are pending.
+    expect(r.summary).toMatchObject({ drain: 'idle', loop: { rounds: 1, reviews: 2, headSha: head2, verdictSha: head2, verdict: 'ready-to-merge', stage: 'waiting-for-ci', merged: false } });
+    expect(w.gh.writes).toContain(`review #${PR} COMMENT at ${head2}`);
+    expect(statusOf(w)).not.toContain('Addressing suggestions');
+    expect(one.upload()).toMatchObject({ changed: true });
+
+    // CI passes on the pushed head; the check suite's delivery (the App's) reaches another machine.
+    w.gh.checks = green;
+    const two = vm(w, 'vm two', { repo: SUGGEST, reviewerArgs, payload: suiteOf(w, head2) });
+    two.download();
+    const merged = await two.run({ eventName: 'check_suite', deliveryId: 'd-2' });
+    expect(merged.err).not.toContain('ERROR');
+    expect(merged.summary).toMatchObject({ loop: { stage: 'merged', merged: true } });
+    expect(w.gh.merges).toEqual([{ sha: head2, method: 'squash' }]);
+    expect(statusOf(w)).toContain('**Updraft · Merged**');
+    expect(w.gh.comments.filter((c) => c.issue === ISSUE)).toHaveLength(1);
+  });
+
+  it('a pull request left as PR #195 was (the review of the pushed head canceled as "moved", the status on "Addressing suggestions") is reviewed and merged by the next delivery for it', async () => {
+    // GitHub does not show the push during the whole first run: its review never starts there.
+    const { w, real } = suggestionWorld(1_000_000);
+    const one = vm(w, 'vm one', { repo: SUGGEST, reviewerArgs });
+    const r = await one.run({ deliveryId: 'd-1' });
+    const head2 = real();
+    expect(r.summary.drain).toBe('stalled');
+    const lost = withDb(one.state, (db) => db.prepare("SELECT id, status FROM jobs WHERE event_id = ?").get(`pr-review:${PR}:${head2}`)) as { id: string; status: string };
+    expect(lost.status).toBe('queued');
+    // As main left PR #195: that job canceled, its head replaced by the old one in the reason.
+    withDb(one.state, (db) => db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ? WHERE id = ?").run(`the head of pull request #${PR} moved from ${head2.slice(0, 12)} to 0123456789ab; the new head gets its own review`, lost.id));
+    expect(statusOf(w)).toContain('**Updraft · Addressing suggestions**');
+    one.upload();
+
+    // GitHub caught up and CI passed on the pushed head: the App's check suite delivery.
+    w.gh.headSha = real;
+    w.gh.checks = green;
+    const two = vm(w, 'vm two', { repo: SUGGEST, reviewerArgs, payload: suiteOf(w, head2) });
+    two.download();
+    const r2 = await two.run({ eventName: 'check_suite', deliveryId: 'd-2' });
+    expect(r2.err).not.toContain('ERROR');
+    expect(r2.code).toBe(0);
+    expect(r2.summary).toMatchObject({ dispatched: true, loop: { reviews: 2, verdictSha: head2, stage: 'merged', merged: true } });
+    expect(w.gh.writes).toContain(`review #${PR} COMMENT at ${head2}`);
+    expect(w.gh.merges).toEqual([{ sha: head2, method: 'squash' }]);
+    expect(statusOf(w)).toContain('**Updraft · Merged**');
   });
 });
 

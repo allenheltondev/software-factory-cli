@@ -791,7 +791,7 @@ async function recheckQueuedJobs(
  * GitHubError for transient API failures (rate limit, network, 5xx), in which case
  * the caller should leave the job queued and try later.
  */
-export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'config'> & { db?: Db }, job: Job): Promise<DispatchCheck> {
+export async function checkJobDispatchable(deps: Pick<PollerDeps, 'api' | 'config' | 'now'> & { db?: Db }, job: Job): Promise<DispatchCheck> {
   // A paused workflow (docs/controls.md): the job is not started, and resume puts it back.
   const paused = deps.db ? pauseProblem(deps.db, job) : null;
   if (paused) {

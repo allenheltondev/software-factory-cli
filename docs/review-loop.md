@@ -95,6 +95,14 @@ A reviewer job is an ordinary job: it appears in `updraft status`, and `updraft 
 runs at the same time as a revision of that PR. A reviewer job whose commit is no longer the
 PR's head is canceled before it starts; the new head has its own job.
 
+GitHub updates a pull request's head a little after a push lands, so a read right after one of
+Updraft's own pushes can still name the commit that push replaced. For five minutes after the
+push, such a read is not taken for a move: the head on record stays the pushed commit, and its
+reviewer job stays queued and is looked at again shortly instead of being canceled. Should a
+reviewer job of the current head be canceled as "moved" all the same, the head gets a new
+reviewer job (at most three times), so a head Updraft pushed is never left without a review
+([#197](https://github.com/allenheltondev/software-factory-cli/issues/197)).
+
 Turning `review` on for a repository that already has open PRs opened by Updraft reviews
 their current heads.
 
@@ -424,7 +432,10 @@ is never touched.
   releases the ready head: its suggestions are settled as above (a decline still gets its reason)
   and the head goes on to its checks and merge. That is at most one revision attempt later than
   without suggestions. A head whose suggestions cannot be settled because GitHub keeps failing is
-  let through after five attempts.
+  let through after five attempts. A suggestion revision that pushed a head the pull request
+  does not show is waited for ten minutes at most; then GitHub is asked: the PR moves on to the
+  pushed head (which gets its own review), or, if the push is not there, the suggestions are
+  settled on the ready head, which goes on to its checks and merge.
 - **Change a verdict.** Suggestions are not blockers; the acceptance gate ([acceptance.md](acceptance.md))
   and the CI gate ([ci-fix.md](ci-fix.md)) are unchanged. Auto-merge waits for the suggestion
   revision's own head to be reviewed and pass its checks; it never merges the head the revision

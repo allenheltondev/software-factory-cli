@@ -262,17 +262,48 @@ export function adoptOwnPushes(db: Db, repoId: number, now?: () => number): numb
 }
 
 /**
+ * How long after the worker pushed a revision a read of the pull request that still shows the
+ * commit that push replaced is taken for GitHub catching up, not for news (#197). GitHub updates a
+ * pull request's head some time after a push lands: a read made in between names the old commit.
+ * Past this, such a read is believed (a person may have pushed the branch back).
+ */
+export const HEAD_LAG_GRACE_MS = 5 * 60_000;
+
+/**
+ * When the worker's own revision push moved the PR from `olderSha` to `headSha`: its pushed_at,
+ * or null when no revision of the worker made that move.
+ */
+export function ownPushReplacing(db: Db, repoId: number, prNumber: number, headSha: string, olderSha: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT pushed_at FROM revisions WHERE repo_id = ? AND pr_number = ? AND head_sha = ? AND base_sha = ? AND pushed_at IS NOT NULL
+       ORDER BY pushed_at DESC LIMIT 1`,
+    )
+    .get(repoId, prNumber, headSha, olderSha) as { pushed_at: string } | undefined;
+  return row?.pushed_at ?? null;
+}
+
+/**
  * The PR was read from GitHub and its head is `sha`. `observedAt` is when the read was started:
  * an observation older than what the row holds (a read that raced the worker's own push) is
- * ignored. Returns true when the head changed.
+ * ignored, and so is one that names the commit the worker's own push of the head replaced, within
+ * HEAD_LAG_GRACE_MS of that push: GitHub had not caught up yet (#197). Returns true when the head
+ * changed.
  */
 export function observeHead(db: Db, repoId: number, prNumber: number, sha: string, observedAt: string): boolean {
+  const lagUntil = Date.parse(observedAt) - HEAD_LAG_GRACE_MS;
+  const cutoff = Number.isFinite(lagUntil) ? new Date(lagUntil).toISOString() : observedAt;
   const res = db
     .prepare(
       `UPDATE revision_prs SET head_sha = ?, head_at = ?, updated_at = ?
-       WHERE repo_id = ? AND pr_number = ? AND (head_sha IS NULL OR head_sha != ?) AND (head_at IS NULL OR head_at < ?)`,
+       WHERE repo_id = ? AND pr_number = ? AND (head_sha IS NULL OR head_sha != ?) AND (head_at IS NULL OR head_at < ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM revisions v
+            WHERE v.repo_id = revision_prs.repo_id AND v.pr_number = revision_prs.pr_number
+              AND v.head_sha = revision_prs.head_sha AND v.base_sha = ? AND v.pushed_at IS NOT NULL AND v.pushed_at > ?
+         )`,
     )
-    .run(sha, observedAt, observedAt, repoId, prNumber, sha, observedAt);
+    .run(sha, observedAt, observedAt, repoId, prNumber, sha, observedAt, sha, cutoff);
   return Number(res.changes) > 0;
 }
 
@@ -375,13 +406,19 @@ export function enqueueReviewJob(
      * (reviewEventId plus the command), so the head is reviewed again once per command.
      */
     rerunOf?: string;
+    /**
+     * The n-th reviewer job for a head whose earlier one was canceled although the head is still
+     * the PR's (requeueLostReview): its own dedupe key (reviewEventId plus the count).
+     */
+    requeue?: number;
   },
 ): Job | null {
   const { repo, pr } = o;
   if (pr.state !== 'open' || !pr.headSha) return null;
   const headSha = pr.headSha;
   const at = nowIso(o.now);
-  const eventId = o.rerunOf ? `${reviewEventId(pr.prNumber, headSha)}:rerun:${o.rerunOf}` : reviewEventId(pr.prNumber, headSha);
+  const base = reviewEventId(pr.prNumber, headSha);
+  const eventId = o.rerunOf ? `${base}:rerun:${o.rerunOf}` : o.requeue !== undefined ? `${base}:requeue:${o.requeue}` : base;
   return transaction(db, () => {
     const exists = db
       .prepare(
@@ -441,6 +478,35 @@ export function enqueueReviewJob(
   });
 }
 
+/** Reviewer jobs queued again for one head whose job was canceled as moved while it was still the head (requeueLostReview). */
+export const MAX_REVIEW_REQUEUES = 3;
+
+/**
+ * The reviewer job of the PR's current head was canceled because the head had "moved" from it,
+ * and yet it is the head: the move was a read of GitHub that had not caught up with the worker's
+ * own push (#197), or the branch moved and came back. Nothing else would ever review that head
+ * (the job's dedupe key is spent, and a push by the worker itself starts no event), so the head
+ * gets a new reviewer job, at most MAX_REVIEW_REQUEUES times. Null when that does not apply.
+ */
+export function requeueLostReview(db: Db, o: Parameters<typeof enqueueReviewJob>[1]): Job | null {
+  const { pr } = o;
+  if (pr.state !== 'open' || !pr.headSha) return null;
+  const base = reviewEventId(pr.prNumber, pr.headSha);
+  const jobs = db
+    .prepare(
+      `SELECT status, status_reason FROM jobs WHERE repo_id = ? AND workflow_id = ? AND (event_id = ? OR event_id LIKE ?)
+       ORDER BY created_at DESC, rowid DESC`,
+    )
+    .all(o.repo.id, pr.workflowId, base, `${base}:requeue:%`) as Array<{ status: JobStatus; status_reason: string | null }>;
+  const latest = jobs[0];
+  if (!latest || latest.status !== 'canceled' || !latest.status_reason?.includes(`moved from ${pr.headSha.slice(0, 12)}`)) return null;
+  // A posted review of the head (a rerun's, say) settles it.
+  if (db.prepare('SELECT 1 AS x FROM pr_reviews WHERE repo_id = ? AND pr_number = ? AND head_sha = ? LIMIT 1').get(o.repo.id, pr.prNumber, pr.headSha)) return null;
+  const requeues = jobs.length - 1;
+  if (requeues >= MAX_REVIEW_REQUEUES) return null;
+  return enqueueReviewJob(db, { ...o, requeue: requeues + 1 });
+}
+
 /**
  * Bring one repository's review loop up to date from local state: watch newly published PRs, take
  * over the heads the worker pushed, and queue the reviewer job of every open PR's current head
@@ -462,14 +528,15 @@ export function scheduleReviews(
   for (const pr of listOpenLoopPrs(db, cfg.id)) {
     if (!pr.headSha || (only && !only(pr))) continue;
     const wf = cfg.workflows.find((w) => workflowId(w) === pr.workflowId);
-    const job = enqueueReviewJob(db, {
+    const o = {
       repo: { id: cfg.id, fullName: repoFullName },
       pr,
       pool: reviewPoolFor(cfg, wf, pr.pool),
       // Without its workflow there is no allowlist: nobody's change request is passed on.
       allowedActors: wf ? allowedActorsFor(config, wf) : [],
       now,
-    });
+    };
+    const job = enqueueReviewJob(db, o) ?? requeueLostReview(db, o);
     if (job) queued.push(job);
   }
   return queued;
@@ -1256,7 +1323,8 @@ export function prStage(db: Db, pr: LoopPr, maxRevisions: number, opts: { ci?: b
   if (!pr.headSha) return { stage: 'awaiting-review', detail: 'the head commit is not known yet' };
 
   const head = short(pr.headSha);
-  const reviewJob = reviewJobs.find((j) => j.event_id === reviewEventId(pr.prNumber, pr.headSha!));
+  const headEvent = reviewEventId(pr.prNumber, pr.headSha);
+  const reviewJob = reviewJobs.find((j) => j.event_id === headEvent || j.event_id.startsWith(`${headEvent}:requeue:`));
   const posting = reviewJob
     ? (db.prepare('SELECT p.* FROM pr_reviews p JOIN runs r ON r.id = p.run_id WHERE r.job_id = ? ORDER BY r.attempt DESC LIMIT 1').get(reviewJob.id) as
         | PrReviewRow

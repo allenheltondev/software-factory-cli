@@ -1195,6 +1195,31 @@ describe('the launcher', () => {
       expect(runs).toEqual([]);
     });
 
+    // #197: the App's own suggestion revision pushed a new head. Its `synchronize` (sent by the
+    // App) starts nothing: the run that pushed reviews that head. The check suite of that head,
+    // also sent by the App, does start a job, whose run-event reviews the head if nothing did
+    // (a review canceled as "moved" is queued again: the CLI's requeueLostReview), then merges it.
+    it("after the App's own push: its synchronize starts nothing, and the check suite of the pushed head (the App's too) starts the job that carries the loop on", async () => {
+      const v = await store.createConfigVersion(55, { sha256: 'ci', files: ['config.yaml'], publishedBy: 's', publishedAt: '', dispatch: dispatchRules(
+        { dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, review: true, revise: true, ciFix: true, workflows: [{ trigger: { label: 'updraft' } }] } } },
+        { keysFor: () => ['ANTHROPIC_API_KEY'] },
+      ) });
+      await store.markConfigReady(55, v as number);
+      await store.activateConfig(55, v as number);
+      const launch = createLauncher(deps);
+      const pushed = 'e'.repeat(40);
+      expect(await launch(prEvent({ action: 'synchronize', sender: { login: 'updraft[bot]' }, pull_request: { number: 40, head: { ref: 'updraft/issue-12-abc', sha: pushed } } }, 'pr-sync', 'pull_request')))
+        .toMatchObject({ disposition: 'not_dispatched', reason: 'own_event' });
+      expect(runs).toEqual([]);
+      const suite = prEvent({ action: 'completed', pull_request: undefined, review: undefined, sender: { login: 'updraft[bot]' },
+        check_suite: { head_branch: 'updraft/issue-12-abc', head_sha: pushed, pull_requests: [{ number: 40, head: { ref: 'updraft/issue-12-abc' } }] } }, 'pr-suite', 'check_suite');
+      const started = await launch(suite);
+      expect(started).toMatchObject({ disposition: 'launched' });
+      expect(runs).toHaveLength(1);
+      expect(await store.getJob(started.jobId!)).toMatchObject({ eventName: 'check_suite', pullRequest: 40 });
+      expect(JSON.parse(events['tenants/55/events/pr-suite/event.json']!)).toMatchObject({ check_suite: { head_sha: pushed }, sender: { login: 'updraft[bot]' } });
+    });
+
     describe("the keys of the workflow that started the pull request", () => {
       // Claude on `updraft`, Codex on `codex`; only the Anthropic key is set.
       beforeEach(async () => {

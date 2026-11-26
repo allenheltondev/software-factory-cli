@@ -675,12 +675,12 @@ const UNSETTLED = `(state = 'publishing' AND (lease_expires_at > ? OR attempts <
  * The newest push of a revision job: whether the worker will still work on it by itself (the same
  * rule as issuesAwaitingRevisionPush), and the head it pushed, if it did. Null: the job has none.
  */
-export function revisionPushOfJob(db: Db, jobId: string, now?: () => number): { unsettled: boolean; pushedSha: string | null } | null {
+export function revisionPushOfJob(db: Db, jobId: string, now?: () => number): { unsettled: boolean; pushedSha: string | null; pushedAt: string | null } | null {
   const at = nowIso(now);
   const row = db
     .prepare(`SELECT head_sha, pushed_at, CASE WHEN ${UNSETTLED} THEN 1 ELSE 0 END AS unsettled FROM revisions WHERE job_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`)
     .get(at, REVISION_MAX_AUTO_ATTEMPTS, REVISION_MAX_AUTO_ATTEMPTS, jobId) as { head_sha: string | null; pushed_at: string | null; unsettled: number } | undefined;
-  return row ? { unsettled: row.unsettled === 1, pushedSha: row.pushed_at ? row.head_sha : null } : null;
+  return row ? { unsettled: row.unsettled === 1, pushedSha: row.pushed_at ? row.head_sha : null, pushedAt: row.pushed_at } : null;
 }
 
 /** Runs whose push or reply the worker should try again now (see listDuePublications). */

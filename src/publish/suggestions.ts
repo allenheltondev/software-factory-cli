@@ -52,6 +52,13 @@ export type SuggestionDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' |
 
 /** Failed attempts to settle one head before it is let through anyway: a suggestion never holds a merge back for good. */
 export const MAX_SUGGEST_ATTEMPTS = 5;
+/**
+ * How long the suggestion step waits for the head a suggestion revision pushed to replace the one
+ * it revised (#197). Past this, GitHub decides: a pull request at the pushed head moves on to it
+ * (that head gets its own review), and one still at the revised head has its suggestions settled
+ * there and goes on to its checks and its merge. Never held for good.
+ */
+export const SUGGEST_PUSH_WAIT_MS = 10 * 60_000;
 /** Suggestions one revision is given; the rest are deferred to the follow-up issue. */
 const MAX_REVISION_SUGGESTIONS = 25;
 /** Suggestions settled on one head at most (each is a few requests); the next head settles what is left. */
@@ -297,12 +304,19 @@ export async function evaluateSuggestions(deps: SuggestionDeps, repo: RepoRef, c
       const job = pr.suggestJobId ? getJob(db, pr.suggestJobId) : null;
       if (job && (job.status === 'queued' || job.status === 'running')) return { status: 'waiting', reason: `the suggestion revision (job ${job.id}) is ${job.status}` };
       // The queue's own rule: a push the worker will still retry by itself is pending; one it gave up on is not.
-      const push = (pr.suggestJobId ? revisionPushOfJob(db, pr.suggestJobId, now) : null) ?? { unsettled: false, pushedSha: null };
+      const push = (pr.suggestJobId ? revisionPushOfJob(db, pr.suggestJobId, now) : null) ?? { unsettled: false, pushedSha: null, pushedAt: null };
       if (push.unsettled) return { status: 'waiting', reason: 'the suggestion revision is being pushed' };
-      // Pushed: the pull request moves to that head, which gets its own review.
-      if (push.pushedSha && push.pushedSha !== sha) return { status: 'waiting', reason: `the suggestion revision pushed ${short(push.pushedSha)}` };
+      // Pushed: the pull request moves to that head, which gets its own review. While the head on
+      // record is still the revised one (GitHub had not caught up with the push), for a while only:
+      // after that, settleHead reads GitHub and either moves the PR on to the pushed head or, if
+      // the push is not there, settles the suggestions on this head and lets it go on (#197).
+      const pushedAt = push.pushedAt ? Date.parse(push.pushedAt) : Number.NaN;
+      if (push.pushedSha && push.pushedSha !== sha && !(now() - pushedAt >= SUGGEST_PUSH_WAIT_MS)) return { status: 'waiting', reason: `the suggestion revision pushed ${short(push.pushedSha)}` };
       released = true;
-      reason = `the revision for the suggestions (job ${pr.suggestJobId ?? '?'}) ended without changing ${short(sha)}`;
+      reason =
+        push.pushedSha && push.pushedSha !== sha
+          ? `the revision for the suggestions (job ${pr.suggestJobId ?? '?'}) pushed ${short(push.pushedSha)}, and ${short(sha)} is still the head of the pull request`
+          : `the revision for the suggestions (job ${pr.suggestJobId ?? '?'}) ended without changing ${short(sha)}`;
     } else {
       // No request for a head with nothing to answer: most heads.
       const login = openSuggestions(db, pr.repoId, pr.prNumber).length ? await workerLogin(deps.api) : '';

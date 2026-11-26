@@ -4,7 +4,7 @@
 // separately), so an agent is never spent on a commit nobody will merge.
 import { reviewActive, workflowId, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
-import { getLoopPr } from '../db/pr-reviews.js';
+import { getLoopPr, HEAD_LAG_GRACE_MS, ownPushReplacing } from '../db/pr-reviews.js';
 import { GitHubError, type GitHubApi, type PullRequestReviews } from '../github/api.js';
 import { reviewOf, type IssueSnapshot, type Job, type ReviewRunRequest } from '../types.js';
 
@@ -49,8 +49,22 @@ export function queuedReviewProblem(config: UpdraftConfig, db: Db, job: Job): st
 }
 
 /**
+ * GitHub's pull request still names the commit the worker's own push of `review.headSha`
+ * replaced, and that push is recent: GitHub has not caught up with it yet (#197). Not a move:
+ * canceling would leave the head the worker pushed without a review for good (its dedupe key is
+ * spent, and the worker's own push starts no event). The reason to wait, or null.
+ */
+export function laggingHead(db: Db | undefined, job: Job, review: ReviewRunRequest, githubHead: string, now: () => number = Date.now): string | null {
+  if (!db) return null;
+  const pushedAt = ownPushReplacing(db, job.repoId, review.pullRequest.number, review.headSha, githubHead);
+  if (!pushedAt || now() - Date.parse(pushedAt) >= HEAD_LAG_GRACE_MS) return null;
+  return `GitHub still shows ${short(githubHead)} as the head of pull request #${review.pullRequest.number}, the commit the worker's push of ${short(review.headSha)} (at ${pushedAt}) replaced; looked at again shortly`;
+}
+
+/**
  * Final check before the worker starts a reviewer job: the config still asks for it, and the PR
- * is still open with the commit under review as its head. One request.
+ * is still open with the commit under review as its head. One request. With `db`, a read that
+ * has not caught up with the worker's own push of that commit keeps the job queued (it rejects).
  *
  * `vouchIssue` is the issue job's own check, as for a revision: when the issue's text is no
  * longer text an allowed actor stands behind, the review still runs (the commit is what it
@@ -60,7 +74,7 @@ export function queuedReviewProblem(config: UpdraftConfig, db: Db, job: Job): st
  * failures, in which case the job stays queued.
  */
 export async function checkReviewDispatchable(
-  deps: { api: GitHubApi; config: UpdraftConfig },
+  deps: { api: GitHubApi; config: UpdraftConfig; db?: Db; now?: () => number },
   job: Job,
   vouchIssue: (original: Job) => Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }>,
 ): Promise<{ ok: true; issue?: IssueSnapshot } | { ok: false; reason: string }> {
@@ -82,7 +96,11 @@ export async function checkReviewDispatchable(
   if (pr.headRef !== review.pullRequest.branch) {
     return { ok: false, reason: `the head of pull request #${n} is ${pr.headRef}, not the published branch ${review.pullRequest.branch}` };
   }
-  if (pr.headSha !== review.headSha) return { ok: false, reason: moved(review, pr.headSha) };
+  if (pr.headSha !== review.headSha) {
+    const lag = laggingHead(deps.db, job, review, pr.headSha, deps.now);
+    if (lag) throw new Error(lag);
+    return { ok: false, reason: moved(review, pr.headSha) };
+  }
 
   const issue = await vouchIssue({ ...job, eventId: review.originalEventId });
   if (issue.ok) return issue;

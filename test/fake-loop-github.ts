@@ -337,3 +337,25 @@ export class FakeLoopGitHub {
     }) as unknown as GitHubApi;
   }
 }
+
+/**
+ * A pull request head as GitHub's REST API shows it right after a push (#197): the first `reads`
+ * reads after the branch moved still name the commit it moved from, then the new one. GitHub
+ * updates a pull request some time after the push lands, and code that reads it in between must
+ * not take that for a move. Counted in reads, not time, so a test does not depend on the machine.
+ */
+export function laggingHead(real: () => string, reads = 3): () => string {
+  let shown = '';
+  let stale = 0;
+  return () => {
+    const now = real();
+    if (now === shown) return shown;
+    if (shown && stale < reads) {
+      stale++;
+      return shown;
+    }
+    shown = now;
+    stale = 0;
+    return shown;
+  };
+}

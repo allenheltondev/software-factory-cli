@@ -11,12 +11,14 @@ import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { configSchema, suggestionMode, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { validateConfig } from '../config/validate.js';
 import { openDatabase, type Db } from '../db/database.js';
-import { getLoopPr, listCiCandidates, listMergeCandidates, observeHead, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
+import { getLoopPr, HEAD_LAG_GRACE_MS, listCiCandidates, listMergeCandidates, MAX_REVIEW_REQUEUES, observeHead, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
 import { getJob } from '../db/queue.js';
 import { getFinding, recordFindings } from '../db/review-findings.js';
 import { countRevisions } from '../db/revisions.js';
 import { GitHubError } from '../github/api.js';
 import { resolvePaths, type UpdraftPaths } from '../paths.js';
+import { checkJobDispatchable } from '../poller/poller.js';
+import { queuedReviewProblem } from '../poller/review-jobs.js';
 import { queuedRevisionProblem } from '../poller/reviews.js';
 import { suggestionsReviewId } from '../poller/review-trigger.js';
 import { revisionOf, reviewOf, type Job, type ReviewVerdict, type RunSummary } from '../types.js';
@@ -26,7 +28,7 @@ import { evaluateAutoMerges } from './merge.js';
 import type { PublishDeps } from './publish.js';
 import { createReviewLoopPublisher, postReview } from './review.js';
 import { renderStatusComment } from './status-marker.js';
-import { classify, evaluateSuggestionsAll, followUpMarker, queueSuggestions, renderFollowUp } from './suggestions.js';
+import { classify, evaluateSuggestionsAll, followUpMarker, queueSuggestions, renderFollowUp, SUGGEST_PUSH_WAIT_MS } from './suggestions.js';
 import { answerFindings } from './threads.js';
 
 const REPO_ID = 42;
@@ -479,6 +481,95 @@ describe('the suggestion step, when things go wrong', () => {
     await t.revise(job2!, { pushed: null });
     t.db.prepare("UPDATE revisions SET state = 'publishing', attempts = 5, lease_expires_at = '2099-01-01T00:00:00.000Z' WHERE job_id = ?").run(job2!);
     expect(await t.step()).toEqual([{ status: 'waiting', reason: 'the suggestion revision is being pushed' }]);
+  });
+
+  // #197: the suggestion revision pushed H2, and nothing ever reviewed it.
+  const pushedUnseen = async (repo: Record<string, unknown> = {}) => {
+    const s = setup({ repo });
+    await s.review('ready-to-merge', structured(TWO));
+    const [jobId] = s.suggestionJobs();
+    await s.revise(jobId!, { pushed: H2 });
+    // GitHub had not caught up with the push: its pull request still names H1.
+    s.push(H1);
+    return { s, jobId: jobId! };
+  };
+  const MOVED = (from: string, to: string) => `the head of pull request #${PR} moved from ${from.slice(0, 12)} to ${to.slice(0, 12)}; the new head gets its own review`;
+  const reviewJobsOf = (s: ReturnType<typeof setup>, sha: string) =>
+    s.db.prepare('SELECT id, status, event_id FROM jobs WHERE event_id LIKE ? ORDER BY created_at, rowid').all(`pr-review:${PR}:${sha}%`) as Array<{ id: string; status: string; event_id: string }>;
+
+  it('#197: a read of GitHub that has not caught up with the worker\'s own push neither moves the head back nor cancels the review of the pushed head, for a bounded time', async () => {
+    const { s } = await pushedUnseen();
+    // The push is the head on record, and its review is queued.
+    const [job] = s.schedule();
+    expect(reviewOf(job!)!.headSha).toBe(H2);
+    expect(s.pr().headSha).toBe(H2);
+    // A read right after the push still shows H1: not a move.
+    expect(observeHead(s.db, REPO_ID, PR, H1, new Date(s.tick()).toISOString())).toBe(false);
+    expect(s.pr().headSha).toBe(H2);
+    expect(queuedReviewProblem(s.config, s.db, job!)).toBeNull();
+    // The pre-start check keeps the job queued (it rejects) instead of canceling it.
+    await expect(checkJobDispatchable({ api: s.gh.api, config: s.config, db: s.db, now: s.now }, job!)).rejects.toThrow(/GitHub still shows 111111111111 .* replaced/);
+    // Past HEAD_LAG_GRACE_MS, what GitHub says is believed: the branch did move back.
+    s.tick(HEAD_LAG_GRACE_MS);
+    expect(await checkJobDispatchable({ api: s.gh.api, config: s.config, db: s.db, now: s.now }, job!)).toEqual({ ok: false, reason: MOVED(H2, H1) });
+    expect(observeHead(s.db, REPO_ID, PR, H1, new Date(s.tick()).toISOString())).toBe(true);
+    expect(s.pr().headSha).toBe(H1);
+  });
+
+  it('#197: a review of the pushed head that was canceled as "moved" while that head is the head is queued again, at most MAX_REVIEW_REQUEUES times; a cancel for any other reason is final', async () => {
+    const { s } = await pushedUnseen();
+    const [job] = s.schedule();
+    // What happened on PR #195: the pre-start check read H1 and canceled the review of H2.
+    const cancel = (id: string, reason: string) => s.db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ? WHERE id = ?").run(reason, id);
+    cancel(job!.id, MOVED(H2, H1));
+    expect(prStage(s.db, s.pr(), 3, { suggestions: true })).toMatchObject({ stage: 'needs-human', detail: expect.stringContaining(job!.id) });
+    for (let n = 1; n <= MAX_REVIEW_REQUEUES; n++) {
+      const [again] = s.schedule();
+      expect(again).toMatchObject({ eventId: `pr-review:${PR}:${H2}:requeue:${n}`, envelope: { review: { headSha: H2 } } });
+      expect(prStage(s.db, s.pr(), 3, { suggestions: true })).toMatchObject({ stage: 'awaiting-review' });
+      expect(s.schedule()).toEqual([]);
+      cancel(again!.id, MOVED(H2, H1));
+    }
+    expect(s.schedule()).toEqual([]);
+    expect(reviewJobsOf(s, H2)).toHaveLength(1 + MAX_REVIEW_REQUEUES);
+
+    // A person's cancel, or a move that was real (the head on record is not that commit), is final.
+    const { s: t } = await pushedUnseen();
+    const [other] = t.schedule();
+    t.db.prepare("UPDATE jobs SET status = 'canceled', status_reason = 'canceled by allen' WHERE id = ?").run(other!.id);
+    expect(t.schedule()).toEqual([]);
+    t.db.prepare('UPDATE jobs SET status_reason = ? WHERE id = ?').run(MOVED(H2, H3), other!.id);
+    t.push(H3);
+    observeHead(t.db, REPO_ID, PR, H3, new Date(t.tick(HEAD_LAG_GRACE_MS)).toISOString());
+    expect(t.schedule().map((j) => reviewOf(j)!.headSha)).toEqual([H3]);
+    expect(reviewJobsOf(t, H2)).toHaveLength(1);
+  });
+
+  it('#197: a suggestion revision whose push the pull request never shows is waited for at most SUGGEST_PUSH_WAIT_MS; then the head moves on, or is released to its merge', async () => {
+    // The head on record never took the push (no schedule ran): the step waits, for a while.
+    const { s } = await pushedUnseen({ notifications: 'quiet' });
+    expect(s.pr()).toMatchObject({ headSha: H1, suggestState: 'fixing' });
+    expect(await s.step()).toEqual([{ status: 'waiting', reason: `the suggestion revision pushed ${H2.slice(0, 12)}` }]);
+    s.tick(SUGGEST_PUSH_WAIT_MS - 10_000);
+    expect(await s.step()).toEqual([{ status: 'waiting', reason: `the suggestion revision pushed ${H2.slice(0, 12)}` }]);
+    expect(s.status()).toContain('**Updraft · Addressing suggestions**');
+    // Then GitHub decides. It still shows H1: the push is not on the pull request, so the
+    // suggestions are settled on H1, which goes on to its merge.
+    s.tick(10_000);
+    expect(await s.step()).toEqual([{ status: 'settled', reason: expect.stringMatching(/pushed 222222222222, and 111111111111 is still the head/) }]);
+    expect(s.status()).not.toContain('Addressing suggestions');
+    await s.mergeStep();
+    expect(s.gh.merges).toEqual([{ sha: H1, method: 'squash' }]);
+
+    // It shows H2: the pull request moves on to it, and H2 gets its review.
+    const t = (await pushedUnseen({ notifications: 'quiet' })).s;
+    t.tick(SUGGEST_PUSH_WAIT_MS);
+    t.push(H2);
+    expect(await t.step()).toEqual([{ status: 'none' }]);
+    expect(t.pr().headSha).toBe(H2);
+    expect(t.schedule().map((j) => reviewOf(j)!.headSha)).toEqual([H2]);
+    await t.mergeStep();
+    expect(t.gh.merges).toEqual([]);
   });
 
   /** follow-up mode, H1 ready with TWO and settled into issue #500; then H2 ready with one more suggestion, not settled yet. */
