@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMemoryStore, type Job } from '../store/store.js';
 import { createJobStopper, resumeJobPause, workflowIsPaused } from './stop.js';
 import { createReconciler } from './reconcile.js';
+import { createWorkflowRecorder } from '../workflows/recorder.js';
+import { createMemoryWorkflowStore } from '../workflows/store.js';
 
 describe('durable job cancellation', () => {
   let store: ReturnType<typeof createMemoryStore>;
@@ -42,6 +44,19 @@ describe('durable job cancellation', () => {
     expect(await request()).toMatchObject({ state: 'canceled', stop: { requestedAt: clock - 2000, confirmedAt: clock, by: 'pat' } });
     expect(await store.listActiveJobs()).toHaveLength(0);
     expect((await store.getJobSummary(55, job.jobId))?.stop?.confirmedAt).toBe(clock);
+  });
+  it('shows the stop on the job\'s workflow at once, and keeps it paused through the confirmed cancel', async () => {
+    const workflowStore = createMemoryWorkflowStore();
+    const workflows = createWorkflowRecorder({ store: workflowStore, now: () => clock, log: () => {} });
+    await workflows.started(job);
+    const stopper = createJobStopper({ store, workflows, terminateMicrovm: terminate, microvmState: async () => state, now: () => clock, log: () => {} });
+    await running();
+    state = 'TERMINATED';
+    expect(await stopper.request(55, job.jobId, 'pat', 'Agent is off course')).toMatchObject({ state: 'canceled' });
+    const events = await workflowStore.listWorkflowEvents(55, '9-i12', 10);
+    expect(events.map((e) => e.kind)).toEqual(['job_started', 'control', 'job_finished']);
+    expect(events[1]).toMatchObject({ control: { action: 'stop_requested', by: 'pat', reason: 'Agent is off course' } });
+    expect(await workflowStore.getWorkflow(55, '9-i12')).toMatchObject({ reason: 'workflow_paused', controlPause: { jobId: job.jobId, at: clock, previous: { reason: 'job_canceled' } } });
   });
   it('cancels a reserved job without launching, and fences a late markLaunching', async () => {
     expect(await request()).toMatchObject({ state: 'canceled' });

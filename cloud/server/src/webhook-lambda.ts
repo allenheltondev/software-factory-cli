@@ -38,7 +38,7 @@ import { createBenchmarkDispatch } from './benchmarks/dispatch.js';
 const env = process.env;
 const store = createDynamoStore(env.TABLE_NAME ?? '');
 const workflowStore = createDynamoWorkflowStore(env.TABLE_NAME ?? '');
-const workflows = createWorkflowRecorder({ store: workflowStore });
+const workflows = createWorkflowRecorder({ store: workflowStore, pauses: store });
 
 // GitHub waits 10 seconds for a webhook: one retry at most.
 const clientOptions = { maxAttempts: 2 };
@@ -326,6 +326,7 @@ const mentionHandler = createMentionHandler({
   managedIssue: async (installationId, repositoryId, issue) =>
     (await workflowStore.getWorkflow(installationId, `${repositoryId}-i${issue}`)) !== null || (await store.getWorkflowPause(installationId, repositoryId, issue)) !== null,
   ...(consoleOrigin ? { consoleOrigin } : {}),
+  workflows,
 });
 
 async function resumeClaude(installationId: number) {
