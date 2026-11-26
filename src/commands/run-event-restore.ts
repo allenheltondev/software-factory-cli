@@ -34,6 +34,8 @@ export type OwnPullRequestAnswer =
 
 const MARKER = /<!-- updraft-run: (run_[0-9a-z]+) -->/;
 const OPENED_BY = /Opened by updraft from run `(run_[0-9a-z]+)` \(agent ([^)\r\n]+)\)/;
+/** The agent, as publication names it beside the marker since the body stopped carrying an "Opened by" line (#173). */
+const AGENT_MARKER = /<!-- updraft-agent: (run_[0-9a-z]+) ([A-Za-z0-9_.-]{1,64}) -->/;
 
 /**
  * Ask GitHub whether pull request `prNumber` is one Updraft opened. Two requests at most (the
@@ -55,7 +57,7 @@ export async function readOwnPullRequest(api: Pick<GitHubApi, 'getPullRequest' |
   if (!runId) return { kind: 'not-ours', why: 'its body does not carry the marker of the run that opened it' };
   const identity = await api.getWorkerIdentity();
   if (!isWorkerLogin(identity, pr.author)) return { kind: 'not-ours', why: `it was opened by ${pr.author ?? 'an unknown account'}, not by ${identity.login}` };
-  const opened = OPENED_BY.exec(pr.body ?? '');
+  const opened = AGENT_MARKER.exec(pr.body ?? '') ?? OPENED_BY.exec(pr.body ?? '');
   return { kind: 'ours', own: { pr, runId, agent: opened && opened[1] === runId ? opened[2]!.trim() : null } };
 }
 

@@ -145,6 +145,7 @@ function vm(w: World, name: string, o: { mode?: string; agentMode?: string; payl
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
+        notifications: 'verbose',
         commentOnFailure: true,
         workflows: [{ id: 'wf', trigger: { event: 'issue.labeled', label: LABEL }, action: 'implement-issue', pool: 'general' }],
         ...o.repo,

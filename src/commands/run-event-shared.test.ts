@@ -166,6 +166,7 @@ function vm(w: World, name: string, o: VmOptions = {}) {
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
+        notifications: 'verbose',
         ...o.repo,
         workflows: [{ id: 'wf', trigger: { event: 'issue.labeled', label: LABEL }, action: 'implement-issue', pool: 'general', reviewPool: 'reviewers' }],
       },
@@ -977,7 +978,7 @@ describe('updraft run-event: review findings', { timeout: 180_000 }, () => {
     for (const [name, change, said] of [
       ['no marker', (w: World) => (w.gh.pullBody = 'Closes #7'), 'marker'],
       ['another author', (w: World) => (w.gh.pullAuthor = 'mallory'), 'opened by mallory'],
-      ['no agent', (w: World) => (w.gh.pullBody = w.gh.pullBody.replace(/\(agent [^)]*\)/, '')), 'agent'],
+      ['no agent', (w: World) => (w.gh.pullBody = w.gh.pullBody.replace(/<!-- updraft-agent: [^>]* -->/, '')), 'agent'],
     ] as const) {
       const { w } = await lostState({ revise: true });
       change(w);
