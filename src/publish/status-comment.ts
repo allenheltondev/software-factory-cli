@@ -12,6 +12,8 @@ import { notificationMode, type UpdraftConfig } from '../config/schema.js';
 import { GitHubError, type GitHubApi, type GitHubIssueComment } from '../github/api.js';
 import { GitHubAppError } from '../github/app-auth.js';
 import { sameLogin, workerLogin } from '../github/identity.js';
+import type { Db } from '../db/database.js';
+import { getLoopPr } from '../db/pr-reviews.js';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
 import { findRepoConfig } from '../worker/executor.js';
@@ -59,6 +61,9 @@ export interface StatusWrite {
   link?: string | null;
   /** The pull request, once there is one; undefined keeps what the comment names. */
   pr?: number;
+  /** Review-loop stages: the head the stage is about, and whether it is the pull request's newest (mayReplace). */
+  sha?: string;
+  latest?: boolean;
 }
 
 export type StatusWriteResult =
@@ -87,12 +92,12 @@ interface Found {
 }
 
 /** The status comment a write is about, among the issue's comments (oldest first), or null. */
-export function findStatusComment(comments: readonly GitHubIssueComment[], target: StatusTarget, login: string | null): Found | null {
+export function findStatusComment(comments: readonly GitHubIssueComment[], target: StatusTarget, login: string): Found | null {
   const own: Found[] = [];
   for (const c of comments) {
     const mark = parseStatusMarker(c.body);
     // Only the worker's own: anyone can type a marker into a comment.
-    if (mark && (login === null || sameLogin(c.user, login))) own.push({ comment: c, mark });
+    if (mark && sameLogin(c.user, login)) own.push({ comment: c, mark });
   }
   const newest = (list: Found[]) => list[list.length - 1] ?? null;
   if ('keys' in target) {
@@ -121,9 +126,10 @@ export async function writeStatusComment(deps: StatusDeps, w: StatusWrite): Prom
 }
 
 async function writeOnce(deps: StatusDeps, w: StatusWrite): Promise<StatusWriteResult> {
-  const login = await workerLogin(deps.api).catch(() => null);
+  // Fails closed: without the worker's own login, anyone's comment could pass for the status comment.
+  const login = await workerLogin(deps.api);
   const found = findStatusComment(await deps.api.listIssueComments(w.repo, w.issue), w.target, login);
-  if (found && !mayReplace(found.mark, w.stage)) {
+  if (found && !mayReplace(found.mark, w.stage, { ...(w.sha ? { sha: w.sha } : {}), ...(w.latest !== undefined ? { latest: w.latest } : {}) })) {
     return { status: 'skipped', comment: found.comment, reason: `the comment shows a later stage (${found.mark.stage})` };
   }
   if (!found && !('keys' in w.target && w.target.create)) return { status: 'none' };
@@ -135,7 +141,8 @@ async function writeOnce(deps: StatusDeps, w: StatusWrite): Promise<StatusWriteR
     text: w.text,
     details: w.details === undefined ? statusDetails(prev) : w.details,
     link: w.link === undefined ? statusLink(prev) : w.link,
-    mark: { key, stage: w.stage, ...(pr !== undefined ? { pr } : {}) },
+    // A review-loop stage names its head; any other keeps none (a new stage of the run starts over).
+    mark: { key, stage: w.stage, ...(pr !== undefined ? { pr } : {}), ...(w.sha && w.stage >= STATUS_STAGE.loop && w.stage < FINAL_STAGE ? { sha: w.sha.slice(0, 40) } : {}) },
   });
   if (found) {
     if (found.comment.body === body) return { status: 'unchanged', comment: found.comment };
@@ -158,3 +165,14 @@ export async function noteStatus(deps: StatusDeps, w: StatusWrite): Promise<Stat
 
 /** Short SHA for a status line. */
 export const shortSha = (sha: string) => sha.slice(0, 7);
+
+/** Whether `sha` is the newest head the worker's records have for the pull request (true when they have none). */
+export function isLatestHead(db: Db, repoId: number, prNumber: number, sha: string | null | undefined): boolean {
+  if (!sha) return false;
+  try {
+    const head = getLoopPr(db, repoId, prNumber)?.headSha;
+    return !head || head.startsWith(sha) || sha.startsWith(head);
+  } catch {
+    return false;
+  }
+}

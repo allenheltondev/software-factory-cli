@@ -128,7 +128,8 @@ pull request appears only when the step stops and needs a person: the revision b
 the failure isn't one the code can fix, CI repair is off, or the fixed head passed and merging is
 up to a person. It names the reason and the next step in one or two sentences, lists the failed
 checks, and links the console when hosted; the status comment says `Waiting for a person`. The
-coding agent's reply to its revision stays, as below.
+CI fix's own revision posts no reply on the pull request either (no claim, no "Coding agent ·
+pushed" comment); replies in human review threads stay.
 
 With `notifications: verbose`, on the pull request, one comment per head, headed **Updraft · CI** and the commit, says that a
 fix was queued (which checks failed, each linked to its run on GitHub even when its log could

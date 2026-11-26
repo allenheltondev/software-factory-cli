@@ -27,7 +27,12 @@ import type { Logger } from '../util/log.js';
 import { consoleJobUrl, consoleWorkflowUrl, type ConsoleContext } from './console-link.js';
 import { CLI_DEFAULT, NOT_APPLICABLE, runDetails, UNKNOWN, type RunDetails } from './run-details.js';
 import { countRevisions } from '../db/revisions.js';
-import { quietFor, shortSha, writeStatusComment, type StatusWrite } from './status-comment.js';
+import { isLatestHead, quietFor, shortSha, writeStatusComment, type StatusWrite } from './status-comment.js';
+import { getPublication } from '../db/publications.js';
+import { dependencyRef, getDependencyWait } from '../db/dependency-waits.js';
+import { ownEntry } from '../db/queue.js';
+import { findRepoConfig } from '../worker/executor.js';
+import { publishMode } from '../config/schema.js';
 import { STATUS_STAGE, statusLinkLine } from './status-marker.js';
 
 /** Writes tried per assignment (the first plus retries of transient failures). */
@@ -58,7 +63,30 @@ export interface AssignmentCommenter {
    * status comment off "Assigned", so it never says a worker is on an issue nobody works on.
    * Never throws.
    */
-  ended?(job: Job, run: Run, signal?: AbortSignal): Promise<void>;
+  ended?(job: Job, run: Run, signal?: AbortSignal, why?: 'failed' | 'canceled'): Promise<void>;
+  /**
+   * After an implementation run succeeded and its publication step ran: quiet notifications say
+   * how it rests when no pull request came of it (no commits, publication off, a dependency
+   * wait, a publication that will not be retried). Never throws.
+   */
+  finished?(job: Job, run: Run, signal?: AbortSignal): Promise<void>;
+}
+
+/** What the status comment says of a succeeded run that opened no pull request; null when it did, or still may. */
+export function finishedStatus(db: Db, config: UpdraftConfig, job: Job, run: Run): { title: string; text: string } | null {
+  const pub = getPublication(db, run.id);
+  if (pub?.prNumber) return null;
+  const wait = getDependencyWait(db, run.id);
+  if (wait) return { title: 'Waiting', text: `The run waits on ${dependencyRef(wait)}; Updraft continues once it is merged.` };
+  if (pub?.state === 'skipped') return { title: 'Finished', text: 'Finished without a pull request: the run made no changes to publish.' };
+  if (pub?.state === 'failed' && !pub.retryable) return { title: 'Stopped', text: 'The pull request could not be opened; the job says why, and how to publish it.' };
+  if (pub) return null; // published, or a retry is due
+  const found = findRepoConfig(config, job);
+  if (found && publishMode(found.repo) === 'none') return { title: 'Finished', text: 'Finished without a pull request: publishing is off for this repository, so the work stays on its local branch.' };
+  const action = ownEntry(config.actions, job.action);
+  if (action && action.output !== 'local-branch') return { title: 'Finished', text: 'Finished; this action opens no pull request.' };
+  if ((run.summary?.commitCount ?? 0) === 0) return { title: 'Finished', text: 'Finished without a pull request: the run made no changes to publish.' };
+  return null;
 }
 
 /** Hidden marker on the assignment comment; finds it again on a retry. Distinct from the others. */
@@ -165,6 +193,8 @@ export function assignmentStatus(db: Db, job: Job, run: Run, ctx?: ConsoleContex
       issue: job.issueNumber,
       target: { pr: review.pullRequest.number },
       stage: STATUS_STAGE.loop,
+      sha: review.headSha,
+      latest: isLatestHead(db, job.repoId, review.pullRequest.number, review.headSha),
       title: 'Reviewing',
       text: `Reviewing PR #${review.pullRequest.number} at \`${shortSha(review.headSha)}\` (review round ${round}).`,
     };
@@ -178,6 +208,7 @@ export function assignmentStatus(db: Db, job: Job, run: Run, ctx?: ConsoleContex
         issue: job.issueNumber,
         target: { pr },
         stage: STATUS_STAGE.loop,
+        ...(sha ? { sha, latest: isLatestHead(db, job.repoId, pr, sha) } : {}),
         title: 'Fixing checks',
         text: sha ? `Fixing failed checks on \`${shortSha(sha)}\` of PR #${pr}.` : `Fixing failed checks of PR #${pr}.`,
       };
@@ -188,7 +219,8 @@ export function assignmentStatus(db: Db, job: Job, run: Run, ctx?: ConsoleContex
     } catch {
       // the round is decoration
     }
-    return { repo, issue: job.issueNumber, target: { pr }, stage: STATUS_STAGE.loop, title: 'Revising', text: `Revising PR #${pr} for review round ${round}.` };
+    const sha = revision.reviewedSha;
+    return { repo, issue: job.issueNumber, target: { pr }, stage: STATUS_STAGE.loop, ...(sha ? { sha, latest: isLatestHead(db, job.repoId, pr, sha) } : {}), title: 'Revising', text: `Revising PR #${pr} for review round ${round}.` };
   }
   return {
     repo,
@@ -283,22 +315,59 @@ export function createAssignmentCommenter(deps: AssignmentCommentDeps): Assignme
         }
       }
     },
-    async ended(job, run, signal) {
+    async ended(job, run, signal, why = 'failed') {
+      if (deps.config.execution.mode !== 'live' || !quietFor(deps.config, job)) return;
+      const log = deps.log.child({ runId: run.id, jobId: job.id, repo: job.repoFullName, issue: job.issueNumber });
+      const repo = { id: job.repoId, fullName: job.repoFullName };
+      const review = reviewOf(job);
+      const revision = revisionOf(job);
+      let w: StatusWrite;
+      if (review || revision) {
+        // A review-loop job that will not finish: the loop rests until a person acts.
+        const pr = (review ?? revision)!.pullRequest.number;
+        const sha = review ? review.headSha : revision!.reviewedSha;
+        const what = review ? 'review' : 'revision';
+        w = {
+          repo,
+          issue: job.issueNumber,
+          target: { pr },
+          stage: STATUS_STAGE.person,
+          ...(sha ? { sha, latest: isLatestHead(deps.db, job.repoId, pr, sha) } : {}),
+          title: why === 'canceled' ? 'Stopped' : 'Waiting for a person',
+          text: why === 'canceled'
+            ? `The ${what} job for PR #${pr} was canceled.`
+            : `The ${what} job for PR #${pr} stopped without finishing; retry it from the job page, or push a commit for a new review.`,
+        };
+      } else {
+        // Edit only: a run that never got its comment out has nothing to take back. Stage
+        // "assigned", so a retry's assignment replaces it.
+        w = {
+          repo,
+          issue: job.issueNumber,
+          target: { keys: statusKeys(job, deps.console), create: false },
+          stage: STATUS_STAGE.assigned,
+          title: 'Stopped',
+          text: why === 'canceled'
+            ? 'The run was canceled before it opened a pull request.'
+            : 'The run ended without opening a pull request. The job says why, and can be retried from there.',
+        };
+      }
+      try {
+        const r = await writeStatusComment({ api: deps.api, log, sleep: (ms) => sleep(ms, signal) }, w);
+        if (r.status !== 'none') log.info(`status comment ${r.status}`, { comment: r.comment.htmlUrl });
+      } catch (err) {
+        log.warn('status comment not updated', { error: message(err) });
+      }
+    },
+    async finished(job, run, signal) {
       if (deps.config.execution.mode !== 'live' || reviewOf(job) || revisionOf(job) || !quietFor(deps.config, job)) return;
       const log = deps.log.child({ runId: run.id, jobId: job.id, repo: job.repoFullName, issue: job.issueNumber });
       try {
-        // Edit only: a run that never got its comment out has nothing to take back. Stage
-        // "assigned", so a retry's assignment replaces it.
+        const status = finishedStatus(deps.db, deps.config, job, run);
+        if (!status) return;
         const r = await writeStatusComment(
           { api: deps.api, log, sleep: (ms) => sleep(ms, signal) },
-          {
-            repo: { id: job.repoId, fullName: job.repoFullName },
-            issue: job.issueNumber,
-            target: { keys: statusKeys(job, deps.console), create: false },
-            stage: STATUS_STAGE.assigned,
-            title: 'Stopped',
-            text: 'The run ended without opening a pull request. The job says why, and can be retried from there.',
-          },
+          { repo: { id: job.repoId, fullName: job.repoFullName }, issue: job.issueNumber, target: { keys: statusKeys(job, deps.console), create: false }, stage: STATUS_STAGE.assigned, ...status },
         );
         if (r.status !== 'none') log.info(`status comment ${r.status}`, { comment: r.comment.htmlUrl });
       } catch (err) {

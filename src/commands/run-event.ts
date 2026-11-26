@@ -1125,7 +1125,8 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
         announcements.add(p);
         return p;
       },
-      ended: (job, run, signal) => announcer.ended?.(job, run, signal) ?? Promise.resolve(),
+      ended: (job, run, signal, why) => announcer.ended?.(job, run, signal, why) ?? Promise.resolve(),
+      finished: (job, run, signal) => announcer.finished?.(job, run, signal) ?? Promise.resolve(),
     };
     const appAuth = credentials.app;
     const startedAt = Date.now();

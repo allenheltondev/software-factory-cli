@@ -8,7 +8,8 @@ import { createAssignmentCommenter, renderStatusTable } from './assignment-comme
 import { capWholeBlocks, stripMachineBlocks } from './markdown.js';
 import { renderQuietCiNotice } from './ci.js';
 import { renderQuietMergeBlockedNotice } from './merge.js';
-import { mergePolicy, mergeSentence, renderPrBody } from './publish.js';
+import { mergePolicy, mergeSentence, renderPrBody, withMergeSentence } from './publish.js';
+import { verdictStatus } from './review.js';
 import { renderRevisionReply } from './revision.js';
 import { findStatusComment, writeStatusComment, type StatusWrite } from './status-comment.js';
 import { mayReplace, parseStatusMarker, renderStatusComment, STATUS_STAGE, statusDetails, statusLink, statusMarker } from './status-marker.js';
@@ -352,7 +353,7 @@ describe('the PR body', () => {
     const on = repoCfg({ autoMerge: 'squash' });
     const auto = mergePolicy(on.config, on.repo, { mode: 'pr', verifies: true, summary: passed });
     expect(auto).toEqual({ auto: true, method: 'squash' });
-    expect(mergeSentence(auto)).toBe('Updraft merges this (`squash`) once review and checks pass.');
+    expect(mergeSentence(auto)).toBe('Updraft merges this (`squash`) once review and required checks pass.');
 
     const off = repoCfg({});
     expect(mergeSentence(mergePolicy(off.config, off.repo, { mode: 'pr', verifies: false, summary: passed }))).toBe('Merging is up to a person.');
@@ -370,7 +371,7 @@ describe('the PR body', () => {
     expect(mergePolicy(noReview.config, noReview.repo, { mode: 'pr', verifies: false, summary: passed }).auto).toBe(false);
 
     const body = renderPrBody({ runId: 'run_x', issueNumber: 3, agent: 'claude', commitCount: 1, mode: 'pr', summary: passed, merge: auto, link: 'https://u.example/installations/9/workflows/1-i3' });
-    expect(body).toMatch(/^Closes #3\n\nUpdraft merges this \(`squash`\) once review and checks pass\. \[View this work in Updraft\]\(https:\/\/u\.example\/installations\/9\/workflows\/1-i3\)/);
+    expect(body).toMatch(/^Closes #3\n\n<!-- updraft-merge -->Updraft merges this \(`squash`\) once review and required checks pass\.<!-- \/updraft-merge --> \[View this work in Updraft\]\(https:\/\/u\.example\/installations\/9\/workflows\/1-i3\)/);
     expect(body).not.toContain('Merging is up to a person');
   });
 });
@@ -410,9 +411,98 @@ describe('the CI step (quiet)', () => {
 describe('the revision reply', () => {
   it('states the merge Updraft will attempt, like the PR body', () => {
     const base = { runId: 'run_v', agent: 'claude', review: { id: 1, author: 'bob', url: 'https://github.com/o/r/pull/1#r', body: '', state: 'CHANGES_REQUESTED', submittedAt: null, comments: [] } as never, summary: summary(['Fixed.']), commitCount: 1 };
-    expect(renderRevisionReply({ ...base, merge: { auto: true, method: 'squash' } })).toContain('Updraft merges it (`squash`) once review and checks pass.');
+    expect(renderRevisionReply({ ...base, merge: { auto: true, method: 'squash' } })).toContain('Updraft merges it (`squash`) once review and required checks pass.');
     expect(renderRevisionReply({ ...base, merge: { auto: true, method: 'squash' } })).not.toContain('up to a person');
     expect(renderRevisionReply(base)).toContain('Review it before merging; merging is up to a person.');
     expect(renderRevisionReply({ ...base, merge: { auto: false, reason: "the worker's verify commands did not pass on this commit" } })).toContain("merging is up to a person: the worker's verify commands did not pass on this commit.");
+  });
+});
+
+describe('review of #181: truthful at every resting point', () => {
+  it('a review-loop stage never replaces one about a newer head, and a late "at work" write never replaces a resting one', () => {
+    const at = (stage: number, sha: string) => ({ key: 'k', stage, sha });
+    const H1 = 'a'.repeat(40);
+    const H2 = 'b'.repeat(40);
+    // A late write about H1 after H2 was said: refused unless H1 is (still) the newest head.
+    expect(mayReplace(at(STATUS_STAGE.loop, H2), STATUS_STAGE.loop, { sha: H1, latest: false })).toBe(false);
+    expect(mayReplace(at(STATUS_STAGE.person, H2), STATUS_STAGE.person, { sha: H1, latest: false })).toBe(false);
+    // A new head moves it on, resting or not.
+    expect(mayReplace(at(STATUS_STAGE.person, H1), STATUS_STAGE.loop, { sha: H2, latest: true })).toBe(true);
+    // On one head: resting wins over a late "at work"; a prefix is the same head.
+    expect(mayReplace(at(STATUS_STAGE.person, H1), STATUS_STAGE.loop, { sha: H1.slice(0, 7), latest: true })).toBe(false);
+    expect(mayReplace(at(STATUS_STAGE.loop, H1), STATUS_STAGE.person, { sha: H1, latest: true })).toBe(true);
+    // Merged or closed by anyone is the last word.
+    expect(mayReplace({ key: 'k', stage: STATUS_STAGE.final }, STATUS_STAGE.person, { sha: H2, latest: true })).toBe(false);
+    expect(parseStatusMarker(statusMarker({ key: 'k', stage: 60, pr: 3, sha: H1 }))).toEqual({ key: 'k', stage: 60, pr: 3, sha: H1 });
+  });
+
+  it('after each verdict, the stage that is true', () => {
+    const repo = (over: Record<string, unknown>) => {
+      const c = configSchema.parse({ version: 1, agents: { claude: {} }, pools: { general: { agents: ['claude'] } }, actions: { 'implement-issue': { prompt: './p.md' } }, dispatch: { allowedActors: ['allen'] }, execution: { mode: 'live' }, repositories: { 'owner/repo': { id: 1, publish: 'pr', review: true, revise: true, workflows: [{ trigger: { event: 'issue.labeled', label: 'ready' }, action: 'implement-issue', pool: 'general' }], ...over } } });
+      return [c, c.repositories['owner/repo']!] as const;
+    };
+    const [c, r] = repo({});
+    const sha = 'c'.repeat(40);
+    expect(verdictStatus(c, r, 'ready', 12, sha)).toMatchObject({ stage: STATUS_STAGE.person, title: 'Ready for a person to merge' });
+    expect(verdictStatus(...repo({ autoMerge: 'squash' }), 'ready', 12, sha)).toMatchObject({ stage: STATUS_STAGE.loop, title: 'Ready to merge' });
+    expect(verdictStatus(...repo({ autoMerge: 'squash', ciFix: true }), 'ready', 12, sha)).toMatchObject({ stage: STATUS_STAGE.loop, title: 'Waiting for checks' });
+    expect(verdictStatus(c, r, 'revision-queued', 12, sha)).toMatchObject({ stage: STATUS_STAGE.loop, title: 'Changes requested' });
+    expect(verdictStatus(c, r, 'no-revise', 12, sha)).toMatchObject({ stage: STATUS_STAGE.person, text: expect.stringMatching(/up to a person/) });
+    expect(verdictStatus(c, r, 'over-limit', 12, sha)).toMatchObject({ stage: STATUS_STAGE.person, title: 'Revision limit reached' });
+    expect(verdictStatus(c, r, 'needs-verification', 12, sha)).toMatchObject({ stage: STATUS_STAGE.person });
+    expect(verdictStatus(c, r, 'stale', 12, sha)).toBeNull();
+    expect(verdictStatus(c, r, 'closed', 12, sha)).toBeNull();
+  });
+
+  it('a succeeded run with no pull request, and a canceled one, do not stay "Assigned"', async () => {
+    // publish is not set here: the work stays on its local branch.
+    const { api, c } = commenter();
+    await c.announce(job('job_1'), run('run_1'));
+    await c.finished!(job('job_1'), { ...run('run_1'), summary: { commitCount: 2 } } as unknown as Run);
+    expect(api.comments[0]!.body).toContain('**Updraft · Finished**');
+    expect(api.comments[0]!.body).toContain('publishing is off for this repository');
+    const other = commenter();
+    await other.c.announce(job('job_1'), run('run_1'));
+    await other.c.ended!(job('job_1'), run('run_1'), undefined, 'canceled');
+    expect(other.api.comments[0]!.body).toContain('**Updraft · Stopped**');
+    expect(other.api.comments[0]!.body).toContain('canceled');
+  });
+
+  it('a review job that fails rests the loop on a person', async () => {
+    const { api, c } = commenter();
+    await c.announce(job('job_1'), run('run_1'));
+    await writeStatusComment(deps(api), write({ target: { keys: ['job_1'], create: true }, stage: STATUS_STAGE.published, pr: 12 }));
+    await c.announce(reviewJob(), run('run_r'));
+    await c.ended!(reviewJob(), run('run_r'));
+    expect(api.comments[0]!.body).toContain('**Updraft · Waiting for a person**');
+    expect(parseStatusMarker(api.comments[0]!.body)).toMatchObject({ stage: STATUS_STAGE.person, sha: 'abcdef1234567' });
+  });
+
+  it('fails closed when the worker login is unknown: no comment is taken for the status comment, and none is posted', async () => {
+    const api = new FakeIssue();
+    api.getWorkerIdentity = async () => {
+      throw new GitHubError('forbidden', 403);
+    };
+    await expect(writeStatusComment(deps(api), write({ target: { keys: ['j'], create: true }, stage: 30 }))).rejects.toThrow();
+    expect(api.comments).toEqual([]);
+  });
+
+  it('strips every block the readers read: any case, any indent, nested in another fence', () => {
+    const text = ['Done.', '  ```UPDRAFT-ACCEPTANCE', '  [{"criterion":"AC-1"}]', '  ```', '````md', 'example:', '~~~updraft-findings', '{"x":1}', '~~~', '````', 'End.'].join('\n');
+    const out = stripMachineBlocks(text);
+    expect(out).not.toMatch(/criterion|updraft-findings|"x"/i);
+    expect(out).toContain('````md\nexample:\n````');
+  });
+
+  it('restates the merge sentence of a PR body for a new head, and keeps the agent line for a name the marker cannot carry', () => {
+    const body = renderPrBody({ runId: 'run_x', issueNumber: 3, agent: 'claude', commitCount: 1, mode: 'draft-pr', summary: summary([]) });
+    expect(body).toContain('Merging is up to a person. Opened as a draft.');
+    const next = withMergeSentence(body, { auto: true, method: 'squash' })!;
+    expect(next).toContain('Updraft merges this (`squash`) once review and required checks pass. Opened as a draft.');
+    expect(withMergeSentence(next, { auto: true, method: 'squash' })).toBeNull();
+    expect(withMergeSentence('Closes #3\n\nold body', { auto: true, method: 'squash' })).toBeNull();
+    const odd = renderPrBody({ runId: 'run_x', issueNumber: 3, agent: 'claude (opus)', commitCount: 1, mode: 'pr', summary: summary([]) });
+    expect(odd).toContain('Opened by updraft from run `run_x` (agent claude (opus)).');
+    expect(odd).not.toContain('updraft-agent:');
   });
 });

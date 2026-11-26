@@ -349,6 +349,11 @@ export async function evaluateCi(deps: CiDeps, repo: RepoRef, cfg: RepositoryCon
       }
       setCiState(db, pr.repoId, pr.prNumber, sha, { state: 'passed', reason: verdict.reason }, now);
       log.info('checks passed', { reason: verdict.reason });
+      // A pass with no fix before it gets no CI comment (postCiNotices): the status says it.
+      if (pr.ciFixes === 0 && quietFor(deps.config, { repoId: pr.repoId, repoFullName: repo.fullName })) {
+        const status = ciStatus({ ciState: 'passed', ciFixes: 0, prNumber: pr.prNumber }, sha, autoMergeMethod(deps.config, cfg));
+        if (status) await noteStatus({ api, log }, { repo, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: true, ...status });
+      }
       return { status: 'passed', reason: verdict.reason };
     }
 
@@ -589,14 +594,15 @@ export function renderQuietCiNotice(o: { pr: LoopPr; sha: string; failed?: reado
 }
 
 /** The status comment's line for a head's CI step (quiet notifications). */
-function ciStatus(pr: LoopPr, sha: string, merge: MergeMethod | null): { title: string; text: string } | null {
-  if (pr.ciState === 'fixing') return { title: 'Fixing checks', text: `Fixing failed checks on \`${shortSha(sha)}\` of PR #${pr.prNumber} (CI fix ${pr.ciFixes}).` };
+function ciStatus(pr: Pick<LoopPr, 'ciState' | 'ciFixes' | 'prNumber'>, sha: string, merge: MergeMethod | null): { stage: number; title: string; text: string } | null {
+  const after = pr.ciFixes > 0 ? ` after CI fix ${pr.ciFixes}` : '';
+  if (pr.ciState === 'fixing') return { stage: STATUS_STAGE.loop, title: 'Fixing checks', text: `Fixing failed checks on \`${shortSha(sha)}\` of PR #${pr.prNumber} (CI fix ${pr.ciFixes}).` };
   if (pr.ciState === 'passed') {
     return merge
-      ? { title: 'Checks passed', text: `Checks passed on \`${shortSha(sha)}\` of PR #${pr.prNumber} after CI fix ${pr.ciFixes}; Updraft merges it once nothing else stands in the way.` }
-      : { title: 'Waiting for a person', text: `Checks passed on \`${shortSha(sha)}\` of PR #${pr.prNumber} after CI fix ${pr.ciFixes}; it is ready for a person to merge.` };
+      ? { stage: STATUS_STAGE.loop, title: 'Checks passed', text: `Checks passed on \`${shortSha(sha)}\` of PR #${pr.prNumber}${after}; Updraft merges it once nothing else stands in the way.` }
+      : { stage: STATUS_STAGE.person, title: 'Ready for a person to merge', text: `Checks passed on \`${shortSha(sha)}\` of PR #${pr.prNumber}${after}; it is ready for a person to merge.` };
   }
-  if (pr.ciState === 'blocked') return { title: 'Waiting for a person', text: `The checks of PR #${pr.prNumber} need a person (see the PR).` };
+  if (pr.ciState === 'blocked') return { stage: STATUS_STAGE.person, title: 'Waiting for a person', text: `The checks of PR #${pr.prNumber} need a person (see the PR).` };
   return null;
 }
 
@@ -633,7 +639,7 @@ export async function postCiNotices(deps: CiDeps, signal?: AbortSignal): Promise
       const merge = autoMergeMethod(deps.config, found.repo);
       if (quietFor(deps.config, { repoId: pr.repoId, repoFullName: found.fullName })) {
         const status = ciStatus(pr, sha, merge);
-        if (status) await noteStatus({ api: deps.api, log: deps.log }, { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, stage: STATUS_STAGE.loop, ...status });
+        if (status) await noteStatus({ api: deps.api, log: deps.log }, { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, sha, latest: pr.headSha === sha, ...status });
         const body = renderQuietCiNotice({
           pr,
           sha,

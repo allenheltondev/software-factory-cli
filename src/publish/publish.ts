@@ -411,7 +411,8 @@ export function mergePolicy(
 }
 
 export function mergeSentence(p: MergePolicy): string {
-  if (p.auto) return `Updraft merges this (${code(p.method)}) once review and checks pass.`;
+  // Branch protection and the required checks still decide: Updraft only ever asks GitHub to merge.
+  if (p.auto) return `Updraft merges this (${code(p.method)}) once review and required checks pass.`;
   return p.reason ? `Merging is up to a person: ${p.reason}.` : 'Merging is up to a person.';
 }
 
@@ -427,18 +428,44 @@ export function renderPrBody(o: {
   /** The run's console timeline, when hosted. */
   link?: string | null;
 }): string {
-  const where = o.link ? `[View this work in Updraft](${o.link})` : `Run ${code(o.runId)}, agent ${code(inline(o.agent))}.`;
+  const markable = /^[A-Za-z0-9_.-]{1,64}$/.test(o.agent);
+  // An agent name the hidden marker cannot carry keeps the line a lost-state restore reads instead.
+  const where = o.link
+    ? `[View this work in Updraft](${o.link})${markable ? '' : ` Opened by updraft from run ${code(o.runId)} (agent ${inline(o.agent)}).`}`
+    : markable ? `Run ${code(o.runId)}, agent ${code(inline(o.agent))}.` : `Opened by updraft from run ${code(o.runId)} (agent ${inline(o.agent)}).`;
   const body = [
     `Closes #${o.issueNumber}`,
     '',
-    `${mergeSentence(o.merge ?? { auto: false, reason: null })}${o.mode === 'draft-pr' ? ' Opened as a draft.' : ''} ${where}`,
+    `${mergeSection(o.merge ?? { auto: false, reason: null }, o.mode)} ${where}`,
     '',
     ...renderRunResult(o.summary, o.commitCount),
   ].join('\n');
   // The agent beside the run's marker: what a run that lost its state reads back (run-event-restore.ts).
-  const agent = /^[A-Za-z0-9_.-]{1,64}$/.test(o.agent) ? `\n${prAgentMarker(o.runId, o.agent)}` : '';
+  const agent = markable ? `\n${prAgentMarker(o.runId, o.agent)}` : '';
   const marker = `${publicationMarker(o.runId)}${agent}`;
   return `${cap(body, MAX_BODY - marker.length - 2)}\n\n${marker}`;
+}
+
+const MERGE_OPEN = '<!-- updraft-merge -->';
+const MERGE_CLOSE = '<!-- /updraft-merge -->';
+
+/** The PR body's merge sentence, between markers so a later verified head can restate it. */
+function mergeSection(p: MergePolicy, mode: 'draft-pr' | 'pr'): string {
+  return `${MERGE_OPEN}${mergeSentence(p)}${mode === 'draft-pr' ? ' Opened as a draft.' : ''}${MERGE_CLOSE}`;
+}
+
+/**
+ * `body` with its merge sentence restated for `p` (a revision or CI fix pushed a new head, which
+ * its own verification is about). Null when the body has no merge section (opened before #173),
+ * or nothing changes.
+ */
+export function withMergeSentence(body: string, p: MergePolicy): string | null {
+  const start = body.indexOf(MERGE_OPEN);
+  const end = body.indexOf(MERGE_CLOSE, start);
+  if (start < 0 || end < 0) return null;
+  const draft = body.slice(start, end).includes(' Opened as a draft.') ? ' Opened as a draft.' : '';
+  const next = `${body.slice(0, start)}${MERGE_OPEN}${mergeSentence(p)}${draft}${body.slice(end)}`;
+  return next === body ? null : next;
 }
 
 /** Hidden marker naming the agent of the run that opened a pull request. */

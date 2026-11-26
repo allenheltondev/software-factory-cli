@@ -950,6 +950,10 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
       return mapPull(res.data!);
     },
 
+    async updatePullRequestBody(repo, pullNumber, body) {
+      await request<RawPullRequest>(`${repoPath(repo)}/pulls/${pullNumber}`, { method: 'PATCH', body: { body } });
+    },
+
     async listIssueComments(repo, issueNumber) {
       const raw = await paginate<RawComment>(`${repoPath(repo)}/issues/${issueNumber}/comments`);
       return raw.map(mapComment);

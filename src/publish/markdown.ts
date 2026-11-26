@@ -80,8 +80,13 @@ export function safeMarkdown(text: string, max: number): string {
   return out.map((l) => (l ? `> ${l}` : '>')).join('\n');
 }
 
-/** The info strings of the agents' machine-readable blocks: the worker reads them, people don't. */
-const MACHINE_BLOCK = /^ {0,3}(`{3,}|~{3,})[ \t]*(updraft-acceptance|updraft-findings)\b/;
+/**
+ * An opening line of the agents' machine-readable blocks, as the worker's readers find them
+ * (agents/acceptance.ts readAcceptanceReport, agents/findings.ts): any indent, any case, wherever
+ * the line is, even inside another fence. Matched a little more widely than they read them (words
+ * after the tag), so that nothing one of them reads is ever left in.
+ */
+const MACHINE_OPEN = /^\s*(`{3,}|~{3,})\s*updraft-(?:acceptance|findings)\b.*$/i;
 const fenceOpen = (line: string): { char: string; len: number } | null => {
   const open = FENCE_OPEN.exec(line);
   if (!open || (open[1]![0] === '`' && open[2]!.includes('`'))) return null;
@@ -93,25 +98,24 @@ const closesFence = (line: string, fence: { char: string; len: number }) => {
 };
 
 /**
- * `text` without its `updraft-acceptance` and `updraft-findings` fenced blocks (a block left open
- * runs to the end of the text, and goes with it). Other fences are kept as they are.
+ * `text` without its `updraft-acceptance` and `updraft-findings` fenced blocks, found and closed
+ * by the readers' rules: from the opening line to the next line of at least as many of the same
+ * fence characters, any indent (a block left open runs to the end of the text, and goes with it).
  */
 export function stripMachineBlocks(text: string): string {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
   const out: string[] = [];
-  let fence: { char: string; len: number; drop: boolean } | null = null;
-  for (const line of text.replace(/\r\n?/g, '\n').split('\n')) {
-    if (fence) {
-      if (!fence.drop) out.push(line);
-      if (closesFence(line, fence)) fence = null;
+  for (let i = 0; i < lines.length; i++) {
+    const open = MACHINE_OPEN.exec(lines[i]!);
+    if (!open) {
+      out.push(lines[i]!);
       continue;
     }
-    const open = fenceOpen(line);
-    if (open) {
-      fence = { ...open, drop: MACHINE_BLOCK.test(line) };
-      if (!fence.drop) out.push(line);
-      continue;
-    }
-    out.push(line);
+    const fence = open[1]!;
+    const close = new RegExp(`^\\s*${fence[0] === '`' ? '`' : '~'}{${fence.length},}\\s*$`);
+    let j = i + 1;
+    while (j < lines.length && !close.test(lines[j]!)) j++;
+    i = j;
   }
   return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }

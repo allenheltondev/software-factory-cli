@@ -30,10 +30,11 @@ reviews:
 | Queued | Updraft Cloud's queue, only if the work waited for capacity | that it waits for capacity; no time and no agent |
 | Assigned | the run, when its worker claims it | the table below |
 | PR opened | publication | `PR #N opened` with its link; the table gains the observed model |
-| Reviewing, Revising, Fixing checks, Checks passed | review, revision and CI-fix jobs of the same workflow | e.g. `Revising PR #12 for review round 2`, `Fixing failed checks on abc1234 of PR #12 (CI fix 1)` |
-| Waiting for a person | the CI step or auto-merge, when they stop | a pointer to the pull request, where the ask is |
-| Merged | auto-merge | `PR #N was merged`, or `... merged after CI fix N` |
-| Stopped | a run that failed for good | that it ended without a pull request; a retry's assignment replaces it |
+| Reviewing, Revising, Fixing checks, Changes requested, Waiting for checks, Ready to merge, Checks passed | review, revision and CI-fix jobs and the review's verdict | e.g. `Revising PR #12 for review round 2`, `Fixing failed checks on abc1234 of PR #12 (CI fix 1)` |
+| Ready for a person to merge, Revision limit reached, Changes requested, Waiting for a person | the verdict, the CI step, auto-merge or a review-loop job that failed, when the loop rests until a person acts | what the person does next (the review or the please-act comment on the PR says how) |
+| Merged, Closed | auto-merge, or the review loop seeing a merge or close by anyone | `PR #N was merged`, `... merged after CI fix N`, `PR #N was closed without being merged` |
+| Finished, Waiting | a run that succeeded without a pull request | no changes to publish, publishing off, an action that opens none, or a wait on another pull request |
+| Stopped | a run that failed for good or was canceled, or a pull request that could not be opened | what ended it; a retry's assignment replaces it |
 
 The Assigned table shows only rows that carry information:
 
@@ -73,6 +74,11 @@ comment. GitHub has no compare-and-set for comments, so the protocol
 - The run's assignment finds the comment by its own key, or takes over a queue acknowledgement
   that still waits; the review loop finds the one naming its pull request. Only assignment and
   publication ever post one; the review loop only edits.
+- A review-loop stage names the head commit it is about (`sha=`), and a write about a head that
+  is no longer the pull request's newest never replaces one about a newer head; on one head, a
+  resting stage (a person has to act) is not replaced by a late "at work" one.
+- Without the worker's own login (or, on Updraft Cloud, the App's slug) nothing is matched or
+  posted: anyone can type a marker into a comment.
 - Stages only move forward across writers: a queue stage never replaces a runner stage (the queue
   reads the comment before every edit), assignment and publication never replace a later stage,
   and nothing replaces `Merged` except another final stage.
@@ -113,9 +119,10 @@ In both modes the body is short: `Closes #N`, the merge sentence, the console li
 and agent when not hosted), the commits and diff stat, the worker's verification and the agent's
 final message. The agent's `updraft-acceptance` and `updraft-findings` blocks are taken out, and a
 message too long for the body is cut at a line, never inside a fenced block. The merge sentence
-states what auto-merge will attempt: `Updraft merges this (squash) once review and checks pass`
+states what auto-merge will attempt: `Updraft merges this (squash) once review and required checks pass`
 when `autoMerge` is on and the verify gate passed on the commit, otherwise `Merging is up to a
-person`, with the reason when a gate already stands in the way.
+person`, with the reason when a gate already stands in the way. A revision or CI fix that pushes a
+new head restates it for that head's own verification, and the revision's reply says the same.
 
 ## The assignment table (verbose)
 

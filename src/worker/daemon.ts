@@ -357,6 +357,10 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
       } else if (finished?.outcome === 'succeeded' && deps.publisher) {
         await deps.publisher.afterRun(run.id, controller.signal);
       }
+      // How a succeeded run that opened no pull request rests (quiet notifications).
+      if (finished?.outcome === 'succeeded' && deps.assignmentCommenter?.finished) {
+        await deps.assignmentCommenter.finished(job, run, controller.signal).catch((err: unknown) => runLog.error('status comment crashed', { error: message(err) }));
+      }
       // Not for interrupted runs: the worker is stopping, and whoever stops it is there to retry.
       // Decided by what was recorded: a run the user canceled is closed as canceled whatever the
       // executor reported, and must not be announced as a failure.
@@ -364,8 +368,10 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         await deps.failureCommenter.afterRun(run.id, controller.signal);
       }
       // The issue's live status comment no longer says a worker is on it (quiet notifications).
-      if (finished && !policyRequeued && !finished.canceledByUser && (finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.assignmentCommenter?.ended) {
-        await deps.assignmentCommenter.ended(job, run, controller.signal).catch((err: unknown) => runLog.error('status comment crashed', { error: message(err) }));
+      if (finished && !policyRequeued && (finished.canceledByUser || finished.outcome === 'failed' || finished.outcome === 'start_failed') && deps.assignmentCommenter?.ended) {
+        await deps.assignmentCommenter
+          .ended(job, run, controller.signal, finished.canceledByUser ? 'canceled' : 'failed')
+          .catch((err: unknown) => runLog.error('status comment crashed', { error: message(err) }));
       }
       // After publishing and commenting, so the trace has Updraft's own steps too.
       if (runTrace) await runTrace.end(finished?.outcome ?? result.outcome);

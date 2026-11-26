@@ -13,6 +13,8 @@
 //      once whatever is replayed.
 //   5. The checkpoint (ETag, newest updated_at) is stored only after every PR was processed; an
 //      API error leaves it where it was and the scan is repeated.
+import { noteStatus, quietFor } from '../publish/status-comment.js';
+import { STATUS_STAGE } from '../publish/status-marker.js';
 import { allowedActorsFor, DEFAULT_MAX_REVISIONS, reviewActive, reviseActive, workflowId, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
 import { getLoopPr, observeHead, scheduleReviews } from '../db/pr-reviews.js';
@@ -177,16 +179,23 @@ export async function pollRepoReviews(
     complete = false;
   }
 
-  const close = (w: RevisionPr, why: string) => {
+  const close = async (w: RevisionPr, why: string, ended?: 'merged' | 'closed') => {
     const canceled = closeRevisionPr(db, repo.id, w.prNumber, why, deps.now);
     result.jobsCanceled += canceled.length;
     log.info('pull request no longer watched for change requests', { pr: w.prNumber, reason: why, jobsCanceled: canceled.length });
+    // Quiet notifications: whoever merged or closed it, the issue's status comment says so last.
+    if (ended && quietFor(deps.config, { repoId: repo.id, repoFullName: repo.fullName })) {
+      await noteStatus(
+        { api, log },
+        { repo, issue: w.issueNumber, target: { pr: w.prNumber }, stage: STATUS_STAGE.final, title: ended === 'merged' ? 'Merged' : 'Closed', text: ended === 'merged' ? `PR #${w.prNumber} was merged.` : `PR #${w.prNumber} was closed without being merged.` },
+      );
+    }
   };
 
   for (const w of watched.values()) {
     const seen = listed.get(w.prNumber);
     if (seen && seen.state !== 'open') {
-      close(w, `pull request #${w.prNumber} was ${seen.merged ? 'merged' : 'closed'}`);
+      await close(w, `pull request #${w.prNumber} was ${seen.merged ? 'merged' : 'closed'}`, seen.merged ? 'merged' : 'closed');
       continue;
     }
     // Not listed: unchanged since the last scan, unless its reviews were never read (a PR that
@@ -201,12 +210,12 @@ export async function pollRepoReviews(
       pr = await api.getPullRequestReviews(repo, w.prNumber);
     } catch (err) {
       if (!isGone(err)) throw err;
-      close(w, `pull request #${w.prNumber} was deleted or is no longer accessible`);
+      await close(w, `pull request #${w.prNumber} was deleted or is no longer accessible`);
       continue;
     }
     result.pullRequestsRead++;
     if (pr.state !== 'open') {
-      close(w, `pull request #${w.prNumber} was ${pr.merged ? 'merged' : 'closed'}`);
+      await close(w, `pull request #${w.prNumber} was ${pr.merged ? 'merged' : 'closed'}`, pr.merged ? 'merged' : 'closed');
       continue;
     }
     if (reviewing && pr.headRef === w.branch && observeHead(db, repo.id, w.prNumber, pr.headSha, readAt)) {

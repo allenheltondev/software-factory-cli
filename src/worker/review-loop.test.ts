@@ -392,8 +392,29 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(gh.comments.filter((c) => c.issue === PR)).toEqual([]);
     expect(gh.writes.filter((w) => w.startsWith('review #'))).toHaveLength(1);
     // Its body names the merge that actually happened.
-    expect(gh.pullBody).toContain('Updraft merges this (`squash`) once review and checks pass.');
+    expect(gh.pullBody).toContain('Updraft merges this (`squash`) once review and required checks pass.');
     expect(gh.pullBody).not.toContain('Merging is up to a person');
+  });
+
+  it('quiet notifications, autoMerge off: the status rests on "Ready for a person to merge", and a person\'s merge is its last word', async () => {
+    const s = setup({ repo: { notifications: 'quiet', autoMerge: undefined }, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] });
+    const { gh } = s;
+    const worker = start(s, {}, true);
+    const status = () => gh.comments.find((c) => c.issue === ISSUE)?.body ?? '';
+    try {
+      await vi.waitFor(() => expect(status()).toContain('**Updraft · Ready for a person to merge**'), { timeout: 150_000, interval: 100 });
+      expect(parseStatusMarker(status())).toMatchObject({ stage: 60, pr: PR });
+      // A person merges it on GitHub: the review loop sees it, and says so last.
+      gh.pull!.state = 'closed';
+      gh.pull!.merged = true;
+      gh.touch();
+      await vi.waitFor(() => expect(status()).toContain('**Updraft · Merged**'), { timeout: 30_000, interval: 100 });
+    } finally {
+      await worker.stop();
+    }
+    expect(gh.comments.filter((c) => c.issue === ISSUE)).toHaveLength(1);
+    expect(gh.comments.filter((c) => c.issue === PR)).toEqual([]);
+    expect(gh.pullBody).toContain('Merging is up to a person.');
   });
 
   it('with autoMerge off, stops at a PR that is ready for review and merges nothing', async () => {

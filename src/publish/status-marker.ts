@@ -27,8 +27,10 @@ export const STATUS_STAGE = {
   assigned: 30,
   /** Its pull request is open (runner). */
   published: 40,
-  /** The review loop is at work on it: reviewing, revising, fixing checks, or waiting for a person (runner). */
+  /** The review loop is at work on a head: reviewing, revising, fixing checks (runner). */
   loop: 50,
+  /** The review loop rests on a head until a person acts: ready to merge by hand, changes up to a person (runner). */
+  person: 60,
   /** Merged, or closed for good (runner). */
   final: 90,
 } as const;
@@ -42,36 +44,54 @@ export interface StatusMark {
   stage: number;
   /** The pull request it reports on, once one is open. */
   pr?: number;
+  /** The review loop's stages: the head commit (7 to 40 hex) the stage is about. */
+  sha?: string;
 }
 
 const KEY = /^[A-Za-z0-9_.-]{1,128}$/;
-const MARKER = /<!-- updraft-status: key=([A-Za-z0-9_.-]{1,128}) stage=(\d{1,3})(?: pr=(\d{1,10}))? -->/;
+const MARKER = /<!-- updraft-status: key=([A-Za-z0-9_.-]{1,128}) stage=(\d{1,3})(?: pr=(\d{1,10}))?(?: sha=([0-9a-f]{7,40}))? -->/;
+const SHA = /^[0-9a-f]{7,40}$/;
 /** What every status comment contains, whatever its key: for a search. */
 export const STATUS_MARKER_PREFIX = '<!-- updraft-status: ';
 
 export function statusMarker(m: StatusMark): string {
   if (!KEY.test(m.key)) throw new Error(`not a status comment key: ${JSON.stringify(m.key)}`);
   const pr = m.pr !== undefined && Number.isSafeInteger(m.pr) && m.pr > 0 ? ` pr=${m.pr}` : '';
-  return `<!-- updraft-status: key=${m.key} stage=${Math.max(0, Math.min(999, Math.trunc(m.stage)))}${pr} -->`;
+  const sha = m.sha !== undefined && SHA.test(m.sha) ? ` sha=${m.sha}` : '';
+  return `<!-- updraft-status: key=${m.key} stage=${Math.max(0, Math.min(999, Math.trunc(m.stage)))}${pr}${sha} -->`;
 }
 
 /** The marker of a status comment, or null for any other comment. */
 export function parseStatusMarker(body: string): StatusMark | null {
   const m = MARKER.exec(body);
   if (!m) return null;
-  return { key: m[1]!, stage: Number(m[2]), ...(m[3] ? { pr: Number(m[3]) } : {}) };
+  return { key: m[1]!, stage: Number(m[2]), ...(m[3] ? { pr: Number(m[3]) } : {}), ...(m[4] ? { sha: m[4] } : {}) };
 }
 
-/** Whether a comment at `current` may be rewritten to show `stage`. */
-export function mayReplace(current: StatusMark | null, stage: number): boolean {
+/** Two head SHAs name the same commit (one may be a prefix of the other). */
+const sameHead = (a: string, b: string) => a.startsWith(b) || b.startsWith(a);
+
+/**
+ * Whether a comment at `current` may be rewritten to show `stage`. A review-loop stage (loop or
+ * person) names its head (`sha`) and says whether that head is still the pull request's newest
+ * (`latest`, as the writer's records have it): a late write about an older head never replaces
+ * what was said about a newer one, and on one head a resting stage (a person has to act) is not
+ * replaced by a late "at work" one.
+ */
+export function mayReplace(current: StatusMark | null, stage: number, next: { sha?: string; latest?: boolean } = {}): boolean {
   if (!current) return true;
   // The Cloud queue only ever writes over what it wrote itself.
   if (stage < RUNNER_STAGE) return current.stage < RUNNER_STAGE;
   // Merged (or closed) is the last word.
   if (current.stage >= FINAL_STAGE) return stage >= FINAL_STAGE;
-  // Assignment and publication happen once, in order: never written over a later stage. The
-  // review loop's stages follow one another, each newer than the last.
+  if (stage >= FINAL_STAGE) return true;
+  // Assignment and publication happen once, in order: never written over a later stage.
   if (stage < STATUS_STAGE.loop) return current.stage <= stage;
+  // The review loop, about one head at a time.
+  if (current.stage >= STATUS_STAGE.loop && current.sha && next.sha) {
+    if (sameHead(current.sha, next.sha)) return stage >= current.stage;
+    return next.latest === true;
+  }
   return true;
 }
 

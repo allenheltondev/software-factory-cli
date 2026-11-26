@@ -118,6 +118,7 @@ function makeConfig(f: GitFixture, repoOver: Record<string, unknown> = {}, mode 
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
+        notifications: 'verbose',
         revise: true,
         commentOnFailure: true,
         workflows: [{ trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general' }],
@@ -641,6 +642,24 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     await reviseRun(deps(badNone, api4), badNone.runId);
     expect(api4.comments[0]!.body).toMatch(new RegExp(`a revision for the checks that failed on \`${failedSha.slice(0, 12)}\`, but`));
     expect(api4.comments[0]!.body).not.toContain('javascript:');
+  });
+
+  it('quiet notifications: a CI fix pushes, and posts no reply and no claim on the PR; a change request is still answered', async () => {
+    const p = await published();
+    const failedSha = 'a'.repeat(40);
+    const base = request(p);
+    const req: RevisionRequest = { ...base, trigger: 'ci_failure', reviewedSha: failedSha, review: { ...base.review, url: `https://github.com/${FULL}/runs/7`, author: 'updraft-bot[bot]', headSha: failedSha } };
+    const s = await revised(p, { req });
+    const api = new FakeCommentsApi();
+    const quiet = makeConfig(s.f, { notifications: 'quiet' });
+    expect((await reviseRun(deps(s, api, { config: quiet, claimReviews: true }), s.runId)).status).toBe('published');
+    expect(api.comments).toEqual([]);
+
+    const q = await published();
+    const r = await revised(q);
+    const api2 = new FakeCommentsApi();
+    expect((await reviseRun(deps(r, api2, { config: makeConfig(r.f, { notifications: 'quiet' }) }), r.runId)).status).toBe('published');
+    expect(api2.comments).toHaveLength(1);
   });
 
   it('pushes nothing to a PR that was closed while the revision ran', async () => {

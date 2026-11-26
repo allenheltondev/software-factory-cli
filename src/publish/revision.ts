@@ -17,6 +17,7 @@
 //   one comment on the PR says so.
 // Destination validation, the throwaway repository, hooks-off and the token handling are
 // publication's (openPushTarget), as are the lease and attempt fence around every write.
+import { quietFor } from './status-comment.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { appendFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -55,6 +56,7 @@ import {
   classifyFailure,
   mergePolicy,
   mergeSentence,
+  withMergeSentence,
   type MergePolicy,
   classifyGit,
   fenced,
@@ -239,13 +241,25 @@ export function renderRevisionReply(o: {
               '',
             ]
           : [`Updraft pushed ${o.commitCount} commit(s) to this pull request for the changes requested by ${code(o.review.author)} in ${o.review.url}`, '']),
-      `From run ${code(o.runId)} (agent ${inline(o.agent)}). ${o.merge?.auto ? `Updraft merges it (${code(o.merge.method)}) once review and checks pass.` : `Review it before merging; ${mergeSentence(o.merge ?? { auto: false, reason: null }).replace(/^M/, 'm')}`}`,
+      `From run ${code(o.runId)} (agent ${inline(o.agent)}). ${o.merge?.auto ? `Updraft merges it (${code(o.merge.method)}) once review and required checks pass.` : `Review it before merging; ${mergeSentence(o.merge ?? { auto: false, reason: null }).replace(/^M/, 'm')}`}`,
       '',
       ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
       ...renderRunResult(o.summary, o.commitCount),
     ],
     revisionMarker(o.runId),
   );
+}
+
+/** Restate the PR body's merge sentence after a push. Best effort: the body is not what decides a merge. */
+async function restateMerge(deps: PublishDeps, repo: RepoRef, prNumber: number, merge: MergePolicy, log: PublishDeps['log']): Promise<void> {
+  if (!deps.api.updatePullRequestBody) return;
+  try {
+    const body = (await deps.api.getPullRequest(repo, prNumber)).body;
+    const next = body ? withMergeSentence(body, merge) : null;
+    if (next) await deps.api.updatePullRequestBody(repo, prNumber, next);
+  } catch (err) {
+    log.warn('could not restate the merge sentence of the pull request body', { error: message(err) });
+  }
 }
 
 /** With claimReviews: what a revision posts just before its push, and then replaces with the reply (or with why it pushed nothing). */
@@ -446,7 +460,10 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     if (!finishRevision(deps.db, runId, fence.attempt, { ...r, now })) throw new RevisionSupersededError(runId, fence.attempt);
     return getRevision(deps.db, runId)!;
   };
-  const claiming = deps.claimReviews === true;
+  // Quiet notifications: a CI fix is said on the issue's status comment, not on the pull request,
+  // so it posts no claim and no reply (only a refusal to push, which a person has to look at).
+  const silent = request.trigger === 'ci_failure' && quietFor(deps.config, job);
+  const claiming = deps.claimReviews === true && !silent;
   /**
    * The PR comment of this run: recorded, found by its marker, or new.
    *
@@ -649,8 +666,11 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       if (answered.log.length) await runLog(answered.log);
     }
 
-    // 4. The reply: recorded, found by marker, or new.
-    await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run), trigger: request.trigger, pushed: { sha: localSha, url: commitUrl(request.pullRequest.url, localSha) }, merge: mergePolicy(deps.config, repo, { mode: 'pr', verifies: Boolean(ownEntry(deps.config.actions, job.action)?.verify?.length), summary: { verification: run.summary.verification, headSha: localSha } }) }), { headSha: localSha });
+    // 4. The PR body's merge sentence, for the new head and its own verification.
+    const merge = mergePolicy(deps.config, repo, { mode: 'pr', verifies: Boolean(ownEntry(deps.config.actions, job.action)?.verify?.length), summary: { verification: run.summary.verification, headSha: localSha } });
+    await restateMerge(deps, repoRef, prNumber, merge, log);
+    // 5. The reply: recorded, found by marker, or new.
+    if (!silent) await comment(() => renderRevisionReply({ runId, agent: run.agent, review: request.review, summary: run.summary, commitCount, perFinding, selection: selectionOf(run), trigger: request.trigger, pushed: { sha: localSha, url: commitUrl(request.pullRequest.url, localSha) }, merge }), { headSha: localSha });
 
     const done = finish({ state: 'published' });
     log.info('revision pushed', { pr: prNumber, from: baseSha, to: localSha });
