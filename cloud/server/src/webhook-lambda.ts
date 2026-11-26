@@ -20,6 +20,7 @@ import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
 import { createBundleKeys } from './tenants/key-needs.js';
 import { configPrefix } from './tenants/paths.js';
 import { createLauncher, internetEgressConnector, noIngressConnector, waitingComment, type Launcher, type LaunchRequest } from './jobs/launch.js';
+import { createGitHubNotices } from './jobs/notices.js';
 import { quotasFromEnv, throttleCommentPermissions, throttledComment, installationPage } from './jobs/quotas.js';
 import { createAdmissionQueue, createGitHubRevalidator, createQueueDispatcher, dispatchMetricsLine, isQueueCancelRequest, type DispatchReport, type QueueCancelRequest, type QueueCancelResult, type QueueNotifier } from './jobs/queue.js';
 import { createDynamoQueueStore, type QueueEntry } from './jobs/queue-store.js';
@@ -132,6 +133,8 @@ const queueNotifier: QueueNotifier = {
     return github.issueCommentBody!(token, entry.repository, commentId);
   },
 };
+// Please-act comments (#173): a delivery refused for a missing key, a workflow blocked for a person.
+const notices = createGitHubNotices({ github, loadSettings, ...(consoleOrigin ? { consoleOrigin } : {}) });
 const admissionQueue = createAdmissionQueue({ store: queueStore, putEvent, notify: queueNotifier, workflows, ...(consoleOrigin ? { consoleOrigin } : {}) });
 
 
@@ -204,6 +207,7 @@ function launcher(): Launcher | undefined {
     quotas: quotasFromEnv(env),
     killSwitch,
     // The App's own token for that one repository, allowed only to write issues (and a pull request's conversation).
+    notifyRefused: (n) => notices.refused(n),
     notifyThrottled: async ({ installationId, repository, repositoryId, issue, pullRequest, limit, quotas }) => {
       const settings = await loadSettings();
       if (!settings) return;
@@ -389,7 +393,7 @@ const appBot = async () => {
   return settings?.slug ? `${settings.slug}[bot]` : undefined;
 };
 const reconcileWorkflows = createWorkflowReconciler({
-  store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch,
+  store: workflowStore, controls: store, jobs: store, github, loadSettings, killSwitch, notifyBlocked: notices.blocked,
   ...(launch && retryJob ? { recovery: { launch, retry: retryJob, appBot, queue: queueStore } } : {}),
 });
 

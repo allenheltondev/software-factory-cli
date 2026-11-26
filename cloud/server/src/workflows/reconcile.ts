@@ -34,6 +34,7 @@ import { workflowPause } from '../jobs/stop.js';
 import { updateWorkflow } from './recorder.js';
 import { pauseControlOf, pausedWorkflow, pauseNoticedMessage, resumedWorkflow } from './timeline.js';
 import { createRecovery, type RecoveryDeps } from './recovery.js';
+import type { BlockNotifier } from '../jobs/notices.js';
 import type { WorkflowStore } from './store.js';
 import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
 
@@ -49,6 +50,8 @@ export interface WorkflowReconcilerDeps {
    */
   recovery?: RecoveryDeps;
   loadSettings: LoadSettings;
+  /** A block a person has to act on: one please-act comment (jobs/notices.ts, #173). Never changes what is decided. */
+  notifyBlocked?: BlockNotifier;
   killSwitch?: KillSwitch;
   now?: () => number;
   log?: (entry: Record<string, unknown>) => void;
@@ -100,7 +103,7 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     return (await deps.github.createInstallationToken(appJwt(settings.appId, settings.privateKey, at), w.installationId, { repositoryIds: [w.repositoryId], permissions })).token;
   };
   const recovery = deps.recovery && deps.jobs
-    ? createRecovery({ store: deps.store, controls: deps.controls, jobs: deps.jobs, github: deps.github, token: (w, p) => token(w, p, now()), recovery: deps.recovery, log })
+    ? createRecovery({ store: deps.store, controls: deps.controls, jobs: deps.jobs, github: deps.github, token: (w, p) => token(w, p, now()), recovery: deps.recovery, log, ...(deps.notifyBlocked ? { notifyBlocked: deps.notifyBlocked } : {}) })
     : undefined;
 
   /** Change the workflow, unless it moved on since it was read (a job started, another run changed it). */
@@ -120,8 +123,9 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     // made once (its save is version-checked), and a later one is a new event, never a replay.
     const blockedEvent = (id: string, message: string): WorkflowEvent => ({ id: `${id}@${w.version}`, at: iso(at), kind: 'blocked', generation: w.generation, message });
     const block = (reason: string, message: string, nextAction: string, id: string, on: Workflow = w) =>
-      change(on, (cur) => ({ workflow: { ...without(cur, 'nextCheckAt'), status: 'blocked', reason, message, nextAction, updatedAt: iso(at) }, event: { ...blockedEvent(id, message), id: `${id}@${on.version}`, reason } })).then(() => {
+      change(on, (cur) => ({ workflow: { ...without(cur, 'nextCheckAt'), status: 'blocked', reason, message, nextAction, updatedAt: iso(at) }, event: { ...blockedEvent(id, message), id: `${id}@${on.version}`, reason } })).then(async (saved) => {
         report.blocked++;
+        if (saved && saved.status === 'blocked' && saved.reason === reason && deps.notifyBlocked) await deps.notifyBlocked(saved, { reason, message, nextAction });
       });
     const later = (ms: number) => change(w, (cur) => ({ workflow: { ...cur, nextCheckAt: iso(at + ms), updatedAt: iso(at) } }));
 

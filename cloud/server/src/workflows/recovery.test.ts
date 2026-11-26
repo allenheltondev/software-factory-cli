@@ -85,9 +85,12 @@ async function world(o: { ciFix?: boolean; concurrentJobs?: number } = {}) {
   const dispatcher = createQueueDispatcher({ queue: queueStore, jobs: store, launch, readEvent, revalidate: createGitHubRevalidator({ github, loadSettings, now }), workflows: recorder, now, log: () => {} });
   const retry = createRetryHandler({ store, launch, readEvent, appBot: async () => 'updraft[bot]', now, log: () => {} });
   const logs: Record<string, unknown>[] = [];
+  /** The please-act notices the blocks asked for (#173). */
+  const notices: { workflowId: string; generation: number; reason: string }[] = [];
   const reconcilerFor = (over: Partial<Parameters<typeof createWorkflowReconciler>[0]> = {}) => createWorkflowReconciler({
     store: workflowStore, controls: store, jobs: store, github, loadSettings, now, log: (e) => void logs.push(e),
     recovery: { launch, retry, appBot: async () => 'updraft[bot]', queue: queueStore },
+    notifyBlocked: async (wf, why) => void notices.push({ workflowId: wf.workflowId, generation: wf.generation, reason: why.reason }),
     ...over,
   });
   const reconcile = reconcilerFor();
@@ -131,7 +134,7 @@ async function world(o: { ciFix?: boolean; concurrentJobs?: number } = {}) {
     await store.requestJobStop(running, { requestedAt: clock, by: 'pat', reason: 'off course' }, [7, 12]);
   };
   return {
-    store, workflowStore, queueStore, recorder, launch, dispatcher, retry, reconcile, reconcilerFor, quota, gh, github, runs, events, logs,
+    store, workflowStore, queueStore, recorder, launch, dispatcher, retry, reconcile, reconcilerFor, quota, gh, github, runs, events, logs, notices,
     label, finish, waitForCi, wf, rewind, timeline, stop,
     tick: (ms: number) => (clock += ms),
     now,
@@ -496,6 +499,8 @@ describe('fenced automatic recovery', () => {
       expect(w.runs).toHaveLength(1);
       const wf = await w.wf();
       expect(wf).toMatchObject({ status: 'blocked', reason: 'publication_uncertain', message: expect.stringContaining('updraft/issue-7-job_evx') });
+      // A person has to decide: asked once on GitHub, without changing what recovery decided.
+      expect(w.notices).toEqual([{ workflowId: wf.workflowId, generation: wf.generation, reason: 'publication_uncertain' }]);
       expect(wf.message).not.toContain('issue-70');
       expect(wf.nextCheckAt).toBeUndefined();
     });
@@ -563,6 +568,7 @@ describe('fenced automatic recovery', () => {
       w.tick(LOST_JOB_LOOK_MS);
       expect(await w.reconcile()).toMatchObject({ recovered: 0, blocked: 1 });
       expect(await w.wf()).toMatchObject({ status: 'blocked', reason: 'recovery_exhausted' });
+      expect(w.notices.map((n) => n.reason)).toEqual(['recovery_exhausted']);
       expect(w.runs).toHaveLength(1 + MAX_RECOVERIES_PER_RUN);
     });
 

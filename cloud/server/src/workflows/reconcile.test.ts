@@ -28,9 +28,11 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; e
     pullRequestHead: vi.fn(async (): Promise<PullRequestHead> => ({ state: 'open', merged: false, headSha: HEAD, headRef: 'updraft/issue-7-job', ...o.pr })),
     commitChecks: vi.fn(async (): Promise<CommitCheckCounts> => o.checks ?? { total: 2, pending: 0, failed: 1, passed: 1, complete: true }),
   };
+  const notices: { reason: string; generation: number; nextAction: string }[] = [];
   const reconcile = createWorkflowReconciler({
     store,
     controls,
+    notifyBlocked: async (w, why) => void notices.push({ reason: why.reason, generation: w.generation, nextAction: why.nextAction }),
     jobs: {
       getJob: async (id: string) => (o.jobs?.[id]?.job as Job | undefined) ?? null,
       getJobSummary: async (_i: number, id: string) => (o.jobs?.[id]?.summary as JobSummary | undefined) ?? null,
@@ -48,7 +50,7 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; e
     await recorder.started(job());
     await recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci', verdict: 'ready-to-merge' } });
   };
-  return { store, controls, recorder, reconcile, github, tick, wf, waitForCi };
+  return { store, controls, recorder, reconcile, github, tick, wf, waitForCi, notices };
 }
 
 describe('workflow reconciliation', () => {
@@ -136,6 +138,10 @@ describe('workflow reconciliation', () => {
     expect((await s.wf())!.nextCheckAt).toBeUndefined();
     const events = await s.store.listWorkflowEvents(55, '99-i7', 50);
     expect(events.at(-1)).toMatchObject({ kind: 'blocked', message: expect.stringMatching(/never reached Updraft/) });
+    // A person restarts it: asked once, on GitHub (#173); a later look decides nothing new.
+    expect(s.notices).toEqual([{ reason: 'ci_event_missed', generation: 1, nextAction: expect.stringMatching(/Re-run a check/) }]);
+    await s.reconcile();
+    expect(s.notices).toHaveLength(1);
 
     // The re-run check's event starts the next job: the workflow works again.
     await s.recorder.started(job({ jobId: 'job_pr000001', issue: undefined, pullRequest: 12, eventName: 'check_suite', deliveryId: 'd-2' }));

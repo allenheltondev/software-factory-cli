@@ -461,6 +461,18 @@ describe('the launcher', () => {
       expect(await createLauncher(deps)(request())).toMatchObject({ status: 202, disposition: 'launched' });
     });
 
+    it('asks a person for the missing key on the issue, never for a console retry (#173)', async () => {
+      await withKeys(['ANTHROPIC_API_KEY']);
+      const notifyRefused = vi.fn(async () => {});
+      expect(await createLauncher({ ...deps, notifyRefused })(request())).toMatchObject({ disposition: 'missing_key' });
+      expect(notifyRefused).toHaveBeenCalledWith(expect.objectContaining({ installationId: 55, repository: 'acme/web', number: 12, pullRequest: false, missing: ['ANTHROPIC_API_KEY'] }));
+      notifyRefused.mockClear();
+      expect(await createLauncher({ ...deps, notifyRefused })({ ...request({}, 'delivery-retry'), retry: true } as LaunchRequest)).toMatchObject({ disposition: 'missing_key' });
+      expect(notifyRefused).not.toHaveBeenCalled();
+      // A comment that cannot be posted never changes the refusal.
+      expect(await createLauncher({ ...deps, notifyRefused: async () => { throw new Error('down'); } })(request({}, 'delivery-2'))).toMatchObject({ disposition: 'missing_key' });
+    });
+
     it("checks only the matched trigger's keys, and pins only those on the job", async () => {
       await activate(twoAgents());
       await setKey('ANTHROPIC_API_KEY');

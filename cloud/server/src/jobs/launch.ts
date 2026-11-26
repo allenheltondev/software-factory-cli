@@ -1,4 +1,5 @@
 import { waitingId } from '../native/sessions.js';
+import type { RefusalNotice } from './notices.js';
 import { workflowIsPaused } from './stop.js';
 import { WorkflowPausedError } from './workflow-gate.js';
 import type { NativeMode } from '../native/store.js';
@@ -171,6 +172,8 @@ export interface LaunchDeps {
   bundleKeys?: BundleKeys;
   /** Posts the over-quota comment on the issue (once a day per issue). Its failure is only logged. */
   notifyThrottled?: (input: ThrottleNotice) => Promise<void>;
+  /** A fresh delivery refused for a missing agent key: one please-act comment (jobs/notices.ts, #173). */
+  notifyRefused?: (notice: RefusalNotice) => Promise<void>;
   /**
    * The admission queue (jobs/queue.ts): a fresh delivery that finds the tenant's or the platform's
    * concurrency taken (or earlier work of the tenant waiting) is kept there and started later,
@@ -472,6 +475,13 @@ export function createLauncher(deps: LaunchDeps) {
       await deps.store
         .recordRefusal(req.installationId, { at: new Date(now()).toISOString(), deliveryId: req.deliveryId, repository: decision.repository, issue: issueNumber, reason })
         .catch((err: unknown) => log({ delivery: req.deliveryId, warning: `could not record the refusal: ${(err as Error)?.name}` }));
+      // A person has to add the key: said once on the issue or pull request. Not for queued work
+      // (its own comment says it), a console retry (the person is there) or a benchmark.
+      if (!req.queued && !req.retry && !req.retryRuntime && !benchmark && deps.notifyRefused) {
+        await deps
+          .notifyRefused({ installationId: req.installationId, repository: decision.repository, repositoryId: decision.repositoryId, number: issueNumber, pullRequest: !isIssue, message: reason, missing: Array.isArray(detail.missing) ? (detail.missing as string[]) : [], configVersion })
+          .catch((err: unknown) => log({ delivery: req.deliveryId, installationId: req.installationId, warning: `could not comment on the refusal: ${(err as Error)?.name ?? 'error'}` }));
+      }
       return skip('missing_key', { reason: 'missing_key', message: reason });
     };
     if (needed === null) return refuse('Updraft could not tell which agent keys this workflow needs: publish the configuration again', { unknown: true });

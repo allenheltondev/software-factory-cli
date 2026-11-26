@@ -43,6 +43,7 @@
  * is not carried on after the resume. Nothing here posts on GitHub: the job it starts does, as any.
  */
 import { createHash } from 'node:crypto';
+import type { BlockNotifier } from '../jobs/notices.js';
 import type { CommitCheckCounts, GitHubApi, PullRequestHead } from '../github/client.js';
 import { GitHubError } from '../github/client.js';
 import type { LaunchRequest, LaunchResult } from '../jobs/launch.js';
@@ -152,6 +153,8 @@ export function createRecovery(deps: {
   token: (w: Workflow, permissions: Record<string, 'read'>) => Promise<string>;
   recovery: RecoveryDeps;
   log: (entry: Record<string, unknown>) => void;
+  /** A block a person has to act on: one please-act comment (jobs/notices.ts, #173). Never changes what is decided. */
+  notifyBlocked?: BlockNotifier;
 }) {
   const { store } = deps;
 
@@ -236,6 +239,7 @@ export function createRecovery(deps: {
         event: { id: `${why.id}@${cur.version}`, at: iso(at), kind: 'blocked', generation: cur.generation, reason: why.reason, message: why.message },
       };
     });
+    if (out.saved && out.workflow && deps.notifyBlocked) await deps.notifyBlocked(out.workflow, why);
     return out.saved ? { kind: 'blocked' } : { kind: 'none' };
   }
 
