@@ -156,6 +156,34 @@ export async function findRevisionClaims(api: Pick<GitHubApi, 'listIssueComments
     .map(({ c, m }) => ({ reviewId, baseSha: m[2]!, headSha: m[3]!, runId: RUN_MARKER.exec(c.body)?.[1] ?? null, commentId: c.id, url: c.htmlUrl }));
 }
 
+/**
+ * Quiet notifications: a CI fix's claim is a ref on the remote, never a comment on the pull request.
+ * `refs/updraft/revision-claims/<review>/<run>` points at the commit the run pushes. GitHub shows
+ * no branch or tag for it, and a fetch of branches never brings it.
+ */
+export function revisionClaimRef(reviewId: string, runId?: string): string {
+  const key = reviewId.replace(/[^A-Za-z0-9._-]/g, '-').replace(/\.{2,}/g, '-').replace(/^[.-]+|[.]+$/g, '').slice(0, 120) || 'review';
+  return `refs/updraft/revision-claims/${key}/${runId ? runId.replace(/[^A-Za-z0-9_-]/g, '-') : ''}`;
+}
+
+/** The ref claims of the runs that revised for `reviewId`, as the remote has them now. */
+export async function findRefClaims(
+  run1: (args: readonly string[], opts: GitOptions) => Promise<{ stdout: string }>,
+  pushUrl: string,
+  net: GitOptions,
+  reviewId: string,
+  repoFullName: string,
+  prNumber: number,
+): Promise<RevisionClaim[]> {
+  const prefix = revisionClaimRef(reviewId);
+  const listed = (await run1(['ls-remote', pushUrl, `${prefix}*`], net)).stdout;
+  return listed
+    .split(/\r?\n/)
+    .map((l) => l.trim().split(/\s+/))
+    .filter((parts): parts is [string, string] => parts.length >= 2 && /^[0-9a-f]{40,64}$/.test(parts[0]!) && parts[1]!.startsWith(prefix))
+    .map(([sha, ref]) => ({ reviewId, baseSha: '', headSha: sha, runId: ref.slice(prefix.length) || null, commentId: 0, url: `https://github.com/${repoFullName}/pull/${prNumber}` }));
+}
+
 /** Hidden marker on the one comment that says a PR reached maxRevisions. */
 export const REVISION_LIMIT_MARKER = '<!-- updraft-revision-limit -->';
 
@@ -464,6 +492,9 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
   // so it posts no claim and no reply (only a refusal to push, which a person has to look at).
   const silent = request.trigger === 'ci_failure' && quietFor(deps.config, job);
   const claiming = deps.claimReviews === true && !silent;
+  // ...and claims its push where no one sees it instead: a ref of its own on the remote
+  // (revisionClaimRef), read the same way as a comment claim. One revision per review, still.
+  const refClaiming = deps.claimReviews === true && silent;
   /**
    * The PR comment of this run: recorded, found by its marker, or new.
    *
@@ -555,9 +586,12 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
      * history this run started from. A claim whose push never came is nobody's.
      */
     const answeredElsewhere = async (remoteSha: string | null): Promise<RevisionClaim | null> => {
-      if (!claiming) return null;
+      if (!claiming && !refClaiming) return null;
       hold();
-      for (const c of await findRevisionClaims(deps.api, repoRef, prNumber, request.review.id)) {
+      const claims = claiming
+        ? await findRevisionClaims(deps.api, repoRef, prNumber, request.review.id)
+        : await findRefClaims(run1, pushUrl, net, request.review.id, repoFullName, prNumber);
+      for (const c of claims) {
         if (c.runId === runId) continue;
         if (c.headSha === remoteSha || c.headSha === baseSha) return c;
         // Exit 1: not an ancestor; 128: a commit this clone never fetched, so not in the run's history either.
@@ -617,6 +651,13 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     } else {
       // Said on the pull request before it is done, so that no run can build on this push without being able to see whose it is.
       if (claiming) await comment(() => renderRevisionClaim({ runId, review: request.review, commitCount }), { headSha: localSha });
+      if (refClaiming) {
+        // The run's own claim ref, before the push: a run that loses the branch's lease finds it.
+        hold();
+        await run1(['push', '--no-verify', '--recurse-submodules=no', '--porcelain', pushUrl, `+${localSha}:${revisionClaimRef(request.review.id, runId)}`], net).catch((err: unknown) => {
+          throw err instanceof GitError ? classifyGit(err, 'push', remote, repoFullName) : err;
+        });
+      }
       await runLog([`pushing ${short(baseSha)}..${short(localSha)} (${commitCount} commit(s)) to ${prBranch} on ${remote} (${redactRemoteUrl(pushUrl)})`]);
       hold();
       try {

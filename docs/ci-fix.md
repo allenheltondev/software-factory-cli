@@ -131,6 +131,17 @@ checks, and links the console when hosted; the status comment says `Waiting for 
 CI fix's own revision posts no reply on the pull request either (no claim, no "Coding agent ·
 pushed" comment); replies in human review threads stay.
 
+One CI-fix revision per failed head still holds across machines (`updraft run-event` on a shared
+state database, where two runs can fix the same head at once). Three fences, none visible:
+- the CI step queues one revision per (pull request, head) in the state it reads;
+- a revision is dropped before its agent starts when the pull request moved on from the head
+  it fixes (a fix that landed moves it);
+- two runs already under way race on the push itself: each first pushes a claim ref of its own,
+  `refs/updraft/revision-claims/<review>/<run>`, at the commit it pushes, and the branch push is
+  a fast-forward under a lease. The run that loses the lease finds the winner's claim at the new
+  head and gives way silently, exactly as a comment claim does in verbose mode. GitHub shows no
+  branch or tag for these refs.
+
 With `notifications: verbose`, on the pull request, one comment per head, headed **Updraft · CI** and the commit, says that a
 fix was queued (which checks failed, each linked to its run on GitHub even when its log could
 not be read, and how many automatic fixes there were) or why a person has to act. The

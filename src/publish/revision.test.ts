@@ -662,6 +662,55 @@ describe('reviseRun', { timeout: 120_000 }, () => {
     expect(api2.comments).toHaveLength(1);
   });
 
+  it('quiet notifications: two runners fixing the same failed head land exactly one revision, and neither says anything on the PR', async () => {
+    const p = await published();
+    const failedSha = remoteSha(p)!;
+    const ciReq = (base: RevisionRequest): RevisionRequest => ({ ...base, trigger: 'ci_failure', reviewedSha: failedSha, review: { ...base.review, id: `ci-failure:${PR}:${failedSha}`, url: `https://github.com/${FULL}/runs/7`, author: 'updraft-bot[bot]', headSha: failedSha } });
+    // Two machines' runs for the one CI-fix review, both prepared from the failed head.
+    const a = await revised(p, { req: ciReq(request(p)) });
+    const other = ciReq(request(p));
+    const b = await revised(p, { req: { ...other, review: { ...other.review, id: 'ci-failure-second-machine' } } });
+    const env = JSON.parse((p.db.prepare('SELECT envelope FROM jobs WHERE id = ?').get(b.jobId) as { envelope: string }).envelope) as { revision: RevisionRequest };
+    env.revision.review.id = `ci-failure:${PR}:${failedSha}`;
+    p.db.prepare('UPDATE jobs SET envelope = ? WHERE id = ?').run(JSON.stringify(env), b.jobId);
+    expect(b.baseSha).toBe(a.baseSha);
+
+    const quiet = makeConfig(p.f, { notifications: 'quiet' });
+    const apiA = new FakeCommentsApi();
+    const apiB = new FakeCommentsApi();
+    // B gets as far as its first push; A then runs to the end; then B goes on: the race at its worst.
+    let resultA: Awaited<ReturnType<typeof reviseRun>> | undefined;
+    let raced = false;
+    const racing: RunGit = async (args, opts) => {
+      if (args[0] === 'push' && !raced) {
+        raced = true;
+        resultA = await reviseRun(deps(a, apiA, { config: quiet, claimReviews: true }), a.runId);
+      }
+      return runGit(args, opts);
+    };
+    const resultB = await reviseRun(deps(b, apiB, { config: quiet, claimReviews: true, runGit: racing }), b.runId);
+    expect(resultA).toMatchObject({ status: 'published' });
+    expect(resultB).toMatchObject({ status: 'skipped' });
+    expect(getRevision(p.db, b.runId)!.error).toMatch(/^superseded: /);
+    // Exactly one revision on the branch: A's.
+    expect(remoteSha(p)).toBe(a.localSha);
+    expect(p.f.git(p.f.clone, 'log', '--format=%H', `${failedSha}..${a.localSha}`).split('\n')).toHaveLength(1);
+    // Nothing on the pull request, from either.
+    expect(apiA.comments).toEqual([]);
+    expect(apiB.comments).toEqual([]);
+    // The claims are refs, not branches.
+    expect(p.f.git(p.f.root, 'ls-remote', '--heads', p.f.remoteDir)).not.toContain('revision-claims');
+    expect(p.f.git(p.f.root, 'ls-remote', p.f.remoteDir, 'refs/updraft/*')).toContain(a.localSha);
+
+    // A third machine, prepared from the failed head after A landed: it gives way before pushing anything.
+    const c = await revised(p, { req: { ...other, review: { ...other.review, id: 'ci-failure-third-machine' } } });
+    const envC = JSON.parse((p.db.prepare('SELECT envelope FROM jobs WHERE id = ?').get(c.jobId) as { envelope: string }).envelope) as { revision: RevisionRequest };
+    envC.revision.review.id = `ci-failure:${PR}:${failedSha}`;
+    p.db.prepare('UPDATE jobs SET envelope = ? WHERE id = ?').run(JSON.stringify(envC), c.jobId);
+    expect(await reviseRun(deps(c, new FakeCommentsApi(), { config: quiet, claimReviews: true }), c.runId)).toMatchObject({ status: 'skipped' });
+    expect(remoteSha(p)).toBe(a.localSha);
+  });
+
   it('pushes nothing to a PR that was closed while the revision ran', async () => {
     const s = await revised(await published());
     s.db.prepare("UPDATE revision_prs SET state = 'closed'").run();
