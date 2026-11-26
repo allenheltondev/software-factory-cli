@@ -149,11 +149,22 @@ without `--global` (`--global` writes to the scratch home and works). To compare
 the base commit an agent uses the run's base checkout instead
 ([Checking a failure against the base commit](worktrees.md#checking-a-failure-against-the-base-commit)).
 
-A clone the worker creates itself (`updraft run-event`) has
-`gc.auto=0` and `maintenance.auto=false`: otherwise the automatic gc that `git commit` starts
-once there are enough loose objects tries to pack refs in the read-only directory, and the
-agent's commit prints `packed-refs.lock` (or `gc.pid.lock`) `Read-only file system` errors.
-A clone you made is left as you configured it.
+With the files ref store, Git takes `packed-refs.lock` in the top level of the Git directory for
+every ref deletion, whether or not the ref is packed, and Git 2.45 and later delete per-worktree
+pseudorefs (`AUTO_MERGE`, `CHERRY_PICK_HEAD` and the like) through the ref store after every
+`git commit`. In a container that lock cannot be created, so each commit prints
+`error: Unable to create '.../packed-refs.lock': Read-only file system` (the commit itself
+succeeds). No configuration turns that deletion off.
+
+So a clone the worker creates itself (`updraft run-event`) uses the reftable ref store where Git
+has it (2.45 and later): every ref, its lock and its tables live in `reftable/`, which is mounted
+like `refs/`, and commits, `git stash pop` and `git branch -d` work without the top level. An
+older Git gets the files store, and its `git commit` deletes no ref. The same clone also has
+`gc.auto=0` and `maintenance.auto=false`, because the automatic gc that `git commit` starts once
+there are enough loose objects writes `gc.pid.lock` there too; the worker runs `git gc --auto`
+itself instead, on the host and outside any agent run (before an event's run at most once a
+day, and on `updraft clean`). A clone you made is left as you configured it: with the files
+store and Git 2.45 or later, a contained agent's commits print that error and still succeed.
 
 After the agent exits, the worker summarizes the run with `git diff` on the host, in a
 worktree whose contents the agent wrote. For a containerized run it tells Git not to look

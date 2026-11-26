@@ -90,7 +90,20 @@ export async function ensureClone(req: EnsureCloneRequest): Promise<EnsuredClone
     return { created: false, managed: marked?.stdout.trim() === 'true' };
   }
   mkdirSync(checkoutPath, { recursive: true });
-  await run(['init', '--quiet'], opts);
+  // The reftable ref store where git has one (2.45 and later). A contained agent commits through
+  // a git directory whose top level is read-only (src/worker/container.ts, gitMounts). With the
+  // files ref store every ref deletion takes `packed-refs.lock` there, whether or not the ref is
+  // packed, and git 2.45+ `git commit` deletes its per-worktree pseudorefs (AUTO_MERGE,
+  // CHERRY_PICK_HEAD, ...) through the ref store after every commit: each agent commit printed
+  // "Unable to create '.../packed-refs.lock': Read-only file system", and `git stash pop` or
+  // `git branch -d` failed. Reftable keeps every ref, its lock and its tables in `reftable/`,
+  // one of the directories a commit may already write, so nothing needs the top level. An older
+  // git refuses the option before creating anything, and gets the files store as before.
+  try {
+    await run(['init', '--quiet', '--ref-format=reftable'], opts);
+  } catch {
+    await run(['init', '--quiet'], opts);
+  }
   await run(['remote', 'add', 'origin', req.cloneUrl], opts);
   await run(['config', '--local', MANAGED_CLONE_KEY, 'true'], opts);
   // No automatic housekeeping. A contained agent commits through a git directory whose top

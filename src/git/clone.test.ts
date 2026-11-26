@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -40,8 +41,11 @@ describe('ensureClone', { timeout: 60_000 }, () => {
     };
     expect(await ensureClone({ checkoutPath, cloneUrl: githubCloneUrl(FULL), runGit: recording, now: () => 1_000 })).toEqual({ created: true, managed: true });
 
+    // Reftable where this git has it; an older git refuses the option and gets the files store.
+    const reftable = spawnSync('git', ['rev-parse', '--show-ref-format'], { cwd: checkoutPath, encoding: 'utf8' }).stdout.trim() === 'reftable';
     expect(seen.map((s) => s.args.join(' '))).toEqual([
-      'init --quiet',
+      'init --quiet --ref-format=reftable',
+      ...(reftable ? [] : ['init --quiet']),
       `remote add origin https://github.com/${FULL}.git`,
       `config --local ${MANAGED_CLONE_KEY} true`,
       'config --local gc.auto 0',
