@@ -277,7 +277,9 @@ describe('transient broker failures', () => {
     expect(ops.slice(0, 7)).toEqual(['register', 'poll', 'poll', 'poll', 'poll', 'heartbeat', 'settled']);
     expect(sessions.size).toBe(1);
   });
-  it('keeps a running job through a transient heartbeat gap and settles it normally', async () => {
+  // Within its 60 s assignment lease (control.ts WORKER_LEASE_MS): a longer gap lets Cloud fence
+  // the assignment, and the next heartbeat's refusal stops the job.
+  it('keeps a running job through a short transient heartbeat gap, within its lease, and settles it normally', async () => {
     const child = fakeChild(); let polls = 0; let heartbeats = 0; let settled = false;
     const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
       interval: 5, maxBackoff: 10, launch: () => child,
@@ -308,7 +310,7 @@ describe('transient broker failures', () => {
     await worker.done;
     expect(ops).toEqual(['register', 'poll']);
   });
-  it('stops once transient failures outlast the budget, which is shorter than Cloud\'s worker-lost grace', async () => {
+  it('stops an idle worker once transient failures outlast the two-minute budget, which is shorter than Cloud\'s worker-lost grace', async () => {
     let clock = 0; let polls = 0;
     const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
       interval: 5, maxBackoff: 5, now: () => clock,
@@ -318,6 +320,23 @@ describe('transient broker failures', () => {
     // Failing since the first poll: 50 s, 100 s within two minutes; 150 s is past it.
     expect(polls).toBe(4);
     expect(TRANSIENT_BUDGET_MS).toBeLessThan(3 * 60_000);
+  });
+  it('stops a running job once a heartbeat retried past its lease is refused', async () => {
+    const child = fakeChild(); let heartbeats = 0;
+    const worker = await startCloudWorker(config, 'mvm-native', { authStatus: async () => 'connected' }, {
+      interval: 5, maxBackoff: 5, launch: () => child,
+      call: async (p) => {
+        if (p.op === 'poll') return { ok: true, request: { payload: {} } };
+        if (p.op === 'heartbeat') {
+          if (++heartbeats <= 2) throw flaky();
+          throw new Error('worker broker refused request'); // the expired lease was fenced
+        }
+        return { ok: true };
+      },
+    });
+    await worker.done;
+    expect(heartbeats).toBe(3);
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
   });
   it('never retries an uncertain settlement, even a transient one', async () => {
     const child = fakeChild(); const ops = [];
@@ -351,5 +370,17 @@ describe('broker invocation classification', () => {
     expect(refused.transient).toBeUndefined();
     expect(() => brokerResponse({ Payload: Buffer.from('not json') })).toThrow();
     expect(brokerResponse({ Payload: Buffer.from(JSON.stringify({ ok: true, busy: false })) })).toEqual({ ok: true, busy: false });
+  });
+  it("treats the broker handler's own failure ('unavailable') as transient for a poll or heartbeat only, never a settlement", () => {
+    const unavailable = { Payload: Buffer.from(JSON.stringify({ ok: false, error: 'unavailable' })) };
+    const thrown = (op) => { try { brokerResponse(unavailable, op); } catch (e) { return e; } return undefined; };
+    for (const op of ['poll', 'heartbeat']) expect(thrown(op)).toMatchObject({ transient: true });
+    for (const op of ['settled', 'register', 'cancel', undefined]) {
+      expect(thrown(op).message).toBe('worker broker refused request');
+      expect(thrown(op).transient).toBeUndefined();
+    }
+    // A plain refusal of a poll stays final.
+    const refusedPoll = (() => { try { brokerResponse({ Payload: Buffer.from(JSON.stringify({ ok: false })) }, 'poll'); } catch (e) { return e; } })();
+    expect(refusedPoll.transient).toBeUndefined();
   });
 });

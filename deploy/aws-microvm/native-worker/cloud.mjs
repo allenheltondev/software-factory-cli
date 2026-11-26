@@ -29,7 +29,10 @@ export const isTransient = (error) => error?.transient === true;
 /**
  * How long a run of transient broker failures may last before the worker stops anyway. Shorter
  * than Cloud's three-minute worker-lost grace (readiness.ts WORKER_LOST_MS): a worker either
- * recovers before Cloud would retire its session, or stops as it always did.
+ * recovers before Cloud would retire its session, or stops as it always did. That is the idle
+ * worker's budget. A running job's assignment lease is only 60 s (control.ts WORKER_LEASE_MS):
+ * a heartbeat gap longer than that lets Cloud fence the assignment, the next heartbeat is then
+ * refused, and the job stops. So a running job outlives about a minute of broker failures, not two.
  */
 export const TRANSIENT_BUDGET_MS = 2 * 60_000;
 const MAX_BACKOFF_MS = 30_000;

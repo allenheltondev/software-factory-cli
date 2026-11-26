@@ -4,7 +4,7 @@ import { createWorkflowReconciler, type ReconcileReport } from './workflows/reco
 import { createLabelScanner, type LabelScanReport } from './workflows/label-scan.js';
 import { reconcileMetricsLine } from './workflows/metrics.js';
 import { waitingId } from './native/sessions.js';
-import { createWaitingNotifier } from './native/waiting-notice.js';
+import { commentCanNeverPost, createWaitingNotifier } from './native/waiting-notice.js';
 import { LambdaMicrovmsClient, RunMicrovmCommand } from '@aws-sdk/client-lambda-microvms';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetParameterCommand, ParameterNotFound, SSMClient } from '@aws-sdk/client-ssm';
@@ -182,7 +182,8 @@ function launcher(): Launcher | undefined {
           try {
             await commentOnIssue(installationId, repositoryId, repository, issue, comment);
           } catch (error) {
-            await sessions.releaseNotice(installationId, waiting.id, at).catch(() => undefined);
+            // A comment GitHub will never take keeps its claim; only a passing failure is retried later.
+            if (!commentCanNeverPost(error)) await sessions.releaseNotice(installationId, waiting.id, at).catch(() => undefined);
             console.error(JSON.stringify({ claudeWaiting: 'issue comment failed', name: (error as Error)?.name }));
           }
         }
@@ -450,7 +451,7 @@ export async function handler(
     // Labeled issues whose delivery never came (workflows/label-scan.ts): reported, never started.
     const labels = !(await killSwitch.engaged()) ? await scanLabels() : { tenants: 0, flagged: 0, failed: 0 };
     // Parked Claude jobs whose wait now needs a sign-in: one comment each (native/waiting-notice.ts).
-    const notices = notifyWaitingClaude ? await notifyWaitingClaude() : { tenants: 0, noticed: 0, failed: 0 };
+    const notices = notifyWaitingClaude ? await notifyWaitingClaude() : { tenants: 0, noticed: 0, unpostable: 0, failed: 0 };
     const combined = { ...report, labels };
     // Metrics first, whatever follows: a failing run is what the alarms look for.
     console.log(reconcileMetricsLine(report, labels, Date.now()));

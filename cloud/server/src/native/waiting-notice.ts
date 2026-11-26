@@ -20,7 +20,20 @@ import type { ClaudeSessions, WaitingClaudeJob } from './sessions.js';
 export interface WaitingNoticeReport {
   tenants: number;
   noticed: number;
+  /** Comments GitHub will never take (the issue or repository is gone, locked, archived, or out of the App's reach): ended, not retried. */
+  unpostable: number;
   failed: number;
+}
+
+/**
+ * Whether GitHub's refusal of the comment is final: 403 (a locked issue, an archived repository,
+ * no access), 404, 410 (deleted) or 422. A rate limit (429, or a 403 that says so) and anything
+ * else (5xx, the network, no token) may pass, so its claim is given back and retried.
+ */
+export function commentCanNeverPost(error: unknown): boolean {
+  const e = error as { status?: unknown; rateLimited?: unknown } | null;
+  if (!e || typeof e.status !== 'number' || e.rateLimited === true) return false;
+  return [403, 404, 410, 422].includes(e.status);
 }
 
 export function createWaitingNotifier(deps: {
@@ -52,9 +65,23 @@ export function createWaitingNotifier(deps: {
       if (!body) continue;
       const at = now();
       if (!await deps.sessions.claimNotice(installationId, job.id, at)) continue;
+      const wait = signInWait(action, { readiness, ...(retirement ? { retirement } : {}) });
+      const record = (why: typeof wait) => deps.workflows?.waiting({
+        installationId, repository: job.subject.repository, repositoryId: job.subject.repositoryId, issue: job.subject.issue,
+        eventName: job.request.eventName ?? 'issues', deliveryId: job.request.deliveryId, jobId: job.id,
+      }, why);
       try {
         await deps.comment(job, body);
       } catch (error) {
+        if (commentCanNeverPost(error)) {
+          // The claim stays: retrying every run for the wait's whole life cannot help. The wait
+          // and why no comment was posted go on the timeline instead.
+          report.unpostable++;
+          log({ claudeWaiting: 'notice unpostable', installationId, jobId: job.id, status: (error as { status?: number }).status });
+          await record({ ...wait, message: `${wait.message} No comment could be posted on the issue (GitHub refused it: ${(error as { status?: number }).status}).`,
+            code: `${wait.code ?? 'claude_sign_in'}_uncommented` });
+          continue;
+        }
         await deps.sessions.releaseNotice(installationId, job.id, at).catch(() => undefined);
         report.failed++;
         log({ claudeWaiting: 'notice failed', installationId, jobId: job.id, name: (error as Error)?.name });
@@ -62,15 +89,12 @@ export function createWaitingNotifier(deps: {
       }
       report.noticed++;
       log({ claudeWaiting: 'noticed', installationId, jobId: job.id, readiness, ...(retirement ? { retirementReason: retirement } : {}) });
-      await deps.workflows?.waiting({
-        installationId, repository: job.subject.repository, repositoryId: job.subject.repositoryId, issue: job.subject.issue,
-        eventName: job.request.eventName ?? 'issues', deliveryId: job.request.deliveryId, jobId: job.id,
-      }, signInWait(action, { readiness, ...(retirement ? { retirement } : {}) }));
+      await record(wait);
     }
   }
 
   return async function notify(): Promise<WaitingNoticeReport> {
-    const report: WaitingNoticeReport = { tenants: 0, noticed: 0, failed: 0 };
+    const report: WaitingNoticeReport = { tenants: 0, noticed: 0, unpostable: 0, failed: 0 };
     for (const t of await deps.tenants.listTenants()) {
       if (t.status !== 'active') continue;
       report.tenants++;

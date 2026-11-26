@@ -16,6 +16,16 @@ describe('the GitHub client', () => {
     expect(new Headers(calls[0]!.init.headers).get('authorization')).toBe('Bearer ghs_x');
   });
 
+  it('says whether a refused comment was a rate limit, or a refusal for good', async () => {
+    const refusing = (status: number, headers: Record<string, string> = {}) =>
+      createGitHubApi(async () => new Response('{}', { status, headers })).createIssueComment('ghs_x', 'acme/web', 12, 'x').catch((e: GitHubError) => e);
+    expect(await refusing(403)).toMatchObject({ status: 403, rateLimited: false });
+    expect(await refusing(403, { 'x-ratelimit-remaining': '0' })).toMatchObject({ status: 403, rateLimited: true });
+    expect(await refusing(403, { 'retry-after': '60' })).toMatchObject({ status: 403, rateLimited: true });
+    expect(await refusing(429)).toMatchObject({ status: 429, rateLimited: true });
+    expect(await refusing(404)).toMatchObject({ status: 404, rateLimited: false });
+  });
+
   it('reads an installation with its permissions and the events it is subscribed to', async () => {
     const api = createGitHubApi(async () => new Response(JSON.stringify({ id: 7, account: { id: 1, login: 'acme', type: 'Organization' }, suspended_at: null,
       permissions: { contents: 'write', bogus: 3 }, events: ['issues', 'check_suite', 4] }), { status: 200 }));

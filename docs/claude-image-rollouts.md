@@ -74,15 +74,26 @@ seals the session as `worker-lost` or `startup-failed`, or the login lapses),
 the five-minute workflow reconciliation posts the comment then and records the
 wait on the timeline. Each waiting job gets exactly one sign-in comment: the
 comment is claimed on the waiting record first, and the claim is given back
-only if posting fails.
+only if posting fails for a reason that may pass (a rate limit, a 5xx, the
+network). If GitHub refuses the comment for good (403 for a locked issue, an
+archived repository or no access; 404; 410; 422), the notice ends there. The
+claim is kept, and the timeline records the wait with an `_uncommented` reason
+code, so reconciliation does not retry it every five minutes until the wait
+expires.
 
 The in-VM dispatcher retries a poll or heartbeat that failed in transport
 (timeout, throttling, a 5xx, a broker invocation that crashed, a function being
-updated) with backoff, for at most two minutes. That is shorter than Cloud's
-three-minute worker-lost grace. A refusal from Cloud (fenced, revoked, another
-session or generation, a bad credential) still stops it at once. An uncertain
-settlement is still never retried. An assignment whose poll response was lost
-is refused on the retried poll, so the worker stops as it did before.
+updated) with backoff. It also retries when the broker's handler caught its own
+failure and answered `error: 'unavailable'`, such as a throttled table during a
+deploy. An idle worker retries for at most two minutes, which is shorter than
+Cloud's three-minute worker-lost grace. A running job survives only about a
+minute of failed heartbeats: its assignment lease is 60 seconds
+(`WORKER_LEASE_MS`). After that, Cloud fences the assignment, the next
+heartbeat is refused, and the job stops. A refusal from Cloud (fenced, revoked,
+another session or generation, a bad credential) still stops the worker at
+once. A settlement is never retried after an uncertain answer, including
+`unavailable`. An assignment whose poll response was lost is refused on the
+retried poll, so the worker stops as it did before.
 
 ## Investigation: the 2026-11-26 01:18 UTC retirement (#176)
 

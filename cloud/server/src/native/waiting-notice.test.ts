@@ -6,7 +6,8 @@ import { waitingComment } from '../jobs/launch.js';
 import { createWorkflowRecorder } from '../workflows/recorder.js';
 import { createMemoryWorkflowStore } from '../workflows/store.js';
 import { createClaudeSessions, type WaitingClaudeJob } from './sessions.js';
-import { createWaitingNotifier } from './waiting-notice.js';
+import { commentCanNeverPost, createWaitingNotifier } from './waiting-notice.js';
+import { GitHubError } from '../github/client.js';
 
 const NOW = Date.parse('2026-11-26T01:00:00Z');
 
@@ -58,7 +59,7 @@ describe('a parked Claude job whose wait comes to need a sign-in gets one commen
     // At park, a heartbeat gap posts nothing.
     expect(waitingComment('https://console.example/x', 'heartbeat-stale')).toBeUndefined();
     const h = harness([parked('job_a')]);
-    expect(await h.notify()).toEqual({ tenants: 1, noticed: 0, failed: 0 });
+    expect(await h.notify()).toEqual({ tenants: 1, noticed: 0, unpostable: 0, failed: 0 });
     expect(h.comment).not.toHaveBeenCalled();
     // Cleanup seals the session: dispatch now reads environment-retiring.
     h.set('environment-retiring', 'worker-lost');
@@ -104,6 +105,42 @@ describe('a parked Claude job whose wait comes to need a sign-in gets one commen
     expect(await h.notify()).toMatchObject({ noticed: 1, failed: 0 });
     expect(h.comment).toHaveBeenCalledTimes(2);
     expect(h.comments.map((c) => c.issue)).toEqual([13]);
+  });
+
+  it.each([
+    [403, 'a locked issue or archived repository'], [404, 'a deleted repository'], [410, 'a deleted issue'], [422, 'a refused comment'],
+  ])('ends the notice when GitHub refuses the comment for good (%i: %s), and says so on the timeline', async (status) => {
+    const h = harness([parked('job_a')]);
+    h.set('environment-retiring', 'worker-lost');
+    h.comment.mockRejectedValue(new GitHubError(status, `POST /repos/issues/comments failed (${status})`));
+    expect(await h.notify()).toMatchObject({ noticed: 0, unpostable: 1, failed: 0 });
+    expect(h.sessions.jobs[0]!.noticeAt).toBe(NOW);
+    const events = await h.workflowStore.listWorkflowEvents(55, '9-i12', 10);
+    expect(events).toContainEqual(expect.objectContaining({ kind: 'waiting', reason: 'claude_session_worker_lost_uncommented',
+      message: expect.stringContaining(`No comment could be posted on the issue (GitHub refused it: ${status})`) }));
+    // Not tried again, and the run does not fail for it.
+    expect(await h.notify()).toEqual({ tenants: 1, noticed: 0, unpostable: 0, failed: 0 });
+    expect(h.comment).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['a rate limit', new GitHubError(403, 'rate limited', true)], ['a 429', new GitHubError(429, 'slow down', true)],
+    ['a 5xx', new GitHubError(502, 'bad gateway')], ['a network failure', new Error('fetch failed')],
+  ])('gives the claim back after %s, so the next run retries', async (_name, error) => {
+    const h = harness([parked('job_a')]);
+    h.set('auth-required');
+    h.comment.mockRejectedValueOnce(error);
+    expect(await h.notify()).toMatchObject({ noticed: 0, unpostable: 0, failed: 1 });
+    expect(h.sessions.jobs[0]!.noticeAt).toBeUndefined();
+    expect(await h.notify()).toMatchObject({ noticed: 1, failed: 0 });
+  });
+
+  it('tells a final GitHub refusal from a passing one', () => {
+    expect(commentCanNeverPost(new GitHubError(403, 'locked'))).toBe(true);
+    expect(commentCanNeverPost(new GitHubError(403, 'rate limited', true))).toBe(false);
+    expect(commentCanNeverPost(new GitHubError(401, 'bad token'))).toBe(false);
+    expect(commentCanNeverPost(new Error('fetch failed'))).toBe(false);
+    expect(commentCanNeverPost(undefined)).toBe(false);
   });
 });
 

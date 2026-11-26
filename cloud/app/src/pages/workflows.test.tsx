@@ -332,5 +332,7 @@ describe('Claude wait reasons on the timeline (#176)', () => {
     expect(reasonLabel('claude_auth_required')).toBe('Claude needs a sign-in');
     expect(reasonLabel('concurrent_jobs')).toBeUndefined();
     expect(reasonLabel('claude_unknown_thing')).toBeUndefined();
+    expect(reasonLabel('claude_session_worker_lost_uncommented')).toBe('The Claude session ended because its worker stopped answering; a new one needs a sign-in; GitHub would not take the comment asking for it, so sign in from Updraft');
+    expect(reasonLabel('claude_auth_required_uncommented')).toMatch(/^Claude needs a sign-in; GitHub would not take/);
   });
 });

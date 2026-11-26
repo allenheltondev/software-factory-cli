@@ -19,15 +19,25 @@ export function transientInvokeError(error) {
 
 const transient = (message, cause) => Object.assign(new Error(message, { cause }), { transient: true });
 
+/** Only these may be retried after the broker could not answer: both are idempotent, and Cloud's state decides the retry. */
+const RETRYABLE_OPS = new Set(['poll', 'heartbeat']);
+
 /**
- * The broker's answer, classified: a refusal (`ok` not true) is Cloud's decision and is final;
- * a crashed invocation (FunctionError: the broker threw, say on a throttled table) or a transport
- * fault is marked `transient` for the dispatcher's bounded retry. An unreadable payload is final.
+ * The broker's answer, classified.
+ * - A crashed invocation (FunctionError) or a transport fault is marked `transient`.
+ * - `{ ok: false, error: 'unavailable' }` is the broker's handler catching its own failure (a
+ *   throttled table during a deploy, say: broker-lambda.ts), not a decision: transient for a poll
+ *   or a heartbeat, never for a settlement or anything else.
+ * - Any other refusal (`ok` not true) is Cloud's decision and is final, as is an unreadable payload.
+ * The dispatcher retries what is transient with bounded backoff (native-worker/cloud.mjs).
  */
-export function brokerResponse(out) {
+export function brokerResponse(out, op) {
   if (out.FunctionError) throw transient('worker broker unavailable');
   const response = JSON.parse(Buffer.from(out.Payload ?? []).toString('utf8'));
-  if (response?.ok !== true) throw new Error('worker broker refused request');
+  if (response?.ok !== true) {
+    if (response?.error === 'unavailable' && RETRYABLE_OPS.has(op)) throw transient('worker broker unavailable');
+    throw new Error('worker broker refused request');
+  }
   return response;
 }
 
@@ -47,6 +57,6 @@ export async function workerControl(config) {
       if (transientInvokeError(error)) throw transient('worker broker unreachable', error);
       throw error;
     }
-    return brokerResponse(out);
+    return brokerResponse(out, body?.op);
   };
 }
