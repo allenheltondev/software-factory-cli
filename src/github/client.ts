@@ -60,6 +60,8 @@
 //   `conclusion` (success, neutral, skipped, failure, cancelled, timed_out, action_required, stale).
 // - `PUT .../pulls/{n}/merge` with `sha` and `merge_method` answers 200 `{ merged, sha, message }`,
 //   405 when the PR cannot be merged, 409 when the head is not `sha`.
+// - A GitHub Actions check run's `html_url` is `https://github.com/{o}/{r}/actions/runs/{run}/job/{job}`;
+//   `POST .../actions/runs/{run}/rerun-failed-jobs` answers 201 with no body.
 import { execFile } from 'node:child_process';
 import type { RepoRef } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -113,6 +115,15 @@ export const REQUEST_TIMEOUT_MS = 60_000;
 export const USER_AGENT = 'updraft';
 export const API_VERSION = '2022-11-28';
 const DEFAULT_BASE_URL = 'https://api.github.com';
+/** The workflow run of a GitHub Actions check run, from its URL (`.../actions/runs/{run}/job/{job}`); nothing for any other check. */
+export function workflowRunOf(...urls: Array<string | null | undefined>): { workflowRunId?: number } {
+  for (const url of urls) {
+    const m = typeof url === 'string' ? /^https:\/\/[^/\s]+\/[^/\s]+\/[^/\s]+\/actions\/runs\/(\d{1,15})\/job\/\d{1,15}(?:[/?#]|$)/.exec(url) : null;
+    if (m) return { workflowRunId: Number(m[1]) };
+  }
+  return {};
+}
+
 /** A check's summary or description kept by getCommitChecks. */
 const DETAIL_SUMMARY_MAX = 2_000;
 
@@ -1240,6 +1251,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
             url: c.html_url ?? c.details_url ?? null,
             ...(typeof c.id === 'number' ? { checkRunId: c.id } : {}),
             app: c.app?.slug ?? null,
+            ...workflowRunOf(c.html_url, c.details_url),
             ...(summary ? { summary: summary.slice(0, DETAIL_SUMMARY_MAX) } : {}),
           });
         }
@@ -1305,6 +1317,15 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         problems.push(`the job log could not be read: ${redactGitHubSecrets(err instanceof Error ? err.message : String(err))}`);
       }
       return { annotations, logTail, problems };
+    },
+
+    async rerunFailedJobs(repo, workflowRunId) {
+      try {
+        await request(`${repoPath(repo)}/actions/runs/${workflowRunId}/rerun-failed-jobs`, { method: 'POST', body: {} });
+      } catch (err) {
+        // 201 with an empty body: the re-run was accepted, there is just nothing to read.
+        if (!(err instanceof SyntaxError)) throw err;
+      }
     },
 
     async mergePullRequest(repo, pullNumber, input) {

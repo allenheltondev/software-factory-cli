@@ -13,7 +13,8 @@
 // `labeled` event for this label, by the payload's sender, created at the payload's time. From
 // there the existing pre-start checks run unchanged.
 import { createHash } from 'node:crypto';
-import { ciSettings, reviewActive, reviseActive, type UpdraftConfig } from '../config/schema.js';
+import { autoMergeMethod, ciSettings, reviewActive, reviseActive, suggestionsActive, type UpdraftConfig } from '../config/schema.js';
+import { listResumableMerges } from '../db/pr-reviews.js';
 import { getRevisionPr, listOpenRevisionPrsByHead } from '../db/revisions.js';
 import type { NewJob } from '../db/ingest.js';
 import type { GitHubApi, GitHubIssueEvent } from '../github/api.js';
@@ -234,7 +235,9 @@ async function pullRequestChanged(deps: WebhookDeps, _payload: Payload, event: W
  * A `check_suite`, `check_run` or `status` delivery: checks changed on some commit. As for a pull
  * request event, the payload only says where to look: the pull request is one of the payload's
  * (for a check), or the watched pull request whose head is the payload's commit (for a status,
- * which names no pull request); the CI step reads the checks from the API itself.
+ * which names no pull request); the CI step reads the checks from the API itself. Without ciFix,
+ * only a pull request whose merge was blocked on the checks of its head is looked at: a pass there
+ * (a re-run) carries the merge on (src/publish/merge.ts).
  */
 async function checksChanged(deps: WebhookDeps, payload: Payload, event: WebhookEventInfo): Promise<WebhookDecision> {
   const nothing = (reason: NothingToDoReason, message: string): WebhookDecision => ({ dispatch: false, reason, message, event });
@@ -243,7 +246,8 @@ async function checksChanged(deps: WebhookDeps, payload: Payload, event: Webhook
   if (!found) {
     return nothing('repository-not-configured', `no configured repository has id ${event.repositoryId}${event.repository ? ` (${event.repository})` : ''}`);
   }
-  if (!ciSettings(deps.config, found.cfg)) {
+  const ci = ciSettings(deps.config, found.cfg) !== null;
+  if (!ci && !autoMergeMethod(deps.config, found.cfg)) {
     return nothing('review-loop-off', `ciFix is not on for ${found.fullName} (it needs review, publish and execution.mode: live), so nothing acts on its checks`);
   }
   const subject = obj(payload.check_suite) ?? obj(payload.check_run);
@@ -259,6 +263,16 @@ async function checksChanged(deps: WebhookDeps, payload: Payload, event: Webhook
     if (sha) pullRequest = listOpenRevisionPrsByHead(deps.db, found.cfg.id, sha)[0] ?? null;
   }
   if (pullRequest === null) return nothing('pull-request', `the ${event.name} event is not about a pull request this worker watches`);
+  if (!ci) {
+    const n = pullRequest;
+    const blocked = listResumableMerges(deps.db, found.cfg.id, { requireSuggestions: suggestionsActive(deps.config, found.cfg) }).some((pr) => pr.prNumber === n);
+    if (!blocked) {
+      return nothing(
+        'review-loop-off',
+        `ciFix is not on for ${found.fullName}, and the merge of pull request #${n} is not blocked on its checks, so nothing acts on this ${event.name} event`,
+      );
+    }
+  }
   event.pullRequest = pullRequest;
   return { dispatch: 'poll-reviews', repo: { id: found.cfg.id, fullName: found.fullName }, pullRequest, event };
 }

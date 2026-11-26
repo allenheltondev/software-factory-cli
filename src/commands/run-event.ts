@@ -24,7 +24,7 @@ import { routeReasonCode, routeSourceOf } from '../db/metrics.js';
 import { getFailureComment } from '../db/failure-comments.js';
 import { putHold, releaseHolds } from '../db/holds.js';
 import { cancelQueuedJob, commitPollBatch } from '../db/ingest.js';
-import { getLoopPr, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
+import { getLoopPr, listResumableMerges, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
 import { getPublication } from '../db/publications.js';
 import { getJob, latestRunOfJob, MAX_START_FAILURES, RETRYABLE, retryJob } from '../db/queue.js';
 import { countRevisions, getRevisionPr, syncRevisionPrs } from '../db/revisions.js';
@@ -41,6 +41,7 @@ import { consoleContextFromEnv, createAssignmentCommenter, type AssignmentCommen
 import { createFailureCommenter, failureCommentsEnabled } from '../publish/failure-comment.js';
 import { createPublisher, publicationEnabled, type PublishDeps } from '../publish/publish.js';
 import { evaluateCiAll, postCiNotices } from '../publish/ci.js';
+import { evaluateAutoMerges } from '../publish/merge.js';
 import { evaluateSuggestionsAll } from '../publish/suggestions.js';
 import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
 import { createRevisionPublisher, findRevisionClaims, revisionsEnabled, SUPERSEDED_PREFIX } from '../publish/revision.js';
@@ -189,6 +190,11 @@ export interface RunEventLoopSummary {
   mergeCommitSha: string | null;
   /** Why it is not merged; null when it is. */
   notMergedReason: string | null;
+  /**
+   * The one automatic re-run of failed checks on the head (docs/ci-fix.md, "One re-run"): the
+   * head, when, and which checks; null when that head was not re-run.
+   */
+  ciRerun: { sha: string; at: string | null; checks: string[] } | null;
 }
 
 /**
@@ -527,6 +533,7 @@ function summarizeLoop(db: Db, config: UpdraftConfig, repoId: number, prNumber: 
     merged,
     mergeCommitSha: pr.mergeCommitSha,
     notMergedReason,
+    ciRerun: pr.ciRerunSha && pr.ciRerunSha === pr.headSha ? { sha: pr.ciRerunSha, at: pr.ciRerunAt, checks: pr.ciRerunChecks } : null,
   };
 }
 
@@ -807,6 +814,17 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       const suggested = await evaluateSuggestionsAll({ ...ciDeps, log: log.child({ component: 'suggestions' }) }, undefined, { only: { repoId: repo.id, prNumber: n } });
       const ci = await evaluateCiAll(ciDeps, undefined, { only: { repoId: repo.id, prNumber: n }, force: true });
       if (ci.length) await postCiNotices(ciDeps);
+      // A merge blocked on the checks of this head is looked at now: they may pass after a re-run
+      // (by Updraft or by a person), and the merge goes ahead with no new commit. Not pending work,
+      // so the drain below would not get to it.
+      const requireCi = ciSettings(config, repoCfg) !== null;
+      if (autoMergeMethod(config, repoCfg) && listResumableMerges(openDb, repo.id, { requireCi, requireSuggestions: suggestionsActive(config, repoCfg) }).some((pr) => pr.prNumber === n)) {
+        await evaluateAutoMerges({ ...ciDeps, log: log.child({ component: 'merge' }) }, undefined, { only: { repoId: repo.id, prNumber: n } });
+        if (getLoopPr(openDb, repo.id, n)?.mergeState === 'merged') {
+          summary.loop = summarizeLoop(openDb, config, repo.id, n);
+          return nothing('pull-request-closed', `pull request #${n} of ${repo.fullName} was merged by Updraft: its checks pass now on the head whose merge was blocked on them`);
+        }
+      }
       const ciQueued = ci.filter((r) => r.status === 'fixing').length;
       const suggestionsQueued = suggested.filter((r) => r.status === 'fixing').length;
       summary.dispatched = (polled?.revisionsQueued ?? 0) + (polled?.reviewsQueued ?? 0) + ciQueued + suggestionsQueued > 0;
