@@ -23,6 +23,8 @@ import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { createPublisher, type PublishDeps } from '../publish/publish.js';
 import { createReviewLoopPublisher, reviewMarker } from '../publish/review.js';
 import { createRevisionPublisher } from '../publish/revision.js';
+import { createAssignmentCommenter } from '../publish/assignment-comment.js';
+import { parseStatusMarker } from '../publish/status-marker.js';
 import { reviewOf, revisionOf, type Job } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { runDaemon } from './daemon.js';
@@ -81,6 +83,7 @@ function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[]; 
         remote: 'origin',
         baseBranch: 'main',
         publish: 'draft-pr',
+        notifications: 'verbose',
         revise: true,
         review: true,
         autoMerge: 'squash',
@@ -107,7 +110,7 @@ function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[]; 
 
 const remoteHead = (f: GitFixture, branch: string) => f.git(f.root, 'ls-remote', f.remoteDir, `refs/heads/${branch}`).split(/\s+/)[0] ?? '';
 
-function start(s: ReturnType<typeof setup>, executorOptions: { nativeClaudeAuth?: NativeAuthRunner } = {}) {
+function start(s: ReturnType<typeof setup>, executorOptions: { nativeClaudeAuth?: NativeAuthRunner } = {}, withStatus = false) {
   const { db, config, paths, gh } = s;
   const api = gh.api;
   const controller = new AbortController();
@@ -131,6 +134,7 @@ function start(s: ReturnType<typeof setup>, executorOptions: { nativeClaudeAuth?
     poll: () => pollOnce({ db, api, config, log: silentLogger }),
     checkDispatchable: (job) => checkJobDispatchable({ api, config }, job),
     publisher: createReviewLoopPublisher(deps, createRevisionPublisher(deps, createPublisher(deps))),
+    ...(withStatus ? { assignmentCommenter: createAssignmentCommenter({ db, config, api, log: silentLogger, sleep: async () => {} }) } : {}),
     hostname: hostname(),
     pid: process.pid,
   });
@@ -365,6 +369,31 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(log).toContain('review verdict for');
     expect(log.match(/review findings count: none \(the reviewer's UPDRAFT-FINDINGS line is not a whole number from 0 to 999999\); the verdict is unaffected/g)).toHaveLength(1);
     expect(db.prepare("SELECT findings FROM metric_events WHERE kind = 'review.verdict'").all()).toEqual([{ findings: null }]);
+  });
+
+  it('quiet notifications: from label to merge, one Updraft comment on the issue, edited through its stages, and nothing on the PR but its body and the reviews', async () => {
+    const s = setup({ repo: { notifications: 'quiet' }, reviewerArgs: ['--mode', 'review', '--verdict', 'ready-to-merge'] });
+    const { db, gh } = s;
+    const worker = start(s, {}, true);
+    await vi.waitFor(() => expect(gh.merges).toHaveLength(1), { timeout: 150_000, interval: 100 });
+    await vi.waitFor(() => expect(gh.comments.find((c) => c.issue === ISSUE)?.body ?? '').toContain('**Updraft · Merged**'), { timeout: 10_000, interval: 50 });
+    await worker.stop();
+
+    expect(jobsOf(db).map((j) => j.envelope.type)).toEqual(['issue.labeled', 'pull_request.review']);
+    // One comment on the issue: posted once at assignment, and only edited after that.
+    const onIssue = gh.comments.filter((c) => c.issue === ISSUE);
+    expect(onIssue).toHaveLength(1);
+    expect(gh.writes.filter((w) => w === `comment #${ISSUE}`)).toHaveLength(1);
+    expect(gh.writes.indexOf(`comment #${ISSUE}`)).toBeLessThan(gh.writes.indexOf(`open draft PR ${s.prBranch} -> main`));
+    expect(parseStatusMarker(onIssue[0]!.body)).toMatchObject({ stage: 90, pr: PR });
+    expect(onIssue[0]!.body).toContain(`PR #${PR} was merged.`);
+    expect(onIssue[0]!.body).toContain('| Worker | `claude` |');
+    // On the pull request: the review, and no comment at all.
+    expect(gh.comments.filter((c) => c.issue === PR)).toEqual([]);
+    expect(gh.writes.filter((w) => w.startsWith('review #'))).toHaveLength(1);
+    // Its body names the merge that actually happened.
+    expect(gh.pullBody).toContain('Updraft merges this (`squash`) once review and checks pass.');
+    expect(gh.pullBody).not.toContain('Merging is up to a person');
   });
 
   it('with autoMerge off, stops at a PR that is ready for review and merges nothing', async () => {

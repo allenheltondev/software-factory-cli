@@ -24,6 +24,7 @@ import { silentLogger } from '../util/log.js';
 import { ciNoticeMarker, CI_POLL_MS, CI_REGISTER_GRACE_MS, evaluateCiAll, failureSignature, judgeChecks, logExcerpt, postCiNotices, redactCi } from './ci.js';
 import { evaluateAutoMerges } from './merge.js';
 import type { PublishDeps } from './publish.js';
+import { renderStatusComment, STATUS_STAGE } from './status-marker.js';
 import { createReviewLoopPublisher, postReview } from './review.js';
 
 const REPO_ID = 42;
@@ -82,6 +83,7 @@ function setup(repo: Record<string, unknown> = {}) {
         id: REPO_ID,
         checkoutPath: './clone',
         publish: 'draft-pr',
+        notifications: 'verbose',
         revise: true,
         review: true,
         ciFix: true,
@@ -169,6 +171,52 @@ const DIAGNOSTICS = {
   logTail: '2026-11-18T12:00:00.0000000Z npm test\n2026-11-18T12:00:01.0000000Z FAIL widget.test.ts\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz0123\n2026-11-18T12:00:02.0000000Z ##[error]Process completed with exit code 1.',
   problems: [],
 };
+
+describe('the CI step with quiet notifications', () => {
+  it('fixes and merges with no comment on the PR, moving the issue status comment instead; stops for a person with one comment', async () => {
+    const s = setup({ autoMerge: 'squash', notifications: 'quiet' });
+    // The status comment publication left on the issue.
+    const status = await s.gh.api.createIssueComment({ id: REPO_ID, fullName: FULL }, ISSUE, renderStatusComment({ title: 'PR opened', text: `PR #${PR} opened`, details: '| | |\n| --- | --- |\n| Worker | `claude` |', mark: { key: 'job_x', stage: STATUS_STAGE.published, pr: PR } }));
+    const statusBody = () => s.gh.comments.find((c) => c.id === status.id)!.body;
+    s.gh.checks = checksOf([run('build', 'success', 1), FAILED_TEST]);
+    s.gh.diagnostics[7] = DIAGNOSTICS;
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'fixing' }]);
+    expect(s.ciComments()).toEqual([]);
+    expect(statusBody()).toContain(`Fixing failed checks on \`${H1.slice(0, 7)}\` of PR #${PR} (CI fix 1).`);
+    expect(statusBody()).toContain('| Worker | `claude` |');
+    // Said once: the head's notice is on record, so later polls write nothing more.
+    const writes = s.gh.writes.length;
+    await s.ci(true);
+    expect(s.gh.writes.length).toBe(writes);
+
+    const [job] = s.queued();
+    s.revised(job!, H2);
+    s.gh.checks = checksOf([run('build', 'success', 11), run('test', 'success', 12)]);
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'passed' }]);
+    expect(s.ciComments()).toEqual([]);
+    expect(statusBody()).toContain('after CI fix 1; Updraft merges it once nothing else stands in the way.');
+    await evaluateAutoMerges(s.deps);
+    expect(s.gh.merges).toEqual([{ sha: H2, method: 'squash' }]);
+    expect(statusBody()).toContain(`**Updraft · Merged**`);
+    expect(statusBody()).toContain(`PR #${PR} was merged after CI fix 1.`);
+    // Only the status comment on the issue; nothing but reviews on the PR.
+    expect(s.gh.comments.filter((c) => c.issue === PR)).toEqual([]);
+    expect(s.gh.comments.filter((c) => c.issue === ISSUE)).toHaveLength(1);
+  });
+
+  it('asks a person, once, when a failure is not one the code can fix', async () => {
+    const s = setup({ notifications: 'quiet' });
+    s.gh.checks = checksOf([run('build', 'cancelled', 1)]);
+    await s.review('ready-to-merge');
+    expect(await s.ci()).toMatchObject([{ status: 'blocked' }]);
+    await s.ci(true);
+    expect(s.ciComments()).toHaveLength(1);
+    expect(s.ciComments()[0]!.body).toMatch(/^Updraft stopped working on the checks of PR #\d+ at `[0-9a-f]{12}` and needs a person: /);
+    expect(s.ciComments()[0]!.body).toContain('Please fix the checks or push a commit');
+  });
+});
 
 describe('the CI step after a clean review', () => {
   it('waits for pending checks without marking the draft ready or queuing anything', async () => {

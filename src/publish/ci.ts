@@ -42,8 +42,11 @@ import type { RepoRef, RevisionRequest } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { code } from './failure-comment.js';
 import { cap, fenced, inline, type PublishDeps } from './publish.js';
+import { consoleWorkflowUrl } from './console-link.js';
+import { noteStatus, quietFor, shortSha } from './status-comment.js';
+import { STATUS_STAGE } from './status-marker.js';
 
-export type CiDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'scope'>;
+export type CiDeps = Pick<PublishDeps, 'db' | 'config' | 'api' | 'log' | 'now' | 'scope' | 'console'>;
 
 /** How often a head that is waiting for its checks is read again by the polling worker. A webhook does not wait for this. */
 export const CI_POLL_MS = 60_000;
@@ -558,6 +561,45 @@ export function renderCiNotice(o: {
   return [...lines, '', ciNoticeMarker(o.sha)].join('\n');
 }
 
+/**
+ * Quiet notifications: the CI step speaks on the pull request only when it stops and a person has
+ * to act (the checks need a person, or they passed after a fix and merging is up to a person), in
+ * one or two plain sentences with what to do. Null when nothing is owed to a person: a fix under
+ * way, or a pass that auto-merge takes from here (the status comment says both).
+ */
+export function renderQuietCiNotice(o: { pr: LoopPr; sha: string; failed?: readonly CheckDetail[] | null; merge?: MergeMethod | null; link?: string | null }): string | null {
+  const { pr } = o;
+  const link = o.link ? ` [View this work in Updraft](${o.link})` : '';
+  let lines: string[];
+  if (pr.ciState === 'blocked') {
+    lines = [
+      `Updraft stopped working on the checks of PR #${pr.prNumber} at ${code(short(o.sha))} and needs a person: ${inline(cap(pr.ciReason ?? 'no reason was recorded', 600))}. ` +
+        `Please fix the checks or push a commit; a new commit gets a new review and new checks.${link}`,
+      ...(o.failed?.length ? ['', ...failedLines(o.failed)] : []),
+    ];
+  } else if (pr.ciState === 'passed' && !o.merge) {
+    lines = [
+      `The checks of PR #${pr.prNumber} pass on ${code(short(o.sha))} after CI fix ${pr.ciFixes}, and the review found it ready. ` +
+        `Please merge it when you are ready; Updraft does not merge pull requests in this repository.${link}`,
+    ];
+  } else {
+    return null;
+  }
+  return [...lines, '', ciNoticeMarker(o.sha)].join('\n');
+}
+
+/** The status comment's line for a head's CI step (quiet notifications). */
+function ciStatus(pr: LoopPr, sha: string, merge: MergeMethod | null): { title: string; text: string } | null {
+  if (pr.ciState === 'fixing') return { title: 'Fixing checks', text: `Fixing failed checks on \`${shortSha(sha)}\` of PR #${pr.prNumber} (CI fix ${pr.ciFixes}).` };
+  if (pr.ciState === 'passed') {
+    return merge
+      ? { title: 'Checks passed', text: `Checks passed on \`${shortSha(sha)}\` of PR #${pr.prNumber} after CI fix ${pr.ciFixes}; Updraft merges it once nothing else stands in the way.` }
+      : { title: 'Waiting for a person', text: `Checks passed on \`${shortSha(sha)}\` of PR #${pr.prNumber} after CI fix ${pr.ciFixes}; it is ready for a person to merge.` };
+  }
+  if (pr.ciState === 'blocked') return { title: 'Waiting for a person', text: `The checks of PR #${pr.prNumber} need a person (see the PR).` };
+  return null;
+}
+
 /** The failed checks of `sha` that decide, for the comment. Best effort: null when GitHub could not be asked. */
 async function failedChecks(deps: CiDeps, repo: RepoRef, sha: string, settings: Pick<CiSettings, 'checks' | 'ignore'>): Promise<CheckDetail[] | null> {
   try {
@@ -588,6 +630,30 @@ export async function postCiNotices(deps: CiDeps, signal?: AbortSignal): Promise
     if (!found || !sha || !settings) continue;
     const repoRef = { id: pr.repoId, fullName: found.fullName };
     try {
+      const merge = autoMergeMethod(deps.config, found.repo);
+      if (quietFor(deps.config, { repoId: pr.repoId, repoFullName: found.fullName })) {
+        const status = ciStatus(pr, sha, merge);
+        if (status) await noteStatus({ api: deps.api, log: deps.log }, { repo: repoRef, issue: pr.issueNumber, target: { pr: pr.prNumber }, stage: STATUS_STAGE.loop, ...status });
+        const body = renderQuietCiNotice({
+          pr,
+          sha,
+          failed: pr.ciState === 'blocked' ? await failedChecks(deps, repoRef, sha, settings) : null,
+          merge,
+          link: consoleWorkflowUrl(deps.console, pr.repoId, pr.issueNumber),
+        });
+        if (!body) {
+          // Nothing a person has to do: the status comment said it.
+          recordCiNotice(deps.db, pr.repoId, pr.prNumber, sha, { skipped: true }, deps.now);
+          continue;
+        }
+        const login = await workerLogin(deps.api);
+        const marker = ciNoticeMarker(sha);
+        const existing = (await deps.api.listIssueComments(repoRef, pr.prNumber)).find((c) => c.body.includes(marker) && sameLogin(c.user, login));
+        const posted = existing ?? (await deps.api.createIssueComment(repoRef, pr.prNumber, body));
+        recordCiNotice(deps.db, pr.repoId, pr.prNumber, sha, { commentId: posted.id, commentUrl: posted.htmlUrl }, deps.now);
+        deps.log.info('asked a person about the checks', { repo: found.fullName, pr: pr.prNumber, state: pr.ciState, comment: posted.htmlUrl });
+        continue;
+      }
       const login = await workerLogin(deps.api);
       const marker = ciNoticeMarker(sha);
       const own = (await deps.api.listIssueComments(repoRef, pr.prNumber)).filter((c) => sameLogin(c.user, login));
@@ -608,7 +674,7 @@ export async function postCiNotices(deps: CiDeps, signal?: AbortSignal): Promise
           repoFullName: found.fullName,
           // Linked on the pull request even when their logs cannot be read.
           failed: pr.ciState === 'passed' ? null : await failedChecks(deps, repoRef, sha, settings),
-          merge: autoMergeMethod(deps.config, found.repo),
+          merge,
         });
       const posted = existing ?? (await deps.api.createIssueComment(repoRef, pr.prNumber, await render()));
       recordCiNotice(deps.db, pr.repoId, pr.prNumber, sha, { commentId: posted.id, commentUrl: posted.htmlUrl }, deps.now);
