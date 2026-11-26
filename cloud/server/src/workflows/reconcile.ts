@@ -32,7 +32,7 @@ import { OFF_SWITCH, type KillSwitch } from '../jobs/kill-switch.js';
 import type { Store } from '../store/store.js';
 import { workflowPause } from '../jobs/stop.js';
 import { updateWorkflow } from './recorder.js';
-import { pauseControlOf, pausedWorkflow, resumedWorkflow } from './timeline.js';
+import { pauseControlOf, pausedWorkflow, pauseNoticedMessage, resumedWorkflow } from './timeline.js';
 import { createRecovery, type RecoveryDeps } from './recovery.js';
 import type { WorkflowStore } from './store.js';
 import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
@@ -130,9 +130,10 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     const pause = await workflowPause(deps.controls, w);
     if (pause) {
       const repeated = w.controlPause?.jobId === pause.jobId && w.controlPause.at === pause.at;
+      const ref = { jobId: pause.jobId, at: pause.at, by: pause.by, ...withControl((pause as { control?: unknown }).control) };
       await change(w, (cur) => ({
-        workflow: pausedWorkflow(cur, { jobId: pause.jobId, at: pause.at, by: pause.by, ...withControl((pause as { control?: unknown }).control) }, at),
-        ...(!repeated ? { event: { ...blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, 'An authorized stop paused automation on this workflow.'), reason: 'workflow_paused' } } : {}),
+        workflow: pausedWorkflow(cur, ref, at),
+        ...(!repeated ? { event: { ...blockedEvent(`control-pause:${pause.jobId}:${pause.at}`, pauseNoticedMessage(ref)), reason: 'workflow_paused' } } : {}),
       }));
       if (!repeated) report.blocked++;
       return;

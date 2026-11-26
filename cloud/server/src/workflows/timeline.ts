@@ -95,32 +95,52 @@ export interface PauseRef {
 }
 
 const CODE = /^[a-z][a-z0-9_-]{0,39}$/;
+/**
+ * Who, as it may appear in a workflow's words: a GitHub login (an App's ends `[bot]`), or the
+ * console caller's id that a stop records when the caller has no login (a Cognito sub, a UUID).
+ */
+const ACTOR = /^[A-Za-z0-9-]{1,39}(\[bot\])?$/;
+export const actorOf = (by: unknown): string | undefined => (typeof by === 'string' && ACTOR.test(by) ? by : undefined);
 
 /** A PAUSE record's `control` descriptor, if it is a well-formed one (anything else is ignored). */
 export function pauseControlOf(raw: unknown): PauseControl | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const c = raw as Record<string, unknown>;
   if ((c.kind !== 'pause' && c.kind !== 'cancel') || typeof c.source !== 'string' || !CODE.test(c.source)) return undefined;
-  return { kind: c.kind, source: c.source, ...(typeof c.by === 'string' && c.by ? { by: c.by.slice(0, 100) } : {}) };
+  const by = actorOf(c.by);
+  return { kind: c.kind, source: c.source, ...(by ? { by } : {}) };
 }
 
 /** The words of a pause: a console stop's, or a command's (pause or cancel, and from where). */
 function pauseWords(pause: PauseRef): { message: string; nextAction: string } {
   const c = pause.control;
   if (!c) {
+    const who = actorOf(pause.by);
     return {
-      message: `Automation was paused by ${pause.by}. The stopped job and existing pull request are preserved.`,
+      message: `Automation was paused${who ? ` by ${who}` : ''}. The stopped job and existing pull request are preserved.`,
       nextAction: `Resume automation from this workflow's page (nothing is run again), or retry job ${pause.jobId} from its page while it is still kept.`,
     };
   }
-  const who = c.by ?? pause.by;
-  const from = c.source.replace(/[_-]/g, ' ');
-  return {
-    message: c.kind === 'cancel'
-      ? `Automation was canceled by ${who} (${from}). Existing commits and the pull request are preserved.`
-      : `Automation was paused by ${who} (${from}). Existing commits and the pull request are preserved.`,
-    nextAction: "Resume automation from this workflow's page (nothing is run again).",
-  };
+  return { message: `${commandPause(pause)}. Existing commits and the pull request are preserved.`, nextAction: "Resume automation from this workflow's page (nothing is run again)." };
+}
+
+/** "Automation was paused by pat (github comment)": a command's pause or cancel, in words. */
+function commandPause(pause: PauseRef): string {
+  const c = pause.control!;
+  const who = actorOf(c.by) ?? actorOf(pause.by);
+  return `Automation was ${c.kind === 'cancel' ? 'canceled' : 'paused'}${who ? ` by ${who}` : ''} (${c.source.replace(/[_-]/g, ' ')})`;
+}
+
+/** The timeline's words for a pause first noticed (by the reconciler). */
+export function pauseNoticedMessage(pause: PauseRef): string {
+  return pause.control ? `${commandPause(pause)}.` : 'An authorized stop paused automation on this workflow.';
+}
+
+/** The timeline's words for a resume that leaves the workflow paused by `other`. */
+export function stillPausedMessage(other: PauseRef): string {
+  if (other.control) return `This pause was resumed, but automation stays paused: ${commandPause(other).replace(/^Automation was /, '')}, which still holds it.`;
+  const who = actorOf(other.by);
+  return `This pause was resumed, but automation stays paused: ${who ? `${who}'s` : 'another'} stop of job ${other.jobId} still holds it.`;
 }
 
 /**

@@ -266,6 +266,46 @@ describe('a wait a pause interrupts', () => {
   });
 });
 
+describe('a resume that cannot read the other pauses', () => {
+  it('keeps the workflow paused, due a look at once, and never restores an unpaused state', async () => {
+    const store = createMemoryWorkflowStore();
+    const pauses = { getWorkflowPause: async () => { throw new Error('throttled'); } };
+    const recorder = createWorkflowRecorder({ store, pauses, now: () => T0 + 60_000, log: () => {} });
+    await recorder.started(job());
+    await recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'waiting-for-ci' } });
+    await recorder.stopRequested(job(), { requestedAt: T0, by: 'pat' });
+    await recorder.resumed({ installationId: 55, workflowId: '99-i7' }, { jobId: 'job_issue0001', at: T0 }, 'pat');
+    const w = (await store.getWorkflow(55, '99-i7'))!;
+    expect(w).toMatchObject({ status: 'blocked', reason: 'workflow_paused', controlPause: { jobId: 'job_issue0001' }, nextCheckAt: new Date(T0 + 60_000).toISOString() });
+    expect((await store.listWorkflowEvents(55, '99-i7', 20)).at(-1)).toMatchObject({ control: { action: 'resumed' }, message: expect.stringMatching(/shows as paused until/) });
+  });
+});
+
+describe('who, in a workflow\'s words', () => {
+  it('names only a login or console id, and leaves anything else out', async () => {
+    const w0 = newWorkflow(job(), '99-i7', T0);
+    expect(pausedWorkflow(w0, { jobId: 'job_a', at: 1, by: 'dependabot[bot]' }, T0).message).toMatch(/^Automation was paused by dependabot\[bot\]\./);
+    expect(pausedWorkflow(w0, { jobId: 'job_a', at: 1, by: '0b3c6f1e-1111-4222-8333-944455556666' }, T0).message).toMatch(/paused by 0b3c6f1e/);
+    expect(pausedWorkflow(w0, { jobId: 'job_a', at: 1, by: '<img src=x> click here' }, T0).message).toBe('Automation was paused. The stopped job and existing pull request are preserved.');
+    expect(pauseControlOf({ kind: 'pause', source: 'github_comment', by: 'not a login!' })).toEqual({ kind: 'pause', source: 'github_comment' });
+    const s = setup();
+    await s.recorder.started(job());
+    await s.recorder.stopRequested(job(), { requestedAt: T0, by: 'Robert"); drop' });
+    expect((await s.events()).at(-1)).toMatchObject({ control: { by: 'an owner' } });
+  });
+
+  it('words a resume that stays paused by a command as that command', async () => {
+    const store = createMemoryWorkflowStore();
+    const held = { jobId: 'control-xyz', at: T0 + 5, by: 'sam', control: { kind: 'cancel', source: 'github_comment' } };
+    const recorder = createWorkflowRecorder({ store, pauses: { getWorkflowPause: async () => held as never }, now: () => T0, log: () => {} });
+    await recorder.started(job());
+    await recorder.stopRequested(job(), { requestedAt: T0, by: 'pat' });
+    await recorder.resumed({ installationId: 55, workflowId: '99-i7' }, { jobId: 'job_issue0001', at: T0 }, 'pat');
+    expect((await store.listWorkflowEvents(55, '99-i7', 20)).at(-1)!.message).toBe('This pause was resumed, but automation stays paused: canceled by sam (github comment), which still holds it.');
+    expect((await store.getWorkflow(55, '99-i7'))!.message).toMatch(/^Automation was canceled by sam \(github comment\)/);
+  });
+});
+
 describe('retention and history', () => {
   it('says how many older events a page leaves out', async () => {
     const s = setup();

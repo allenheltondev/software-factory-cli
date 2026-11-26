@@ -6,7 +6,7 @@
  */
 import type { Job, JobFinishDetail, Store, WorkflowPause } from '../store/store.js';
 import type { WorkflowStore } from './store.js';
-import { endedWait, keepPaused, pauseControlOf, pausedWorkflow, resumedWorkflow, waitFrom, type PauseRef } from './timeline.js';
+import { actorOf, endedWait, keepPaused, pauseControlOf, pausedWorkflow, resumedWorkflow, stillPausedMessage, waitFrom, type PauseRef } from './timeline.js';
 import { newWorkflow, onJobFinished, onJobQueued, onJobStarted, onJobWaiting, onQueueCovered, onQueueEnded, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
 
 type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'> & Partial<Pick<Job, 'expiresAt' | 'native'>>;
@@ -86,12 +86,20 @@ export function createWorkflowRecorder(o: {
 }) {
   const now = o.now ?? Date.now;
   const log = o.log ?? ((entry) => console.log(JSON.stringify(entry)));
-  /** A pause other than `resumed` holding one of the workflow's subjects now (its issue, its pull request). */
-  const otherPause = async (w: Workflow, resumed: { jobId: string; at: number }): Promise<WorkflowPause | null> => {
+  /**
+   * A pause other than `resumed` holding one of the workflow's subjects now (its issue, its pull
+   * request), or `unknown` when a pause could not be read: then nothing may be taken as unpaused.
+   */
+  const otherPause = async (w: Workflow, resumed: { jobId: string; at: number }): Promise<WorkflowPause | null | 'unknown'> => {
     if (!o.pauses) return null;
     for (const subject of new Set([w.issue, w.pullRequest])) {
       if (subject === undefined) continue;
-      const p = await o.pauses.getWorkflowPause(w.installationId, w.repositoryId, subject).catch(() => null);
+      let p: WorkflowPause | null;
+      try {
+        p = await o.pauses.getWorkflowPause(w.installationId, w.repositoryId, subject);
+      } catch {
+        return 'unknown';
+      }
       if (p && !(p.jobId === resumed.jobId && p.at === resumed.at)) return p;
     }
     return null;
@@ -204,7 +212,7 @@ export function createWorkflowRecorder(o: {
             workflow: pausedWorkflow(w, pause, at),
             event: {
               id: `control:stop:${job.jobId}:${stop.requestedAt}`, at: new Date(at).toISOString(), kind: 'control', generation, jobId: job.jobId,
-              control: { action: 'stop_requested', by: stop.by, ...(stop.reason ? { reason: stop.reason.slice(0, 200) } : {}) },
+              control: { action: 'stop_requested', by: actorOf(stop.by) ?? 'an owner', ...(stop.reason ? { reason: stop.reason.slice(0, 200) } : {}) },
               message: 'Stop requested. Automation on this workflow is paused until an owner resumes it; the job\'s commits and pull request are kept.',
             },
           };
@@ -222,24 +230,30 @@ export function createWorkflowRecorder(o: {
         const at = now();
         // Another stop's pause that still holds one of the workflow's subjects: it stays paused, by that one.
         const current = await o.store.getWorkflow(where.installationId, id);
-        const other = current ? await otherPause(current, pause) : null;
+        const found = current ? await otherPause(current, pause) : null;
+        const other: PauseRef | null = found && found !== 'unknown' ? { jobId: found.jobId, at: found.at, by: found.by, ...withControl((found as { control?: unknown }).control) } : null;
         await updateWorkflow(o.store, where.installationId, id, (w) => {
           if (!w) return null;
           const ours = w.controlPause?.jobId === pause.jobId && w.controlPause.at === pause.at;
           const waited = waitFrom('pause', pause.at, at);
           const next = !ours
             ? { ...w, updatedAt: new Date(at).toISOString() }
-            : other
-              ? pausedWorkflow(w, { jobId: other.jobId, at: other.at, by: other.by, ...withControl((other as { control?: unknown }).control) }, at)
-              : resumedWorkflow(w, at);
+            : found === 'unknown'
+              // Not known to be unpaused: it stays paused, and the reconciler settles it at its next run.
+              ? { ...w, nextCheckAt: new Date(at).toISOString(), updatedAt: new Date(at).toISOString() }
+              : other
+                ? pausedWorkflow(w, other, at)
+                : resumedWorkflow(w, at);
           return {
             workflow: next,
             event: {
               id: `control:resume:${pause.jobId}:${pause.at}`, at: new Date(at).toISOString(), kind: 'control', generation: w.generation, jobId: pause.jobId,
-              control: { action: 'resumed', by }, ...(waited ? { waited } : {}),
+              control: { action: 'resumed', by: actorOf(by) ?? 'an owner' }, ...(waited ? { waited } : {}),
               message: other
-                ? `This pause was resumed, but automation stays paused: ${other.by}'s stop of job ${other.jobId} still holds it.`
-                : 'Automation resumed. Future GitHub events continue the workflow; nothing is run again.',
+                ? stillPausedMessage(other)
+                : found === 'unknown' && ours
+                  ? 'Automation resumed. This workflow shows as paused until Updraft confirms no other stop holds it (within minutes).'
+                  : 'Automation resumed. Future GitHub events continue the workflow; nothing is run again.',
             },
           };
         });

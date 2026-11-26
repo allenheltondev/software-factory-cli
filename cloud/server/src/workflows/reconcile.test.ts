@@ -93,6 +93,7 @@ describe('workflow reconciliation', () => {
     s.controls.getWorkflowPause.mockResolvedValue({ jobId: 'control-abc', at: T0, by: 'pat', control: { kind: 'pause', source: 'github_comment' } } as never);
     await s.reconcile();
     expect(await s.wf()).toMatchObject({ reason: 'workflow_paused', message: 'Automation was paused by pat (github comment). Existing commits and the pull request are preserved.', controlPause: { control: { kind: 'pause' } } });
+    expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).at(-1)).toMatchObject({ kind: 'blocked', message: 'Automation was paused by pat (github comment).' });
   });
 
   it('on resume, gives a workflow that was already blocked its own state back, without diagnosing it again', async () => {
