@@ -9,6 +9,8 @@ import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { handle } from 'hono/aws-lambda';
 import { adminAccess, DEFAULT_ADMIN_GROUP } from './admin/access.js';
 import { createAdminService } from './admin/admin.js';
+import { createJobFinishedReplay } from './admin/job-finished-replay.js';
+import { dynamoFinishedSummaries, dynamoReplayLock, eventBridgePut } from './admin/job-finished-replay-aws.js';
 import { createApp } from './app.js';
 import { createRoutineService } from './routines/service.js';
 import { createDynamoRoutineRuleStore } from './routines/rules.js';
@@ -211,6 +213,13 @@ const app = createApp({
         admin: {
           access: adminAccess(process.env.ADMIN_GROUP ?? DEFAULT_ADMIN_GROUP),
           service: createAdminService({ store, quotas: quotasFromEnv(process.env) }),
+          // Replaying Job Finished events: sent as the live publisher sends them, under its stack name.
+          ...(process.env.STACK_NAME
+            ? { replay: createJobFinishedReplay({
+                store, stack: process.env.STACK_NAME,
+                lock: dynamoReplayLock(tableName), summaries: dynamoFinishedSummaries(tableName), put: eventBridgePut(),
+              }) }
+            : {}),
         },
       }
     : {}),

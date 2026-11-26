@@ -238,6 +238,40 @@ Insights uses recorded response models while the source job summaries are retain
 30 days. After a summary expires, historical groups use the configured model from the
 durable run history. Longer views can therefore include both attribution sources.
 
+#### Replaying Job Finished events (backfill)
+
+Only a summary's first move to `finished` publishes an event, so jobs that finished before the
+tenant opted in (or before the publisher was deployed) are never sent. A platform admin can
+send them from the job summaries the table keeps for 30 days:
+
+```http
+POST /api/v1/admin/tenants/<installation-id>/job-finished-events/replay
+{"since": "2026-11-01T00:00:00Z", "until": "2026-11-26T00:00:00Z"}
+```
+
+- It sends one event for each of the tenant's `finished` job summaries whose `finishedAt` falls
+  in `[since, until)`. The events go to the same default bus, with the same `source` and
+  `detail-type`, in `PutEvents` batches of at most 10.
+- Each replayed event has the live event's detail plus `replayed: true`. Live events never
+  carry the field, not even as `false`, and it is additive within v1.
+- `since` and `until` must be full ISO 8601 timestamps with a time zone, with `since` before
+  `until` and at most 30 days between them. An `until` in the future is clamped to now. Any
+  other window gets a `400`.
+- The tenant must have opted in (see above). Otherwise the call gets a `409`. Only admins can
+  call it; anyone else gets a `403`, the same as the other admin routes.
+- Each tenant can run one replay per 15 minutes. The lock is the item `TENANT#<id>` /
+  `JOB_FINISHED_REPLAY`. A second call inside that time gets a `429`, and its `Retry-After`
+  header gives the seconds left. A call refused for its window or opt-in gives the lock back.
+  A replay that sent anything, fully or partly, keeps it.
+- The call is synchronous. It answers `200 {"replayed": <count>, "since": ..., "until": ...}`
+  with the window it used. Entries that `PutEvents` rejects are retried once. If any still fail,
+  the call answers `502` with `sent` and `failed` counts. Run the same replay again after the
+  lock expires.
+
+Consumers deduplicate on `stack`, `tenantId` and `jobId`, as for live events. A job that was
+already delivered can be replayed safely, and so can an overlapping window. A consumer that
+needs to tell a backfill from a live finish checks `replayed`.
+
 #### Recovering failed events
 
 A batch that still fails after its retries (5, with the batch split in half each time) is
