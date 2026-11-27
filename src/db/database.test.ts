@@ -490,3 +490,20 @@ describe('migration v22', () => {
     expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 22 });
   });
 });
+
+describe('migration v23', () => {
+  it('records who published a run: login and account id only, legacy rows left without one', () => {
+    const db = openDatabase(':memory:', { migrateTo: 22 });
+    const cols = () => (db.prepare('PRAGMA table_info(publications)').all() as { name: string }[]).map((c) => c.name);
+    expect(cols()).not.toContain('publisher_kind');
+    migrate(db, 23);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 23 });
+    expect(cols()).toEqual(expect.arrayContaining(['publisher_kind', 'publisher_login', 'publisher_id']));
+    expect(cols().some((c) => /token|secret|credential/i.test(c))).toBe(false);
+    // Run again over a database that already has the columns: nothing changes.
+    db.exec('PRAGMA user_version = 22');
+    migrate(db, 23);
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 23 });
+    db.close();
+  });
+});

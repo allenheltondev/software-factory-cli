@@ -36,6 +36,7 @@ import {
 import { GitHubError, type GitHubApi, type GitHubReview, type PullRequestReviews, type PullRequestUpdate } from '../github/api.js';
 import { revisionOf, type IssueSnapshot, type Job, type RepoRef, type ReviewSnapshot, type RevisionRequest } from '../types.js';
 import type { Logger } from '../util/log.js';
+import { isWorkerLogin, type WorkerIdentity } from '../github/credentials.js';
 import { requesterProblem, reviewTrigger, reviewWithdrawn, verdictStale } from './review-trigger.js';
 
 /** Pull requests per page. Keep constant: the stored page-1 ETag depends on the query string. */
@@ -156,6 +157,8 @@ export async function pollRepoReviews(
   if (!revising && !reviewing) return null;
   const { db, api } = deps;
   const { only } = opts;
+  /** The worker's identity, read once when a review that may be its own is seen. */
+  let worker: WorkerIdentity | null = null;
   const result: ReviewPollResult = { pullRequestsRead: 0, revisionsQueued: 0, reviewsQueued: 0, jobsCanceled: 0 };
   const scheduleReviewJobs = () => {
     for (const job of scheduleReviews(db, deps.config, repo.fullName, cfg, deps.now, only === undefined ? undefined : (pr) => pr.prNumber === only)) {
@@ -247,7 +250,11 @@ export async function pollRepoReviews(
     }
     if (revising) {
       opts.beforeIngest?.(w.prNumber);
-      result.revisionsQueued += ingestReviews(deps, repo, cfg, w, pr, log);
+      // Updraft's own formal change requests (publishAs user: the App reviews a person's pull
+      // request) already queued their revision from the recorded verdict. Recognised by author and
+      // marker together, so nobody else's review can pass for one, and nothing is queued twice.
+      if (!worker && pr.reviews.some((r) => r.state === 'CHANGES_REQUESTED' && r.body.includes(REVIEW_MARKER_PREFIX))) worker = await api.getWorkerIdentity();
+      result.revisionsQueued += ingestReviews(deps, repo, cfg, w, pr, log, worker);
     }
     // The listed time, not the read's: a review that landed between the two is then read again.
     markRevisionPrSeen(db, repo.id, w.prNumber, seen?.updatedAt ?? pr.updatedAt, deps.now);
@@ -260,13 +267,31 @@ export async function pollRepoReviews(
 }
 
 /** Decide every review of `pr` that has no record yet, oldest first. Returns how many revision jobs were queued. */
-function ingestReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: RepositoryConfig, w: RevisionPr, pr: PullRequestReviews, log: Logger): number {
+/** The start of the hidden marker of a reviewer run's review (review.ts reviewMarker). */
+const REVIEW_MARKER_PREFIX = '<!-- updraft-review: ';
+
+/** Is `review` one the worker submitted for a reviewer run of its own? Its author is the worker and it carries the marker. */
+export function isOwnReview(worker: WorkerIdentity | null, review: Pick<GitHubReview, 'author' | 'body'>): boolean {
+  return worker !== null && isWorkerLogin(worker, review.author) && review.body.includes(REVIEW_MARKER_PREFIX);
+}
+
+function ingestReviews(deps: ReviewPollDeps, repo: RepoRef, cfg: RepositoryConfig, w: RevisionPr, pr: PullRequestReviews, log: Logger, worker: WorkerIdentity | null = null): number {
   const { db } = deps;
   const wf = cfg.workflows.find((x) => workflowId(x) === w.workflowId);
   const reviews = [...pr.reviews].sort((a, b) => Date.parse(a.submittedAt ?? '') - Date.parse(b.submittedAt ?? ''));
   let queued = 0;
   for (const review of reviews) {
     if (getReviewRequest(db, repo.id, review.id)) continue;
+    if (review.state === 'CHANGES_REQUESTED' && isOwnReview(worker, review)) {
+      const reason = "Updraft's own change request: the revision for it is queued from the verdict the worker recorded, not from this review";
+      recordReviewRequest(
+        db,
+        { repoId: repo.id, reviewId: review.id, prNumber: w.prNumber, reviewer: review.author, trigger: 'changes_requested', reviewUrl: review.url, submittedAt: review.submittedAt, state: 'ignored', reason },
+        deps.now,
+      );
+      log.debug('own change request not acted on', { pr: w.prNumber, review: review.url });
+      continue;
+    }
     // Without its workflow there is no allowlist to judge the review by: nobody is allowed.
     const decision = reviewTrigger(review, wf ? allowedActorsFor(deps.config, wf) : []);
     if (decision.kind === null) continue;

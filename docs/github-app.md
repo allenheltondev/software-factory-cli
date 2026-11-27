@@ -169,7 +169,9 @@ readable only by the worker's user (mode 600) and outside every clone.
 - **Earlier pull requests and comments stay as they are,** and are still recognised: the
   worker finds its PRs by branch and its comments by a hidden marker, not by author, so
   switching identity never produces duplicates.
-- **Merging.** The worker never merges, approves or marks a PR ready, as either identity.
+- **Merging.** The worker never merges, approves or marks a PR ready, as either identity, except
+  as the review loop and `autoMerge` say. Its reviewer submits a formal approval only on a pull
+  request a person published (see [Publishing as a person](#publishing-as-a-person)).
 
 ## Pushing
 
@@ -208,6 +210,121 @@ so GitHub shows the commits as the bot's. Things to know:
   the agent's own `env`.
 - The bot's user id is read from GitHub once per worker. If it cannot be read, the run fails
   before a worktree is created and can be retried.
+
+## Publishing as a person
+
+With an App configured, a repository can have its pull requests opened and pushed under a
+person's own GitHub account instead, while the App reviews them. The pull request conversation
+then has two clearly different participants: the coding agent, as the person who authorized it,
+and the reviewer, as `<app-slug>[bot]`. Because they are different accounts, the reviewer can
+submit a real GitHub **approval** or **change request** instead of a comment.
+
+It is off unless configured, and only for the repositories you name:
+
+```yaml
+github:
+  app:
+    appId: 1234567
+    privateKeyPath: ./github-app.pem
+  publisher:
+    login: your-login        # the account that agreed to publish; never inferred
+    id: 1234                 # optional: its numeric id, which survives a rename
+repositories:
+  your-org/your-repo:
+    publish: pr
+    review: true
+    publishAs: user          # default: app
+```
+
+`updraft validate` refuses `publishAs: user` without `github.app` (without an App the worker
+already publishes as you) and without `github.publisher`. `updraft doctor` then checks, for
+each repository with `publishAs: user`, the same things publication checks, and prints both
+identities: *"pull requests and pushes as your-login (id 1234, github.publisher); reviews,
+notices and merges as updraft[bot]"*. The worker logs the same at start.
+
+### Who does what
+
+| Action | Identity |
+| --- | --- |
+| Push of the job branch, the pull request itself | the person |
+| Revision and CI-fix pushes, the coding agent's replies and claims on the PR, its answers in finding threads | the person |
+| The reviewer's review, inline findings, thread resolution | the App |
+| The issue's status comment, assignment, CI and merge notices, limit notices | the App |
+| Marking ready for review, `autoMerge` | the App |
+| Polling, reading issues and reviews | the App |
+
+### Consent and checks
+
+- **Explicit.** The person is the one named in `github.publisher`. Updraft never takes the
+  issue's author, the label's actor or the installation's owner for it.
+- **Local CLI: your own `gh` sign-in.** The token is `GH_TOKEN` / `GITHUB_TOKEN` if set, else
+  `gh auth token`. Nothing asks you to paste a classic PAT into the config.
+- **Checked on every use.** Before a job of such a repository starts, and again at every
+  publication and revision push, the worker reads a fresh token and asks GitHub whose it is
+  (`GET /user`) and whether that account can push to the configured repository, compared by
+  repository id. The token it checked is the one it pushes with, so a `gh auth switch` in
+  between cannot change who pushes.
+- **No fallback.** Another account's sign-in, an expired or revoked one, a repository the
+  account cannot reach or push to, or a bot token: each stops the step with what to change.
+  A job that has not started stays queued (the reason is in `updraft status`); a publication
+  or revision fails without pushing. Nothing is ever retried as the App instead.
+- **A pull request keeps its publisher.** The publisher is recorded (login and account id,
+  never a credential) before the first push, and every retry, revision and CI fix of that pull
+  request uses it. Turning `publishAs` on or off applies to new pull requests only. If the
+  recorded person is no longer configured, or `github.publisher` now names someone else, the
+  step stops rather than continue as another account. Pull requests from before this setting,
+  and those of repositories without it, stay the App's.
+- **Pushes go over HTTPS** with the person's checked token, never with the clone's SSH key
+  (whose account nobody checked), to exactly the validated repository. The branch rules of
+  [Publication](publication.md) are unchanged: only Updraft's own job branch, create-only for
+  the first push, fast-forward with a lease for revisions, never the base or default branch,
+  never a force push.
+
+### Reviews
+
+On a pull request the person published, the App's reviewer submits:
+
+- **APPROVE** for a ready-to-merge verdict, and **REQUEST_CHANGES** for changes requested,
+  pinned to the exact reviewed commit (`commit_id`).
+- A **COMMENT** that says why it is not one of those, when the pull request is no longer at the
+  reviewed commit, when what is missing is for a person to settle (acceptance criteria only a
+  person can verify), when blockers of earlier reviews are not verified yet (for an approval),
+  when the reviewer and the publisher turn out to be the same account, or when GitHub refuses
+  the formal review (repository rules, permissions). It never reads as an approval.
+- When a later head is reviewed without an approval, the App dismisses its own earlier
+  approvals of other commits, so one never outlives the commit it was for. A person's reviews
+  are never touched.
+
+What a formal review does **not** change:
+
+- **The worker's own verdict decides**, as before: a revision is queued from the recorded
+  verdict, and the App's change request on GitHub is recognised as its own (author and the
+  review's hidden marker together) and never queues a second one. CI waits, the same-head
+  check and `autoMerge` read the recorded verdict, not GitHub's review state.
+- **Required reviews.** Whether the App's approval counts toward a branch protection rule or
+  ruleset is GitHub's decision, and depends on the rule (a required code owner, a required
+  approval from someone with write access, "dismiss stale approvals", and so on). Updraft never
+  claims an automated approval stands in for a person's or a code owner's. `autoMerge` still
+  asks GitHub to merge the exact head and reports GitHub's refusal.
+- **A person's reviews** still trigger revisions under `revise`, as before.
+
+### Commit authorship and attribution
+
+Who *pushes* and who *authored* a commit are separate in Git. Commits keep the local Git
+identity, or the bot's with `commitAsApp`; Updraft does not set them to the person, does not
+sign them, and does not mark them verified. The pull request body says plainly that it was
+pushed and opened by Updraft's coding agent with the person's sign-in, that the code is the
+agent's, and (with `review`) that the automated reviews are the App's and do not replace a
+review a person or code owner must give. The usual run and agent markers and run details stay.
+
+### What it is not yet
+
+- **Updraft Cloud** does not offer this yet: hosted jobs publish as the App only. The design and
+  threat model for a hosted version are in [Publication identity](publication-identity.md).
+- It was tested against simulated GitHub APIs, not yet against a real repository with real
+  formal reviews. Before you rely on it, run `updraft doctor`, start with one repository, and
+  check on GitHub that the pull request's author, each push's actor and the review state are as
+  described.
 
 ## Permissions
 

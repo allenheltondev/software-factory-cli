@@ -22,6 +22,7 @@ import {
   type GitHubPullRequest,
 } from '../github/api.js';
 import { GitHubAppError } from '../github/app-auth.js';
+import { createUserPublisher } from '../github/publisher.js';
 import type { UpdraftPaths } from '../paths.js';
 import type { RepoRef, RunOutcome } from '../types.js';
 import { createLogger, silentLogger } from '../util/log.js';
@@ -1213,5 +1214,185 @@ describe('publishRun as a GitHub App (github.app)', { timeout: 60_000 }, () => {
     const r = await publishRun(deps(s, new FakePublishApi(), { runGit: git.runGit, workerKind: 'app', token: async () => APP_TOKEN }), s.runId);
     expect(r).toMatchObject({ status: 'failed', retryable: false });
     if (r.status === 'failed') expect(r.error).toMatch(/"Workflows" repository permission/);
+  });
+});
+
+describe('publishRun as a person (publishAs user, github.publisher)', { timeout: 60_000 }, () => {
+  const APP_TOKEN = 'ghs_appInstallationToken0123456789';
+  const USER_TOKEN = 'gho_personUserToken0123456789';
+  const HTTPS = `https://github.com/${FULL}.git`;
+  const SSH = `git@github.com:${FULL}.git`;
+
+  class AppApi extends FakePublishApi {
+    override async getWorkerIdentity() {
+      return { kind: 'app' as const, login: 'updraft[bot]', id: 9, appSlug: 'updraft' } as never;
+    }
+  }
+  class PersonApi extends FakePublishApi {
+    constructor(
+      remoteHas: (b: string) => boolean,
+      private readonly who: { login: string; id: number } = { login: 'alice', id: 7 },
+      private readonly repo: { id: number; push: boolean } = { id: REPO_ID, push: true },
+    ) {
+      super(remoteHas);
+    }
+    override async getWorkerIdentity() {
+      return { kind: 'user' as const, ...this.who };
+    }
+    override async getRepo(): Promise<never> {
+      return {
+        id: this.repo.id, fullName: FULL, owner: 'octo', name: 'widgets', private: false, archived: false, defaultBranch: 'main', description: null,
+        permissions: { admin: false, push: this.repo.push, pull: true },
+      } as never;
+    }
+  }
+
+  function sshRemoteGit(s: Scenario): { runGit: RunGit; calls: GitCall[] } {
+    const calls: GitCall[] = [];
+    return {
+      calls,
+      runGit: async (args, opts: GitOptions) => {
+        calls.push({ args: [...args], env: opts.env });
+        if (args[0] === 'remote' && args[1] === 'get-url') return { stdout: `${SSH}\n`, stderr: '' };
+        return runGit(args.map((a) => (a === HTTPS ? s.f.remoteDir : a)), opts);
+      },
+    };
+  }
+
+  const personConfig = (s: Scenario, publisher: { login: string; id?: number } | null = { login: 'alice' }) =>
+    makeConfig(s.f, { publishAs: 'user' }, { github: { app: { appId: 1, privateKeyPath: './app.pem' }, ...(publisher ? { publisher } : {}) } });
+
+  async function setup(o: { person?: PersonApi; expected?: { login: string; id?: number } } = {}) {
+    const s = await scenario();
+    const git = sshRemoteGit(s);
+    const app = new AppApi((b) => remoteSha(s, b) !== null);
+    const person = o.person ?? new PersonApi((b) => remoteSha(s, b) !== null);
+    const appTokens: string[] = [];
+    let userTokenReads = 0;
+    const publisher = createUserPublisher({
+      expected: o.expected ?? { login: 'alice' },
+      readToken: async () => (userTokenReads++, USER_TOKEN),
+      apiFor: async (t) => {
+        expect(t).toBe(USER_TOKEN);
+        return person;
+      },
+    });
+    const d = deps(s, app, {
+      config: personConfig(s, o.expected ?? { login: 'alice' }),
+      runGit: git.runGit,
+      workerKind: 'app',
+      token: async (r) => (appTokens.push(r), APP_TOKEN),
+      publisher,
+    });
+    return { s, git, app, person, d, appTokens, reads: () => userTokenReads };
+  }
+
+  it('pushes and opens the pull request with the person\'s checked sign-in, and leaves the issue comment to the App', async () => {
+    const { s, git, app, person, d, appTokens } = await setup();
+    const r = await publishRun(d, s.runId);
+    expect(r.status).toBe('published');
+    expect(remoteSha(s)).toBe(s.localSha);
+    // The pull request is the person's; the App opened nothing and was never asked for a push token.
+    expect(person.creates.filter((c) => c.startsWith('createPull'))).toHaveLength(1);
+    expect(app.creates.filter((c) => c.startsWith('createPull'))).toHaveLength(0);
+    expect(appTokens).toEqual([]);
+    // Updraft's own notice on the issue stays the App's.
+    expect(app.creates.filter((c) => c.startsWith('createComment'))).toHaveLength(1);
+    expect(person.creates.filter((c) => c.startsWith('createComment'))).toHaveLength(0);
+    // HTTPS with the person's token in the environment, never the SSH key and never in argv.
+    const push = git.calls.find((c) => c.args[0] === 'push')!;
+    expect(push.args).toContain(HTTPS);
+    for (const c of git.calls) {
+      expect(c.args).not.toContain(SSH);
+      expect(c.args.join(' ')).not.toContain(USER_TOKEN);
+    }
+    const header = Object.entries(push.env ?? {}).find(([, v]) => typeof v === 'string' && v.startsWith('AUTHORIZATION: basic '))!;
+    expect(Buffer.from(header[1]!.slice('AUTHORIZATION: basic '.length), 'base64').toString()).toBe(`x-access-token:${USER_TOKEN}`);
+    // Provenance: who published, never the token.
+    const pub = getPublication(s.db, s.runId)!;
+    expect(pub.publisher).toEqual({ kind: 'user', login: 'alice', id: 7 });
+    expect(JSON.stringify(s.db.prepare('SELECT * FROM publications').all())).not.toContain(USER_TOKEN);
+    const log = readFileSync(s.logPath, 'utf8');
+    expect(log).toContain('publishing as alice (github.publisher, account 7)');
+    expect(log).not.toContain(USER_TOKEN);
+    // Attribution stays visible, and no claim that an automated review stands in for a person's.
+    expect(person.pulls[0]!.body).toContain("Pushed and opened by Updraft's coding agent with the GitHub sign-in of `alice`");
+  });
+
+  it('stops for another account\'s sign-in, and does not publish as the App instead', async () => {
+    const { s, app, person, d, appTokens } = await setup({ person: undefined, expected: { login: 'alice' } });
+    (person as unknown as { who: { login: string; id: number } }).who = { login: 'mallory', id: 66 };
+    const r = await publishRun(d, s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false, error: expect.stringMatching(/the gh sign-in is mallory .* github\.publisher names alice/) });
+    expect(remoteSha(s)).toBeNull();
+    expect(app.creates).toEqual([]);
+    expect(person.creates).toEqual([]);
+    expect(appTokens).toEqual([]);
+  });
+
+  it('stops when the account cannot push, or the repository is another one by id', async () => {
+    for (const repo of [{ id: REPO_ID, push: false }, { id: 999, push: true }]) {
+      const s0 = await setup();
+      const person = new PersonApi((b) => remoteSha(s0.s, b) !== null, undefined, repo);
+      const { s, app, d, appTokens } = await setup({ person });
+      const r = await publishRun(d, s.runId);
+      expect(r).toMatchObject({ status: 'failed', retryable: false });
+      expect(r.status === 'failed' && r.error).toMatch(repo.push ? /repository 999, not the configured 42/ : /cannot push to octo\/widgets/);
+      expect(remoteSha(s)).toBeNull();
+      expect(app.creates).toEqual([]);
+      expect(appTokens).toEqual([]);
+    }
+  });
+
+  it('keeps the recorded publisher on a retry: without github.publisher it stops rather than switch to the App', async () => {
+    const { s, app, person, d, appTokens } = await setup();
+    // The first attempt pushed as the person, then GitHub failed to open the pull request.
+    person.failNext.createPullRequest = new GitHubError('POST /repositories/42/pulls failed: 502 Bad Gateway', 502);
+    const first = await publishRun(d, s.runId);
+    expect(first).toMatchObject({ status: 'failed', retryable: true });
+    expect(getPublication(s.db, s.runId)!.publisher).toEqual({ kind: 'user', login: 'alice', id: 7 });
+    // Retried by a worker started without github.publisher.
+    const r = await publishRun({ ...d, publisher: undefined }, s.runId);
+    expect(r).toMatchObject({ status: 'failed', retryable: false, error: expect.stringMatching(/published as alice \(id 7\), but github\.publisher is not configured.*does not switch it to the GitHub App/) });
+    // ...and by one whose github.publisher names someone else now.
+    const other = createUserPublisher({ expected: { login: 'bob' }, readToken: async () => USER_TOKEN, apiFor: async () => person });
+    const r2 = await publishRun({ ...d, publisher: other }, s.runId);
+    expect(r2).toMatchObject({ status: 'failed', retryable: false, error: expect.stringMatching(/github\.publisher now names bob; a pull request keeps its publisher/) });
+    expect(app.creates.filter((c) => c.startsWith('createPull'))).toHaveLength(0);
+    expect(appTokens).toEqual([]);
+    // With the person back, the retry opens the pull request as them.
+    const r3 = await publishRun(d, s.runId);
+    expect(r3.status).toBe('published');
+    expect(person.pulls).toHaveLength(1);
+  });
+
+  it('continues a publication that already pushed before publishers were recorded as the worker, as before', async () => {
+    const { s, app, person, d, appTokens } = await setup();
+    // A publication from an earlier version: pushed by the worker, no publisher on record.
+    s.f.git(s.f.clone, 'push', '--quiet', 'origin', `${s.branch}:refs/heads/${s.branch}`);
+    s.db.prepare(
+      `INSERT INTO publications (run_id, job_id, repo_id, repo_full_name, issue_number, mode, state, branch, base_branch, head_sha, pushed_at, attempts, retryable, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 7, 'draft-pr', 'failed', ?, 'main', ?, ?, 1, 1, ?, ?)`,
+    ).run(s.runId, s.jobId, REPO_ID, FULL, s.branch, s.localSha, new Date(T0).toISOString(), new Date(T0).toISOString(), new Date(T0).toISOString());
+    const r = await publishRun(d, s.runId);
+    expect(r.status).toBe('published');
+    expect(app.creates.filter((c) => c.startsWith('createPull'))).toHaveLength(1);
+    expect(person.creates).toEqual([]);
+    expect(appTokens).toEqual([FULL]);
+    expect(getPublication(s.db, s.runId)!.publisher).toEqual({ kind: 'worker', login: 'updraft[bot]', id: null });
+  });
+});
+
+describe('publishRun without publishAs', { timeout: 60_000 }, () => {
+  it('records the worker as the publisher and asks nothing of a person', async () => {
+    const s = await scenario();
+    const api = new FakePublishApi((b) => remoteSha(s, b) !== null);
+    let asked = 0;
+    const publisher = createUserPublisher({ expected: { login: 'alice' }, readToken: async () => (asked++, 'x'), apiFor: async () => api });
+    const r = await publishRun(deps(s, api, { publisher }), s.runId);
+    expect(r.status).toBe('published');
+    expect(asked).toBe(0);
+    expect(getPublication(s.db, s.runId)!.publisher).toEqual({ kind: 'worker', login: 'allen', id: null });
+    expect(api.pulls[0]!.body).not.toContain('sign-in of');
   });
 });

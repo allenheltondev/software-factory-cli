@@ -481,7 +481,7 @@ interface RawPullRequestDetails {
   draft?: boolean;
   head: { ref: string; sha: string; repo?: { id: number } | null };
   base: { ref: string };
-  user?: { login: string } | null;
+  user?: { login: string; id?: number } | null;
   body?: string | null;
   mergeable?: boolean | null;
   mergeable_state?: string;
@@ -1057,6 +1057,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         mergeable: typeof r.mergeable === 'boolean' ? r.mergeable : null,
         mergeableState: r.mergeable_state ?? 'unknown',
         author: r.user?.login ?? null,
+        authorId: typeof r.user?.id === 'number' ? r.user.id : null,
         body: r.body ?? '',
         headRepoId: r.head.repo?.id ?? null,
         title: r.title ?? '',
@@ -1071,11 +1072,13 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
     },
 
     async createPullRequestReview(repo, pullNumber, input) {
+      const event = input.event ?? 'COMMENT';
+      // A formal review is always about one exact commit: never an approval of whatever the head is by then.
+      if (event !== 'COMMENT' && !input.commitId) throw new Error(`a ${event} review needs the commit it is for`);
       const res = await request<RawReviewSummary>(`${repoPath(repo)}/pulls/${pullNumber}/reviews`, {
         method: 'POST',
-        // COMMENT, always: this client has no way to approve or to request changes.
         body: {
-          event: 'COMMENT',
+          event,
           body: input.body,
           ...(input.commitId ? { commit_id: input.commitId } : {}),
           ...(input.comments?.length
@@ -1092,6 +1095,10 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         },
       });
       return mapReviewSummary(res.data!);
+    },
+
+    async dismissPullRequestReview(repo, pullNumber, reviewId, message) {
+      await request(`${repoPath(repo)}/pulls/${pullNumber}/reviews/${reviewId}/dismissals`, { method: 'PUT', body: { message, event: 'DISMISS' } });
     },
 
     async listPullRequestFiles(repo, pullNumber) {

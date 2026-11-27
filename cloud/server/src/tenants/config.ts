@@ -99,6 +99,7 @@ const PLATFORM_REPO_KEYS: Record<string, string> = {
   remote: 'set by the platform',
   dependencies: "a job's GitHub token reaches only its own repository, so it cannot watch another",
   id: 'set by the platform from the installation',
+  publishAs: 'hosted jobs publish as the platform GitHub App; publishing as a person is not available on Updraft Cloud yet (docs/publication-identity.md)',
 };
 const PROMPT_FILE = /^[A-Za-z0-9][A-Za-z0-9_.-]*\.md$/;
 const PROMPT_REF = /^\.\/prompts\/([A-Za-z0-9][A-Za-z0-9_.-]*\.md)$/;

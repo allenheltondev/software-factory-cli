@@ -22,6 +22,10 @@ import { resolvePaths, type UpdraftPaths } from '../paths.js';
 import { checkJobDispatchable, pollOnce } from '../poller/poller.js';
 import { createPublisher, type PublishDeps } from '../publish/publish.js';
 import { createReviewLoopPublisher, reviewMarker } from '../publish/review.js';
+import { checkPublisherForJob } from '../publish/publisher-role.js';
+import { createUserPublisher } from '../github/publisher.js';
+import { runGit, type GitOptions } from '../git/git.js';
+import { getPublication } from '../db/publications.js';
 import { createRevisionPublisher } from '../publish/revision.js';
 import { createAssignmentCommenter } from '../publish/assignment-comment.js';
 import { parseStatusMarker } from '../publish/status-marker.js';
@@ -48,7 +52,22 @@ afterEach(() => {
   for (const f of fixtures.splice(0)) f.cleanup();
 });
 
-function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[]; coderArgs?: string[] } = {}) {
+/** The consenting person of github.publisher in the publishAs user tests, and their gh token. */
+const ALICE = { login: 'alice', id: 7 };
+const ALICE_TOKEN = 'gho_aliceUserToken0123456789';
+
+function setup(
+  over: {
+    repo?: Record<string, unknown>;
+    reviewerArgs?: string[];
+    coderArgs?: string[];
+    /** publishAs user, with github.app and github.publisher (alice). */
+    person?: boolean;
+    /** One agent profile (claude) codes and reviews: the review pool is the coding agent's, and allowSameAgent is on. */
+    sameProfile?: boolean;
+    allowedActors?: string[];
+  } = {},
+) {
   const f = createGitFixture(FULL);
   fixtures.push(f);
   const paths: UpdraftPaths = resolvePaths({ env: { UPDRAFT_HOME: join(f.root, 'updraft home') } });
@@ -73,9 +92,10 @@ function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[]; 
       claude: { command: process.execPath, args: over.coderArgs ?? ['--mode', 'success'], env },
       codex: { command: process.execPath, args: over.reviewerArgs ?? ['--mode', 'review'], env },
     },
-    pools: { general: { agents: ['claude'] }, reviewers: { agents: ['codex'] } },
+    pools: { general: { agents: ['claude'] }, reviewers: { agents: [over.sameProfile ? 'claude' : 'codex'] } },
     actions: { 'implement-issue': { prompt: './prompts/implement.md', revisePrompt: './prompts/revise.md', reviewPrompt: './prompts/review.md', timeoutMinutes: 2 } },
-    dispatch: { allowedActors: ['allen'] },
+    dispatch: { allowedActors: over.allowedActors ?? ['allen'] },
+    ...(over.person ? { github: { app: { appId: 1, privateKeyPath: './app.pem' }, publisher: ALICE } } : {}),
     repositories: {
       [FULL]: {
         id: REPO_ID,
@@ -87,11 +107,14 @@ function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[]; 
         revise: true,
         review: true,
         autoMerge: 'squash',
+        ...(over.person ? { publishAs: 'user' } : {}),
+        ...(over.sameProfile ? { review: { allowSameAgent: true } } : {}),
         ...over.repo,
         workflows: [{ id: 'wf', trigger: { event: 'issue.labeled', label: 'updraft:ready' }, action: 'implement-issue', pool: 'general', reviewPool: 'reviewers' }],
       },
     },
   };
+  if (over.person) writeFileSync(join(paths.configDir, 'app.pem'), 'not a key: the tests never sign as the App\n');
   expect(validateConfig(raw)).toMatchObject({ ok: true });
   const config: UpdraftConfig = configSchema.parse(raw);
   // Faster than the schema allows a user to set: auto-merge is evaluated after each poll.
@@ -110,10 +133,21 @@ function setup(over: { repo?: Record<string, unknown>; reviewerArgs?: string[]; 
 
 const remoteHead = (f: GitFixture, branch: string) => f.git(f.root, 'ls-remote', f.remoteDir, `refs/heads/${branch}`).split(/\s+/)[0] ?? '';
 
-function start(s: ReturnType<typeof setup>, executorOptions: { nativeClaudeAuth?: NativeAuthRunner } = {}, withStatus = false) {
-  const { db, config, paths, gh } = s;
+/** Every git command publication ran, with its environment (where a push's credentials are). */
+type GitCall = { args: string[]; env: NodeJS.ProcessEnv | undefined };
+
+function start(
+  s: ReturnType<typeof setup>,
+  executorOptions: { nativeClaudeAuth?: NativeAuthRunner } = {},
+  withStatus = false,
+  person: { calls?: GitCall[]; tokenReads?: { n: number }; signedInAs?: { login: string; id: number } } = {},
+) {
+  const { db, config, paths, gh, f } = s;
   const api = gh.api;
   const controller = new AbortController();
+  // As the person of github.publisher, a push goes over HTTPS to GitHub with their checked token:
+  // here, that URL is the fixture's remote.
+  const https = `https://github.com/${FULL}.git`;
   const deps: PublishDeps = {
     db,
     config,
@@ -121,8 +155,24 @@ function start(s: ReturnType<typeof setup>, executorOptions: { nativeClaudeAuth?
     api,
     log: silentLogger,
     token: async () => {
-      throw new Error('a local remote needs no token');
+      throw new Error('a local remote needs no token, and the App is never asked for a push token here');
     },
+    ...(config.github?.publisher
+      ? {
+          publisher: createUserPublisher({
+            expected: config.github.publisher,
+            readToken: async () => (person.tokenReads && person.tokenReads.n++, ALICE_TOKEN),
+            apiFor: async (token) => {
+              expect(token).toBe(ALICE_TOKEN);
+              return gh.as(person.signedInAs ?? ALICE);
+            },
+          }),
+          runGit: async (args: readonly string[], opts: GitOptions) => {
+            person.calls?.push({ args: [...args], env: opts.env });
+            return runGit(args.map((a) => (a === https ? f.remoteDir : a)), opts);
+          },
+        }
+      : {}),
   };
   const done = runDaemon({
     db,
@@ -132,7 +182,12 @@ function start(s: ReturnType<typeof setup>, executorOptions: { nativeClaudeAuth?
     signal: controller.signal,
     executor: createExecutor(config, executorOptions),
     poll: () => pollOnce({ db, api, config, log: silentLogger }),
-    checkDispatchable: (job) => checkJobDispatchable({ api, config, db }, job),
+    checkDispatchable: async (job) => {
+      const check = await checkJobDispatchable({ api, config, db }, job);
+      // As `updraft start` wires it: a job to be published as the person waits while they can't be.
+      if (check.ok) await checkPublisherForJob(deps, job);
+      return check;
+    },
     publisher: createReviewLoopPublisher(deps, createRevisionPublisher(deps, createPublisher(deps))),
     ...(withStatus ? { assignmentCommenter: createAssignmentCommenter({ db, config, api, log: silentLogger, sleep: async () => {} }) } : {}),
     hostname: hostname(),
@@ -549,5 +604,159 @@ describe('the code-and-review cycle, end to end', { timeout: 180_000 }, () => {
     expect(gh.writes.some((w) => w.startsWith('ready '))).toBe(false);
     const log = readFileSync(latestRunOfJob(db, reviewJob()!.id)!.logPath!, 'utf8');
     expect(log).toContain('totalEvents=139UPDRAFT-VERDICT: ready-to-merge[INFO] [KRS]');
+  });
+});
+
+/** The person-published loop's GitHub, as a person would read it: who wrote what. */
+function personLoopChecks(s: ReturnType<typeof setup>, calls: GitCall[]) {
+  const { gh } = s;
+  // The pull request is the person's, and so are the pushes: HTTPS with their token, in the
+  // environment and never in argv, and never the clone's own remote.
+  expect(gh.pullAuthor).toBe('alice');
+  expect(gh.writesOf('alice')[0]).toBe(`open draft PR ${s.prBranch} -> main`);
+  const pushes = calls.filter((c) => c.args[0] === 'push');
+  expect(pushes.length).toBeGreaterThan(0);
+  for (const push of pushes) {
+    expect(push.args).toContain(`https://github.com/${FULL}.git`);
+    const header = Object.values(push.env ?? {}).find((v) => typeof v === 'string' && v.startsWith('AUTHORIZATION: basic '))!;
+    expect(Buffer.from(header.slice('AUTHORIZATION: basic '.length), 'base64').toString()).toBe(`x-access-token:${ALICE_TOKEN}`);
+  }
+  for (const c of calls) expect(c.args.join(' ')).not.toContain(ALICE_TOKEN);
+  // Everything that is not the coding agent's is the App's: reviews, notices, ready, merge.
+  for (const w of gh.writesOf('alice')) expect(w).toMatch(/^(open draft PR|comment #100$|reply #100)/);
+  for (const w of gh.writes.filter((x) => /^(review|ready|merge|dismiss)/.test(x))) expect(gh.writesOf('updraft-bot')).toContain(w);
+  expect(gh.writesOf('updraft-bot')).toContain(`comment #${ISSUE}`);
+  // Provenance: who published, never the token.
+  expect(getPublication(s.db, latestRunOfJob(s.db, s.jobId)!.id)!.publisher).toEqual({ kind: 'user', ...ALICE });
+  expect(JSON.stringify(s.db.prepare('SELECT * FROM publications').all())).not.toContain(ALICE_TOKEN);
+  expect(gh.pullBody).toContain("Pushed and opened by Updraft's coding agent with the GitHub sign-in of `alice`");
+  expect(gh.pullBody).toContain('they do not replace a review a person or code owner must give');
+}
+
+/** The native subscription path: every agent is the Claude adapter, signed in to a subscription, checked before each run. */
+function nativeSubscription(s: ReturnType<typeof setup>) {
+  for (const name of ['claude', 'codex']) {
+    const a = s.config.agents[name];
+    if (!a) continue;
+    a.adapter = 'claude';
+    a.authentication = 'native-claude';
+  }
+  return vi.fn(async () => ({ code: 0, stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai' }) }));
+}
+
+describe('the loop of a pull request a person published (publishAs user), end to end', { timeout: 180_000 }, () => {
+  it.each([['standard'], ['native subscription']] as const)(
+    '%s worker path: the person pushes and opens it, the App formally requests changes and then approves the exact heads, one revision, merged',
+    async (path) => {
+      // The App is in the allowlist, and GitHub lists its formal reviews where the poller reads
+      // reviews: its own change request still queues nothing (the verdict did).
+      const s = setup({ person: true, allowedActors: ['allen', 'updraft-bot'] });
+      const { f, db, gh, prBranch } = s;
+      gh.listFormalReviews = true;
+      const check = path === 'native subscription' ? nativeSubscription(s) : null;
+      const calls: GitCall[] = [];
+      const reads = { n: 0 };
+      const worker = start(s, check ? { nativeClaudeAuth: check } : {}, false, { calls, tokenReads: reads });
+      try {
+        await vi.waitFor(() => expect(gh.merges).toHaveLength(1), { timeout: 150_000, interval: 100 });
+        await vi.waitFor(() => expect(getLoopPr(db, REPO_ID, PR)?.mergeState).toBe('merged'), { timeout: 10_000, interval: 50 });
+        // Several more polls: nothing more is queued, by the App's reviews or anything else.
+        await new Promise((r) => setTimeout(r, 2_500));
+      } finally {
+        await worker.stop();
+      }
+      if (check) expect(check).toHaveBeenCalled();
+
+      const jobs = jobsOf(db);
+      expect(jobs.map((j) => [j.envelope.type, j.status])).toEqual([
+        ['issue.labeled', 'succeeded'],
+        ['pull_request.review', 'succeeded'],
+        ['pull_request.changes_requested', 'succeeded'],
+        ['pull_request.review', 'succeeded'],
+      ]);
+      const [, review1, revision] = jobs as [Job, Job, Job, Job];
+      const head2 = remoteHead(f, prBranch);
+      const head1 = reviewOf(review1)!.headSha;
+      expect(head1).not.toBe(head2);
+      expect(revisionOf(revision)).toMatchObject({ trigger: 'updraft_review', reviewedSha: head1 });
+
+      // GitHub's review state: a change request on the first head, an approval of the merged one.
+      expect(gh.writesOf('updraft-bot').filter((w) => w.startsWith('review '))).toEqual([`review #${PR} REQUEST_CHANGES at ${head1}`, `review #${PR} APPROVE at ${head2}`]);
+      expect(gh.reviews.filter((r) => r.user === 'updraft-bot').map((r) => [r.state, r.commitId])).toEqual([
+        ['CHANGES_REQUESTED', head1],
+        ['APPROVED', head2],
+      ]);
+      // The App's formal change request was seen and set aside (ignored); the one revision was
+      // queued from the verdict the worker recorded (updraft_review).
+      expect(db.prepare('SELECT trigger_kind AS trigger, state FROM review_requests ORDER BY trigger_kind').all()).toEqual([
+        { trigger: 'changes_requested', state: 'ignored' },
+        { trigger: 'updraft_review', state: 'queued' },
+      ]);
+      expect(gh.merges).toEqual([{ sha: head2, method: 'squash' }]);
+      // The revision's push was the person's too, checked again (publish, revision: one read each at least).
+      expect(calls.filter((c) => c.args[0] === 'push')).toHaveLength(2);
+      expect(reads.n).toBeGreaterThanOrEqual(2);
+      personLoopChecks(s, calls);
+    },
+  );
+
+  it.each([['standard'], ['native subscription']] as const)(
+    '%s worker path, one agent profile in both roles, manual merge policy: reviewed, revised and approved, then left for a person, with nothing queued twice',
+    async (path) => {
+      const s = setup({ person: true, sameProfile: true, coderArgs: ['--mode', 'by-prompt'], repo: { autoMerge: undefined }, allowedActors: ['allen', 'updraft-bot'] });
+      const { f, db, gh, prBranch } = s;
+      gh.listFormalReviews = true;
+      const check = path === 'native subscription' ? nativeSubscription(s) : null;
+      const calls: GitCall[] = [];
+      const worker = start(s, check ? { nativeClaudeAuth: check } : {}, false, { calls });
+      try {
+        await vi.waitFor(() => expect(gh.writes.some((w) => w.startsWith('ready '))).toBe(true), { timeout: 150_000, interval: 100 });
+        await new Promise((r) => setTimeout(r, 2_500));
+      } finally {
+        await worker.stop();
+      }
+      if (check) expect(check).toHaveBeenCalled();
+
+      const jobs = jobsOf(db);
+      expect(jobs.map((j) => [j.envelope.type, j.status])).toEqual([
+        ['issue.labeled', 'succeeded'],
+        ['pull_request.review', 'succeeded'],
+        ['pull_request.changes_requested', 'succeeded'],
+        ['pull_request.review', 'succeeded'],
+      ]);
+      // The same profile wrote and reviewed: the identities are still separate.
+      expect(jobs.map((j) => latestRunOfJob(db, j.id)!.agent)).toEqual(['claude', 'claude', 'claude', 'claude']);
+      const head2 = remoteHead(f, prBranch);
+      const head1 = reviewOf(jobs[1]!)!.headSha;
+      expect(gh.writesOf('updraft-bot').filter((w) => w.startsWith('review '))).toEqual([`review #${PR} REQUEST_CHANGES at ${head1}`, `review #${PR} APPROVE at ${head2}`]);
+      // Manual merge: ready for review, never merged, no merge gate read.
+      expect(gh.merges).toEqual([]);
+      expect(gh.calls).not.toContain('mergePullRequest');
+      expect(gh.pull).toMatchObject({ state: 'open', draft: false });
+      expect(gh.pullBody).toContain('Merging is up to a person.');
+      expect(prStage(db, getLoopPr(db, REPO_ID, PR)!, 3)).toMatchObject({ stage: 'ready-to-merge' });
+      expect(db.prepare('SELECT trigger_kind AS trigger, state FROM review_requests ORDER BY trigger_kind').all()).toEqual([
+        { trigger: 'changes_requested', state: 'ignored' },
+        { trigger: 'updraft_review', state: 'queued' },
+      ]);
+      personLoopChecks(s, calls);
+    },
+  );
+
+  it('holds the issue job, and publishes nothing as the App, while the sign-in is another account', async () => {
+    const s = setup({ person: true });
+    const { db, gh } = s;
+    // The gh sign-in is mallory's, not alice's whom github.publisher names.
+    const worker = start(s, {}, false, { signedInAs: { login: 'mallory', id: 8 } });
+    try {
+      await vi.waitFor(() => expect(getJob(db, s.jobId)!.statusReason ?? '').toMatch(/the gh sign-in is mallory .*github\.publisher names alice/), { timeout: 30_000, interval: 100 });
+      await new Promise((r) => setTimeout(r, 1_500));
+    } finally {
+      await worker.stop();
+    }
+    expect(getJob(db, s.jobId)!.status).toBe('queued');
+    expect(jobsOf(db)).toHaveLength(1);
+    expect(gh.writes.filter((w) => w.startsWith('open'))).toEqual([]);
+    expect(gh.pull).toBeNull();
   });
 });

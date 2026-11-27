@@ -43,7 +43,7 @@ import { previousAssessment, renderAcceptanceChecklist } from './acceptance.js';
 import { diffIndex } from './anchors.js';
 import { answerInThreads, applyFindingState, inlineComments, revisionFindingsOf, planThreads, recordPostedThreads, renderStructuredReview, verdictContradiction, withoutInline, type ThreadAnswers, type ThreadPlan } from './threads.js';
 import { countRevisions, enqueueRevision, getReviewRequest, revisionJob } from '../db/revisions.js';
-import { GitHubError, type PullRequestReviewSummary } from '../github/api.js';
+import { GitHubError, type PullRequestReviewSummary, type ReviewCommentInput } from '../github/api.js';
 import { sameLogin, workerLogin } from '../github/identity.js';
 import { verdictTrigger } from '../poller/review-trigger.js';
 import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type ReviewVerdict, type RevisionFinding, type RevisionRequest, type Run } from '../types.js';
@@ -57,6 +57,8 @@ import { code } from './failure-comment.js';
 import { runDetails, selectionLine } from './run-details.js';
 import { evaluateAutoMerges, postMergeNotices } from './merge.js';
 import { safeMarkdown } from './markdown.js';
+import { chooseReviewForm, COMMENT_FORM, reviewFormSentence, type ReviewForm } from './review-form.js';
+import { getPublication } from '../db/publications.js';
 import {
   cap,
   classifyFailure,
@@ -114,13 +116,14 @@ export function renderReview(o: {
   acceptance?: string | null;
   /** What ran the review (run-details.ts selectionLine): fixed words and inline code only. */
   selection?: string;
+  /** How it is submitted on GitHub (review-form.ts). Default: the worker's comment review. */
+  form?: ReviewForm;
 }): string {
   const marker = reviewMarker(o.runId);
   const body = [
     `**Updraft review: ${VERDICT_WORDS[o.verdict]}**`,
     '',
-    `Automated review of commit ${code(short(o.headSha))} by agent ${inline(o.agent)} (run ${code(o.runId)}). It is posted as a comment because the ` +
-      'account that opened a pull request cannot approve or request changes on it; the verdict itself is recorded by the worker.',
+    `Automated review of commit ${code(short(o.headSha))} by agent ${inline(o.agent)} (run ${code(o.runId)}). ${reviewFormSentence(o.form)}`,
     '',
     ...(o.selection ? [`<sub>${o.selection}</sub>`, ''] : []),
     ...(o.override ? [`Updraft: the reviewer wrote ready to merge, but ${inline(o.override)}, so this counts as changes requested.`, ''] : []),
@@ -318,6 +321,28 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
     if (reading.problem) await runLog([`findings: ${reading.problem}; the review is posted as written`]);
     const round = structured ? reviewRound(deps.db, runId) : 0;
     const login = await workerLogin(deps.api);
+    /**
+     * After a review of a newer head that is not an approval: the worker's own approvals of
+     * earlier commits are dismissed, so an approval never outlives the commit it was for. Only
+     * reviews by the worker that carry its marker; a person's review is never touched. Best effort.
+     */
+    const dismissOutdatedApprovals = async (posted: PullRequestReviewSummary) => {
+      if (posted.state === 'APPROVED' || !deps.api.dismissPullRequestReview) return;
+      try {
+        hold();
+        const stale = (await deps.api.listPullRequestReviews(repoRef, prNumber)).filter(
+          (r) => r.id !== posted.id && r.state === 'APPROVED' && r.commitId !== headSha && sameLogin(r.user, login) && r.body.includes('<!-- updraft-review: '),
+        );
+        for (const r of stale) {
+          hold();
+          await deps.api.dismissPullRequestReview(repoRef, prNumber, r.id, `Updraft reviewed a newer commit (${short(headSha)}); this approval was for ${r.commitId ? short(r.commitId) : 'an earlier commit'}.`);
+          await runLog([`dismissed the earlier approval ${r.htmlUrl} of ${r.commitId ? short(r.commitId) : 'an earlier commit'}`]);
+        }
+      } catch (err) {
+        if (!(err instanceof GitHubError)) throw err;
+        await runLog([`could not dismiss earlier approvals (${err.message}); GitHub shows them as outdated`]);
+      }
+    };
     if (!rev.reviewId) {
       hold();
       const marker = reviewMarker(runId);
@@ -334,16 +359,62 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
             })
           : null;
         const next = nextStep(deps.config, repo, verdict, countRevisions(deps.db, job.repoId, prNumber), holdForPerson ? enforced : null);
-        const create = async (input: Parameters<typeof deps.api.createPullRequestReview>[2]): Promise<PullRequestReviewSummary> => {
+        // How it is submitted (review-form.ts): a comment review, as always, unless a person
+        // published the pull request and this worker (the App) may approve or request changes on it.
+        const publisher = getPublication(deps.db, watched.sourceRunId)?.publisher ?? null;
+        let form: ReviewForm = COMMENT_FORM;
+        if (publisher?.kind === 'user') {
+          hold();
+          const live = await deps.api.getPullRequest(repoRef, prNumber);
+          form = chooseReviewForm({
+            publisher,
+            reviewer: login,
+            verdict,
+            liveHead: live.state === 'open' ? live.headSha : null,
+            headSha,
+            heldForPerson: holdForPerson,
+            openBlockers: unverifiedBlockers(deps.db, job.repoId, prNumber).length,
+          });
+          await runLog([
+            form.event === 'COMMENT'
+              ? `submitting as a comment review, not ${form.instead ?? 'a formal review'}: ${form.why ?? 'the worker opened this pull request'}`
+              : `submitting as ${form.event} of ${short(headSha)} as ${login} (pull request published by ${publisher.login})`,
+          ]);
+        }
+        const create = async (input: { commitId?: string; comments?: ReviewCommentInput[] }, body: (form: ReviewForm) => string): Promise<PullRequestReviewSummary> => {
           hold(); // the lookup may have outlived the lease
           try {
-            return await deps.api.createPullRequestReview(repoRef, prNumber, input);
+            return await deps.api.createPullRequestReview(repoRef, prNumber, { ...input, body: body(form), ...(form.event !== 'COMMENT' ? { event: form.event } : {}) });
           } catch (err) {
+            if (!(err instanceof GitHubError) || err.status !== 422) throw err;
+            // GitHub refused the formal review (the account may not, or a rule says no). It becomes a
+            // comment that says so, never a comment that reads as an approval.
+            if (form.event !== 'COMMENT') {
+              const refused = form.event;
+              const formal = form;
+              form = { event: 'COMMENT', instead: refused, why: `GitHub refused it as one (${inline(cap(err.message, 200))})` };
+              if (!input.comments?.length) {
+                await runLog([`GitHub refused the ${refused} review (${err.message}); posting it as a comment review that says so`]);
+                return create(input, body);
+              }
+              // With inline comments the refusal may be the formal event's alone: first the same
+              // review, inline comments and all, as a comment, so no thread is lost for it.
+              await runLog([`GitHub refused the ${refused} review with ${input.comments.length} inline comment(s) (${err.message}); trying it as a comment review with the same inline comments`]);
+              try {
+                return await create(input, body);
+              } catch (again) {
+                if (!(again instanceof GitHubError) || again.status !== 422) throw again;
+                // Refused as a comment too: it is about the inline comments. The caller drops them
+                // and tries the formal form again, which falls back to a comment if refused once more.
+                form = formal;
+                throw again;
+              }
+            }
             // The commit is no longer part of the pull request (its branch was rewritten). The body
             // names the commit, so the review is still worth having, unpinned.
-            if (!(err instanceof GitHubError) || err.status !== 422 || !input.commitId || input.comments?.length) throw err;
+            if (!input.commitId || input.comments?.length) throw err;
             hold();
-            const unpinned = await deps.api.createPullRequestReview(repoRef, prNumber, { body: input.body });
+            const unpinned = await deps.api.createPullRequestReview(repoRef, prNumber, { body: body(form) });
             await runLog([`GitHub refused to attach the review to ${short(headSha)} (${err.message}); posted it without a commit`]);
             return unpinned;
           }
@@ -362,7 +433,7 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
             }
           }
           let plan = planThreads(structured, { diff, noDiff, rootOf: (key) => threadOf(deps.db, job.repoId, prNumber, key) });
-          const render = (p: ThreadPlan) =>
+          const render = (p: ThreadPlan) => (f: ReviewForm) =>
             renderStructuredReview({
               runId,
               agent: run.agent,
@@ -378,10 +449,11 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
               marker,
               maxBody: MAX_BODY,
               selection,
+              form: f,
             });
           if (plan.inline.length) {
             try {
-              posted = await create({ body: render(plan), commitId: headSha, comments: inlineComments({ runId, round, headSha, plan }) });
+              posted = await create({ commitId: headSha, comments: inlineComments({ runId, round, headSha, plan }) }, render(plan));
             } catch (err) {
               // GitHub refuses the whole review when it cannot place one comment. Every finding is
               // kept: they all go in the summary instead.
@@ -390,19 +462,19 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
               await runLog([`GitHub refused the inline comments (${err.message}); posting every finding in the review summary`]);
             }
           }
-          posted ??= await create({ body: render(plan), commitId: headSha });
+          posted ??= await create({ commitId: headSha }, render(plan));
           await runLog([`findings: ${plan.inline.length} inline, ${plan.summary.length} in the summary, ${plan.repeats.length} in earlier threads, ${structured.checks.length} check(s) of earlier findings`]);
         } else {
           // A block that was read (it held only criteria) is not shown as raw JSON: the checklist says it.
           const findings = reading.structured ? reading.prose : result.findings;
-          posted = await create({
-            body: renderReview({ runId, agent: run.agent, verdict, headSha, findings, next, override: acceptanceOverride, acceptance: checklist, selection }),
-            commitId: headSha,
-          });
+          posted = await create({ commitId: headSha }, (f) =>
+            renderReview({ runId, agent: run.agent, verdict, headSha, findings, next, override: acceptanceOverride, acceptance: checklist, selection, form: f }),
+          );
         }
+        if (publisher?.kind === 'user') await dismissOutdatedApprovals(posted);
       }
       hold({ reviewId: posted.id, reviewUrl: posted.htmlUrl });
-      await runLog([found ? `review already on pull request #${prNumber}: ${posted.htmlUrl}` : `posted a comment review on pull request #${prNumber}: ${posted.htmlUrl}`]);
+      await runLog([found ? `review already on pull request #${prNumber}: ${posted.htmlUrl}` : `posted a ${posted.state === 'APPROVED' ? 'formal approval' : posted.state === 'CHANGES_REQUESTED' ? 'formal change request' : 'comment review'} on pull request #${prNumber}: ${posted.htmlUrl}`]);
     }
 
     // 1b. Structured findings: recorded with the inline comments the review posted, whatever head

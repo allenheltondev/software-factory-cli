@@ -1,6 +1,6 @@
 // Persistence for publication (push the job branch, open a PR, comment on the issue). Kept in
 // its own table so publishing never changes a run's outcome. See src/publish/publish.ts.
-import type { Publication, PublicationState } from '../types.js';
+import type { Publication, PublicationState, PublisherKind } from '../types.js';
 import { nowIso } from '../util/ids.js';
 import { transaction, type Db } from './database.js';
 import { notePrOpened } from './metrics.js';
@@ -29,6 +29,9 @@ interface PublicationRow {
   created_at: string;
   updated_at: string;
   published_at: string | null;
+  publisher_kind?: string | null;
+  publisher_login?: string | null;
+  publisher_id?: number | null;
 }
 
 function rowToPublication(r: PublicationRow): Publication {
@@ -56,6 +59,10 @@ function rowToPublication(r: PublicationRow): Publication {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     publishedAt: r.published_at,
+    publisher:
+      (r.publisher_kind === 'worker' || r.publisher_kind === 'user') && r.publisher_login
+        ? { kind: r.publisher_kind, login: r.publisher_login, id: r.publisher_id ?? null }
+        : null,
   };
 }
 
@@ -155,6 +162,9 @@ export interface PublicationProgress {
   prUrl?: string;
   commentId?: number;
   commentUrl?: string;
+  publisherKind?: PublisherKind;
+  publisherLogin?: string;
+  publisherId?: number | null;
 }
 
 const PROGRESS_COLUMNS: Record<keyof PublicationProgress, string> = {
@@ -165,13 +175,16 @@ const PROGRESS_COLUMNS: Record<keyof PublicationProgress, string> = {
   prUrl: 'pr_url',
   commentId: 'comment_id',
   commentUrl: 'comment_url',
+  publisherKind: 'publisher_kind',
+  publisherLogin: 'publisher_login',
+  publisherId: 'publisher_id',
 };
 
 /** Record progress for the owning attempt (and extend its lease). Throws PublicationSupersededError. */
 export function recordPublicationProgress(db: Db, runId: string, fence: PublicationFence, p: PublicationProgress): void {
   const clock = fence.now ?? Date.now;
   const sets: string[] = ['lease_expires_at = ?'];
-  const values: Array<string | number> = [new Date(clock() + fence.leaseSeconds * 1000).toISOString()];
+  const values: Array<string | number | null> = [new Date(clock() + fence.leaseSeconds * 1000).toISOString()];
   for (const [key, column] of Object.entries(PROGRESS_COLUMNS) as Array<[keyof PublicationProgress, string]>) {
     const v = p[key];
     if (v !== undefined) {

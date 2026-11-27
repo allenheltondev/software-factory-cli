@@ -39,7 +39,7 @@ import {
 import { listUnpublishedSinceEnabled } from '../db/publish-settings.js';
 import { dependencyRef, getDependencyWait } from '../db/dependency-waits.js';
 import { recordError, type Db } from '../db/database.js';
-import { autoMergeMethod, publishMode, type MergeMethod, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
+import { autoMergeMethod, publishMode, reviewActive, type MergeMethod, type RepositoryConfig, type UpdraftConfig } from '../config/schema.js';
 import {
   assertValidBranchName,
   GitError,
@@ -57,6 +57,8 @@ import { jobBranchName, withCheckoutLock } from '../git/worktree.js';
 import { GitHubError, type GitHubApi, type GitHubPullRequest } from '../github/api.js';
 import { APP_PERMISSIONS_HINT, GitHubAppError, redactGitHubSecrets } from '../github/app-auth.js';
 import type { WorkerKind } from '../github/credentials.js';
+import { workerLogin } from '../github/identity.js';
+import type { UserPublisher } from '../github/publisher.js';
 import type { UpdraftPaths } from '../paths.js';
 import { reviewOf, revisionOf, type Job, type Publication, type Run, type RunSummary } from '../types.js';
 import type { Logger } from '../util/log.js';
@@ -69,6 +71,7 @@ import { quietFor, writeStatusComment } from './status-comment.js';
 import { STATUS_STAGE } from './status-marker.js';
 import { code } from './failure-comment.js';
 import { detailLines, runDetails, type RunDetails } from './run-details.js';
+import { codingRole, whoRecord } from './publisher-role.js';
 
 /** How long a publication may hold its lease before another process may take it over. */
 export const PUBLISH_LEASE_SECONDS = 10 * 60;
@@ -113,6 +116,14 @@ export interface PublishDeps {
    * installation token, never with the SSH key of the clone's remote. Default 'user'.
    */
   workerKind?: WorkerKind;
+  /**
+   * The consenting person of github.publisher (src/github/publisher.ts), for repositories with
+   * publishAs user: their sign-in pushes and opens the pull requests there (publisher-role.ts).
+   * Absent: nothing is published as a person, and a pull request recorded as one stops.
+   */
+  publisher?: UserPublisher;
+  /** Push over HTTPS with `token` even for kind 'user' (a person publisher: never the clone's SSH key). */
+  httpsPush?: boolean;
   git?: string;
   /** Injected in tests to record what reaches git. */
   runGit?: RunGit;
@@ -427,6 +438,8 @@ export function renderPrBody(o: {
   merge?: MergePolicy;
   /** The run's console timeline, when hosted. */
   link?: string | null;
+  /** Publishing as a person (publishAs user): who pushed and opened it, and who reviews it. */
+  identities?: { publisher: string; reviewer: string | null } | null;
 }): string {
   const markable = /^[A-Za-z0-9_.-]{1,64}$/.test(o.agent);
   // An agent name the hidden marker cannot carry keeps the line a lost-state restore reads instead.
@@ -438,12 +451,26 @@ export function renderPrBody(o: {
     '',
     `${mergeSection(o.merge ?? { auto: false, reason: null }, o.mode)} ${where}`,
     '',
+    ...(o.identities ? [identitiesLine(o.identities), ''] : []),
     ...renderRunResult(o.summary, o.commitCount),
   ].join('\n');
   // The agent beside the run's marker: what a run that lost its state reads back (run-event-restore.ts).
   const agent = markable ? `\n${prAgentMarker(o.runId, o.agent)}` : '';
   const marker = `${publicationMarker(o.runId)}${agent}`;
   return `${cap(body, MAX_BODY - marker.length - 2)}\n\n${marker}`;
+}
+
+/**
+ * The attribution line of a pull request published as a person: it was opened and pushed by
+ * Updraft's coding agent with that person's sign-in, which does not make them the author of the
+ * code, and its automated reviews are the App's, which count toward GitHub's required reviews
+ * only where GitHub itself says so.
+ */
+export function identitiesLine(o: { publisher: string; reviewer: string | null }): string {
+  return (
+    `Pushed and opened by Updraft's coding agent with the GitHub sign-in of ${code(o.publisher)}, who authorized it; the code is the agent's.` +
+    (o.reviewer ? ` Updraft's automated reviews are posted as ${code(o.reviewer)}; they do not replace a review a person or code owner must give.` : '')
+  );
 }
 
 const MERGE_OPEN = '<!-- updraft-merge -->';
@@ -560,7 +587,7 @@ export interface PushTarget {
  * `onToken` receives the token as soon as it is read, so the caller can redact it from any error.
  */
 export async function openPushTarget(
-  deps: Pick<PublishDeps, 'token' | 'workerKind' | 'env' | 'git' | 'runGit'>,
+  deps: Pick<PublishDeps, 'token' | 'workerKind' | 'httpsPush' | 'env' | 'git' | 'runGit'>,
   o: { checkoutPath: string; repoFullName: string; remote: string | undefined; scratchDir: string; signal: AbortSignal; onToken: (token: string) => void },
 ): Promise<PushTarget> {
   const { checkoutPath, repoFullName, scratchDir } = o;
@@ -591,7 +618,9 @@ export async function openPushTarget(
   // As a GitHub App the push must carry the installation token, so it goes over HTTPS to the
   // repository the remote was just validated to be, never over SSH with the person's key (and
   // never with credentials embedded in the remote's URL).
-  const pushUrl = deps.workerKind === 'app' ? `https://github.com/${repoFullName}.git` : pushUrlRaw;
+  // So must a push as the person of github.publisher: their checked token, not an SSH key whose
+  // account nobody checked.
+  const pushUrl = deps.workerKind === 'app' || deps.httpsPush ? `https://github.com/${repoFullName}.git` : pushUrlRaw;
   let token: string | null = null;
   if (isHttpsGitHub(pushUrl)) {
     token = await deps.token(repoFullName);
@@ -690,9 +719,20 @@ export async function publishRun(
     const signal = opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(NETWORK_TIMEOUT_MS)]) : AbortSignal.timeout(NETWORK_TIMEOUT_MS);
     const local: GitOptions = { cwd: checkoutPath, git: deps.git };
 
+    // 0. Who pushes and opens the pull request (publisher-role.ts): recorded before anything is
+    // written, so every retry and revision of this pull request is the same account.
+    const role = await codingRole(deps, { repo: repoRef, config: repo, recorded: pub.publisher ?? null, started: Boolean(pub.pushedAt || pub.prNumber) });
+    const who = await whoRecord(deps.api, role);
+    if (!pub.publisher) {
+      hold();
+      progress({ publisherKind: who.kind, publisherLogin: who.login, publisherId: who.id });
+    }
+    if (who.kind === 'user') await runLog([`publishing as ${who.login} (github.publisher, account ${who.id}), checked just now`]);
+    const pushDeps = { ...deps, token: role.token, workerKind: role.workerKind, httpsPush: role.httpsPush };
+
     // 1. The clone, its remote, the base branch and the job branch's commit.
     const { remote, pushUrl, net, localSha, commitCount } = await withCheckoutLock(checkoutPath, async () => {
-      const target = await openPushTarget(deps, {
+      const target = await openPushTarget(pushDeps, {
         checkoutPath,
         repoFullName,
         remote: repo.remote,
@@ -728,7 +768,7 @@ export async function publishRun(
       return { status: 'skipped', reason, publication: getPublication(deps.db, runId)! };
     }
 
-    const baseBranch = pub.baseBranch ?? repo.baseBranch ?? (await remoteDefaultBranch(pushUrl, net));
+    const baseBranch = pub.baseBranch ?? repo.baseBranch ?? (await remoteDefaultBranch(pushUrl, net, run1));
     if (baseBranch !== pub.baseBranch) progress({ baseBranch });
     if (branch === baseBranch) throw new PublishRefusal(`the job branch ${branch} is the base branch; refusing to push to it`);
 
@@ -790,7 +830,7 @@ export async function publishRun(
       pr = { number: pub.prNumber, htmlUrl: pub.prUrl, state: 'open', draft: mode === 'draft-pr', merged: false, headRef: branch, headRepoId: job.repoId, baseRef: baseBranch, body: '' };
     } else {
       const owner = repoFullName.split('/')[0]!;
-      const existing = (await deps.api.listPullRequestsForHead(repoRef, { headOwner: owner, head: branch })).filter(
+      const existing = (await role.api.listPullRequestsForHead(repoRef, { headOwner: owner, head: branch })).filter(
         (p) => p.headRef === branch && (p.headRepoId === null || p.headRepoId === job.repoId),
       );
       pr = existing.find((p) => p.state === 'open') ?? existing[0] ?? null;
@@ -799,7 +839,7 @@ export async function publishRun(
       } else {
         const title = cap(job.envelope.issue.title.replace(/\s+/g, ' ').trim() || `Issue #${job.issueNumber}`, MAX_TITLE);
         hold(); // the lookup may have outlived the lease
-        pr = await deps.api.createPullRequest(repoRef, {
+        pr = await role.api.createPullRequest(repoRef, {
           title,
           head: branch,
           base: baseBranch,
@@ -813,6 +853,7 @@ export async function publishRun(
             mode,
             merge: mergePolicy(deps.config, repo, { mode, verifies: Boolean(ownEntry(deps.config.actions, job.action)?.verify?.length), summary: run.summary }),
             link: consoleWorkflowUrl(deps.console, job.repoId, job.issueNumber),
+            identities: who.kind === 'user' ? { publisher: who.login, reviewer: reviewActive(deps.config, repo) ? await workerLogin(deps.api) : null } : null,
           }),
         });
         await runLog([`opened ${pr.draft ? 'draft ' : ''}PR #${pr.number}: ${pr.htmlUrl}`]);

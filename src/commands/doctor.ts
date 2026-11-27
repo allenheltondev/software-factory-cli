@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import type { UserPublisher } from '../github/publisher.js';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -153,6 +154,8 @@ export interface DoctorProbes {
    * sign-in). Throws when an App is configured and its key cannot be used. Absent: the gh sign-in.
    */
   createCredentials?(config: UpdraftConfig): GitHubCredentials;
+  /** The person of github.publisher (src/github/publisher.ts), or null when none is configured. */
+  createUserPublisher?(config: UpdraftConfig): UserPublisher | null;
   /** Permission bits of a file, or null when it cannot be read; for the App's private key. */
   fileMode?(path: string): number | null;
   fileExists(path: string): boolean;
@@ -271,12 +274,14 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
 
   let api: GitHubApi | null = null;
   let credentials: GitHubCredentials | undefined;
+  let workerName: string | null = null;
   try {
     if (!appKeyOk) throw new Error("the GitHub App's private key cannot be used (see above)");
     credentials = config ? probes.createCredentials?.(config) : undefined;
     api = await probes.createApi(credentials);
     // Who the worker is: the gh account, or the App's bot (never GET /user under an App).
     const who = await api.getWorkerIdentity();
+    workerName = who.login;
     const listed = config ? new Set(config.dispatch.allowedActors.map((a) => a.toLowerCase())).has(who.login.toLowerCase()) : false;
     if (who.kind === 'app') {
       add('ok', 'github', `the GitHub App authenticates; the worker acts as ${who.login} (app id ${who.id})`);
@@ -311,6 +316,20 @@ export async function runDoctor(paths: UpdraftPaths, probes: DoctorProbes): Prom
         // Under a GitHub App, access is the installation's permissions, not an account's.
         const appAuth = credentials?.app;
         if (appAuth) for (const c of await appRepoChecks(appAuth, config, fullName, repo)) add(c.status, name, c.detail);
+        if (repo.publishAs === 'user') {
+          // Publishing as a person (docs/github-app.md): checked exactly as publication checks it.
+          const sev: CheckStatus = config.execution.mode === 'live' ? 'fail' : 'warn';
+          const person = probes.createUserPublisher?.(config) ?? null;
+          if (!person) add(sev, name, 'publishAs: user, but github.publisher names no one, so nothing would be published');
+          else {
+            try {
+              const v = await person.verify({ id: repo.id, fullName });
+              add('ok', name, `publishAs: user; pull requests and pushes as ${v.login} (id ${v.id}, github.publisher); reviews, notices and merges as ${workerName ?? 'the GitHub App'}`);
+            } catch (err) {
+              add(sev, name, `publishAs: user, but Updraft cannot publish as ${person.expected.login}: ${errMessage(err)}`);
+            }
+          }
+        }
         const publish = publishMode(repo);
         if (publish !== 'none' && !appAuth) {
           // Publication pushes and opens PRs as this account; a miss here is a failure only when it would run.
@@ -497,6 +516,7 @@ export function defaultDoctorProbes(ctx: CommandContext): DoctorProbes {
     checkDb: (file) => ctx.openDb(file).close(),
     createApi: (credentials) => ctx.createApi(credentials ? { credentials } : undefined),
     createCredentials: (config) => ctx.createCredentials(config),
+    createUserPublisher: (config) => ctx.createUserPublisher?.(config) ?? null,
     fileExists: existsSync,
   };
 }

@@ -35,6 +35,7 @@ export async function publishCommand(ctx: CommandContext, runId: string, deps: P
     const log = createLogger({ stream: null });
     const credentials = ctx.createCredentials(config, { log });
     const api = await ctx.createApi({ log, credentials });
+    const userPublisher = ctx.createUserPublisher?.(config, { log }) ?? null;
     const testToken = deps.token;
     const publishDeps: PublishDeps = {
       db,
@@ -44,6 +45,7 @@ export async function publishCommand(ctx: CommandContext, runId: string, deps: P
       log,
       token: testToken ? () => testToken(ctx.env) : (repoFullName) => credentials.token(repoFullName, { fresh: true }),
       workerKind: credentials.kind,
+      ...(userPublisher ? { publisher: userPublisher } : {}),
       env: ctx.env,
       now: ctx.now,
       ...(deps.runGit ? { runGit: deps.runGit } : {}),

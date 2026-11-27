@@ -16,6 +16,7 @@ import { createLogger, type Logger, type LoggerOptions } from '../util/log.js';
 import { isInNpxCache, NPX_START_WARNING } from '../util/npx.js';
 import { runDaemon, type DaemonDeps } from '../worker/daemon.js';
 import { createExecutor } from '../worker/prepare-only.js';
+import { checkPublisherForJob, publishingAsPerson } from '../publish/publisher-role.js';
 import type { CommandContext } from './context.js';
 import { EXIT } from './errors.js';
 
@@ -89,8 +90,11 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
     // The gh account, or the GitHub App of github.app: one provider for the API and for pushes.
     const credentials = ctx.createCredentials(config, { log: log.child({ component: 'github' }) });
     const api = await ctx.createApi({ log: log.child({ component: 'github' }), credentials });
+    // The person of github.publisher, for repositories with publishAs user (publisher-role.ts).
+    const userPublisher = ctx.createUserPublisher?.(config, { log: log.child({ component: 'publisher' }) }) ?? null;
     log.info('worker starting', {
       github: credentials.kind === 'app' ? 'GitHub App' : 'gh account',
+      ...(userPublisher ? { publisher: userPublisher.expected.login, publishesAsPerson: publishingAsPerson(config) } : {}),
       config: paths.configFile,
       db: paths.dbFile,
       repos: repoCount,
@@ -107,6 +111,7 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       log: log.child({ component }),
       token: (repoFullName) => credentials.token(repoFullName, { fresh: true }),
       workerKind: credentials.kind,
+      ...(userPublisher ? { publisher: userPublisher } : {}),
       env: ctx.env,
     });
     const publication = publicationEnabled(config) ? createPublisher(publishDeps('publish')) : undefined;
@@ -122,7 +127,12 @@ export async function startCommand(ctx: CommandContext, deps: StartDeps = defaul
       paths,
       log: log.child({ component: 'worker' }),
       poll: () => deps.pollOnce({ db: openDb, api, config, log: pollLog, configDir: paths.configDir }),
-      checkDispatchable: (job) => deps.checkJobDispatchable({ api, config, db: openDb }, job),
+      checkDispatchable: async (job) => {
+        const check = await deps.checkJobDispatchable({ api, config, db: openDb }, job);
+        // Throws while the publisher can't publish: the job stays queued, with the reason recorded.
+        if (check.ok) await checkPublisherForJob(publishDeps('publisher'), job);
+        return check;
+      },
       signal: controller.signal,
       executor: createExecutor(config, appAuth && config.github?.app?.commitAsApp ? { commitIdentity: (repoFullName) => appCommitIdentity(appAuth, repoFullName) } : {}),
       ...(publisher ? { publisher } : {}),

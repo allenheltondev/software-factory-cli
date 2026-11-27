@@ -582,4 +582,24 @@ export interface Publication {
   createdAt: string;
   updatedAt: string;
   publishedAt: string | null;
+  /**
+   * Whose GitHub identity pushed this run's branch and opened its pull request (docs/github-app.md,
+   * "Publishing as a person"), recorded before the first push and kept for the PR's lifetime.
+   * Null for a publication recorded before this existed, or one not started yet.
+   */
+  publisher?: PublisherRecord | null;
+}
+
+/**
+ * Who publishes: `worker` is the worker's own credentials (the GitHub App of github.app, or the
+ * gh account without one); `user` is the consenting person of github.publisher.
+ */
+export type PublisherKind = 'worker' | 'user';
+
+/** A pull request's publisher as recorded: never a credential, only who it was. */
+export interface PublisherRecord {
+  kind: PublisherKind;
+  login: string;
+  /** The account's numeric id; null when it was not known. */
+  id: number | null;
 }

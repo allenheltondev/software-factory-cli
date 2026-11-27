@@ -4,6 +4,7 @@ import type { GitHubApi } from '../github/api.js';
 import type { UpdraftConfig } from '../config/schema.js';
 import { createGitHubApi, resolveGitHubToken } from '../github/client.js';
 import { createWorkerCredentials, type GitHubCredentials } from '../github/credentials.js';
+import { createUserPublisher, type UserPublisher } from '../github/publisher.js';
 import { findLegacyInstall, legacyInstallNotice, resolvePaths, type LegacyInstall, type UpdraftPaths } from '../paths.js';
 import type { Logger } from '../util/log.js';
 import { createClackPrompter, type Prompter } from './prompter.js';
@@ -32,6 +33,12 @@ export interface CommandContext {
    * configured, else the gh sign-in. Throws when the App's private key cannot be used.
    */
   createCredentials(config: Pick<UpdraftConfig, 'github'> | null, opts?: { log?: Logger }): GitHubCredentials;
+  /**
+   * The consenting person of github.publisher (src/github/publisher.ts), or null when none is
+   * configured: their own `gh` sign-in, checked against the named account on every use. Optional:
+   * contexts without it publish as no person, and a pull request recorded as one stops.
+   */
+  createUserPublisher?(config: Pick<UpdraftConfig, 'github'> | null, opts?: { log?: Logger }): UserPublisher | null;
   /** Lazily created so non-interactive commands never touch the terminal. */
   prompter(): Prompter;
   openDb(file: string): Db;
@@ -67,6 +74,7 @@ export function createDefaultContext(globals: GlobalOptions = {}): CommandContex
     createApi: (opts) => createGitHubApi({ env, log: opts?.log, ...(opts?.credentials ? { credentials: opts.credentials } : {}) }),
     createCredentials: (config, opts) =>
       createWorkerCredentials(config, { configDir: paths.configDir, env, userToken: () => resolveGitHubToken(env), ...(opts?.log ? { log: opts.log } : {}) }),
+    createUserPublisher: (config, opts) => userPublisherFor(config, { env, ...(opts?.log ? { log: opts.log } : {}) }),
     prompter: () => (prompter ??= createClackPrompter()),
     openDb: (file) => openDatabase(file),
     openDbReadOnly: (file) => openDatabaseReadOnly(file),
@@ -84,4 +92,18 @@ export function legacyNotice(ctx: CommandContext): string[] {
 
 export function println(out: Output, line = ''): void {
   out.write(`${line}\n`);
+}
+
+/**
+ * The person of github.publisher, or null: their `gh` sign-in (GH_TOKEN / GITHUB_TOKEN, else
+ * `gh auth token`), read again and checked for every publication step. Never the App's credentials.
+ */
+export function userPublisherFor(config: Pick<UpdraftConfig, 'github'> | null, o: { env: NodeJS.ProcessEnv; log?: Logger }): UserPublisher | null {
+  const expected = config?.github?.publisher;
+  if (!expected) return null;
+  return createUserPublisher({
+    expected: { login: expected.login, ...(expected.id !== undefined ? { id: expected.id } : {}) },
+    readToken: () => resolveGitHubToken(o.env),
+    apiFor: (token) => createGitHubApi({ token, env: o.env, ...(o.log ? { log: o.log } : {}) }),
+  });
 }

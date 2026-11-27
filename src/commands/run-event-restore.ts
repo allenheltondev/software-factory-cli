@@ -13,7 +13,8 @@ import { getRevisionPr, syncRevisionPrs } from '../db/revisions.js';
 import { isJobBranchName } from '../git/worktree.js';
 import { GitHubError, type GitHubApi, type PullRequestDetails } from '../github/api.js';
 import { isWorkerLogin } from '../github/credentials.js';
-import type { RepoRef } from '../types.js';
+import { sameLogin } from '../github/identity.js';
+import type { PublisherRecord, RepoRef } from '../types.js';
 
 /** What the API establishes about a pull request Updraft opened. */
 export interface OwnPullRequest {
@@ -22,6 +23,8 @@ export interface OwnPullRequest {
   runId: string;
   /** The agent of that run, from the line publication writes above the marker; null when it cannot be read. */
   agent: string | null;
+  /** Who opened it, as far as the API showed: the worker, or the person of github.publisher. */
+  publisher?: PublisherRecord;
 }
 
 export type OwnPullRequestAnswer =
@@ -42,7 +45,17 @@ const AGENT_MARKER = /<!-- updraft-agent: (run_[0-9a-z]+) ([A-Za-z0-9_.-]{1,64})
  * pull request, and who the worker is), none of them a write. Throws for API failures other than
  * "not found".
  */
-export async function readOwnPullRequest(api: Pick<GitHubApi, 'getPullRequest' | 'getWorkerIdentity'>, repo: RepoRef, prNumber: number): Promise<OwnPullRequestAnswer> {
+export async function readOwnPullRequest(
+  api: Pick<GitHubApi, 'getPullRequest' | 'getWorkerIdentity'>,
+  repo: RepoRef,
+  prNumber: number,
+  /**
+   * The person of github.publisher when the repository publishes as them (publishAs user): a pull
+   * request they opened is Updraft's too, if it also has the job branch and the run's marker. A pull
+   * request of theirs without those is never taken for one.
+   */
+  publisher: { login: string; id?: number } | null = null,
+): Promise<OwnPullRequestAnswer> {
   let pr: PullRequestDetails;
   try {
     pr = await api.getPullRequest(repo, prNumber);
@@ -55,10 +68,23 @@ export async function readOwnPullRequest(api: Pick<GitHubApi, 'getPullRequest' |
   if (pr.headRepoId !== repo.id) return { kind: 'not-ours', why: 'its head branch is in another repository' };
   const runId = MARKER.exec(pr.body ?? '')?.[1];
   if (!runId) return { kind: 'not-ours', why: 'its body does not carry the marker of the run that opened it' };
-  const identity = await api.getWorkerIdentity();
-  if (!isWorkerLogin(identity, pr.author)) return { kind: 'not-ours', why: `it was opened by ${pr.author ?? 'an unknown account'}, not by ${identity.login}` };
   const opened = AGENT_MARKER.exec(pr.body ?? '') ?? OPENED_BY.exec(pr.body ?? '');
-  return { kind: 'ours', own: { pr, runId, agent: opened && opened[1] === runId ? opened[2]!.trim() : null } };
+  const agent = opened && opened[1] === runId ? opened[2]!.trim() : null;
+  if (publisher && pr.author && sameLogin(pr.author, publisher.login) && !pr.author.endsWith('[bot]')) {
+    // The account id is recorded, so the rest of this pull request's loop checks the sign-in by
+    // id as well as login (publisher-role.ts): the author's, as GitHub reports it, else the
+    // configured one. An author whose id is not the configured one is another account by that name.
+    const authorId = typeof pr.authorId === 'number' ? pr.authorId : null;
+    if (authorId !== null && publisher.id !== undefined && authorId !== publisher.id) {
+      return { kind: 'not-ours', why: `it was opened by ${pr.author} (account ${authorId}), not by account ${publisher.id} of github.publisher` };
+    }
+    return { kind: 'ours', own: { pr, runId, agent, publisher: { kind: 'user', login: pr.author, id: authorId ?? publisher.id ?? null } } };
+  }
+  const identity = await api.getWorkerIdentity();
+  if (!isWorkerLogin(identity, pr.author)) {
+    return { kind: 'not-ours', why: `it was opened by ${pr.author ?? 'an unknown account'}, not by ${identity.login}${publisher ? ` or ${publisher.login} (github.publisher)` : ''}` };
+  }
+  return { kind: 'ours', own: { pr, runId, agent, publisher: { kind: 'worker', login: identity.login, id: null } } };
 }
 
 export interface RestoreInput {
@@ -118,13 +144,19 @@ export function restorePublication(db: Db, o: RestoreInput): { run: 'created' | 
     }
     db.prepare(
       `INSERT INTO publications (run_id, job_id, repo_id, repo_full_name, issue_number, mode, state, branch, base_branch, pr_number, pr_url,
-                                 error, retryable, attempts, created_at, updated_at, published_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)
+                                 error, retryable, attempts, created_at, updated_at, published_at, publisher_kind, publisher_login, publisher_id)
+       VALUES (?, ?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (run_id) DO UPDATE SET
+         publisher_kind = coalesce(publications.publisher_kind, excluded.publisher_kind),
+         publisher_login = coalesce(publications.publisher_login, excluded.publisher_login),
+         publisher_id = coalesce(publications.publisher_id, excluded.publisher_id),
          state = 'published', branch = excluded.branch, base_branch = excluded.base_branch, pr_number = excluded.pr_number, pr_url = excluded.pr_url,
          error = excluded.error, retryable = 0, lease_expires_at = NULL, next_attempt_at = NULL, updated_at = excluded.updated_at,
          published_at = coalesce(publications.published_at, excluded.published_at)`,
-    ).run(runId, o.jobId, o.repo.id, job.repo_full_name, job.issue_number, o.mode, pr.headRef, pr.baseRef, pr.number, pr.htmlUrl, why, at, at, at);
+    ).run(
+      runId, o.jobId, o.repo.id, job.repo_full_name, job.issue_number, o.mode, pr.headRef, pr.baseRef, pr.number, pr.htmlUrl, why, at, at, at,
+      o.own.publisher?.kind ?? null, o.own.publisher?.login ?? null, o.own.publisher?.id ?? null,
+    );
     return existingRun ? 'kept' : 'created';
   });
   // The watch row is derived from the publication, as it always is (a transaction of its own).
