@@ -5,12 +5,13 @@ import { api as defaultApi, ApiError, ConfigInvalidError, type ApiClient, type C
 import { tenantStatusLabel } from './GitHubSettingsPage';
 import { ConfigEditor } from './config/Editor';
 import { AGENT_LABEL, KEY_FOR, keysNeeded, sectionOf, type Section } from './config/model';
+import { useCodexAccount } from '../lib/codexAccount';
 import { EffectiveConfig, isSimple, SimpleConfig, simpleBlockers } from './config/Simple';
 import { customSettings, describeChanges, labelGroups, type KeyStatus } from './config/team';
 
 export { issuesAt, parseLogins } from './config/model';
 
-type ConfigApi = Pick<ApiClient, 'config' | 'previewConfig' | 'publishConfig' | 'setAgentKey'> & Partial<Pick<ApiClient, 'agentKeys'>>;
+type ConfigApi = Pick<ApiClient, 'config' | 'previewConfig' | 'publishConfig' | 'setAgentKey'> & Partial<Pick<ApiClient, 'agentKeys' | 'nativeClaude' | 'nativeCodex'>>;
 type Load = { state: 'loading' } | { state: 'ok'; view: ConfigView } | { state: 'error'; message: string };
 type Busy = 'preview' | 'publish' | null;
 
@@ -62,6 +63,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
       .catch(() => undefined);
   }, [api, installationId, valid]);
   useEffect(readKeyStatus, [readKeyStatus]);
+  const codex = useCodexAccount(api, installationId, valid);
 
   const show = useCallback((view: ConfigView) => {
     setLoad({ state: 'ok', view });
@@ -212,7 +214,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
     setKeys(keys);
     readKeyStatus();
   };
-  const shared = { config, onChange: edit, view, installationId, keyApi: api, onKeys };
+  const shared = { config, onChange: edit, view, installationId, keyApi: api, onKeys, codex };
   const custom = customSettings(config);
   const simple = mode === 'simple' && custom.length === 0;
   const blockers = simple ? simpleBlockers(config, view) : [];
