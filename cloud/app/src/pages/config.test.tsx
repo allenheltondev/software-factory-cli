@@ -449,12 +449,12 @@ describe('connected agents, teams and exceptions (#193)', () => {
     const api = fakeApi({ config: vi.fn().mockResolvedValue(view({ config, agentKeys: {} })), setAgentKey, publishConfig: publishedOk(1) });
     configPage(api);
     // Three steps on one page.
-    expect(await screen.findByText('1 · Connect agents')).toBeInTheDocument();
-    expect(screen.getByText('2 · Choose your agent team')).toBeInTheDocument();
-    expect(screen.getByText('3 · Choose where work starts')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '1 · Connect agents' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '2 · Choose your agent team' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '3 · Choose where work starts' })).toBeInTheDocument();
 
     const card = screen.getByTestId('provider-claude');
-    expect(card).toHaveTextContent('API key · runs bill your API billing');
+    expect(card).toHaveTextContent('Uses your Anthropic API key.');
     await userEvent.click(within(card).getByRole('button', { name: 'Connect Claude Code' }));
     await userEvent.type(within(card).getByLabelText(/Claude Console API key/), 'sk-ant-abc');
     await userEvent.click(within(card).getByRole('button', { name: 'Save key' }));
@@ -547,7 +547,7 @@ describe('connected agents, teams and exceptions (#193)', () => {
     // Reset both: the label and the repository use the defaults again.
     await userEvent.click(within(screen.getByTestId('label-art')).getByRole('button', { name: 'Reset to defaults' }));
     await userEvent.click(within(screen.getByTestId('repo-acme/api')).getByRole('button', { name: 'Use the agents of "updraft" in acme/api' }));
-    expect(screen.getByTestId('effective-acme/api-updraft')).toHaveTextContent('Installation defaults');
+    expect(screen.getByTestId('effective-acme/api-updraft')).toHaveTextContent('Your team');
     await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     const reset = sentConfig(api, 1);
     expect(reset.pools).toEqual({ builders: { agents: ['claude'] }, reviewers: { agents: ['claude', 'codex'] } });
@@ -567,7 +567,7 @@ describe('connected agents, teams and exceptions (#193)', () => {
       const { unmount } = configPage(api);
       await userEvent.click(await screen.findByRole('button', { name: 'View config' }));
       expect(previewConfig).toHaveBeenCalledWith(55, config);
-      expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'No changes' })).toBeDisabled();
       expect(screen.queryByTestId('pending-changes')).toBeNull();
       unmount();
     }
@@ -597,11 +597,11 @@ describe('connected agents, teams and exceptions (#193)', () => {
     expect(within(card).getByRole('button', { name: 'Reconnect Claude Code' })).toBeInTheDocument();
     const box = within(screen.getByTestId('coding-claude')).getByRole('checkbox', { name: 'Claude Code' });
     expect(box).toBeChecked();
-    expect(screen.getByTestId('coding-claude')).toHaveTextContent('its last run could not use the key: reconnect it');
+    expect(screen.getByTestId('coding-claude')).toHaveTextContent('Key failed: reconnect it');
     expect(within(screen.getByTestId('review-claude')).getByRole('checkbox', { name: 'Claude Code' })).toBeChecked();
     expect(screen.getByTestId('review-summary')).toHaveTextContent(/Independent review/);
     // A Claude subscription is a separate route, never a silent fallback here.
-    expect(within(card).getByRole('link', { name: 'Claude subscription routing' })).toHaveAttribute('href', '/installations/55/claude');
+    expect(within(card).getByRole('link', { name: /Use your Claude subscription/ })).toHaveAttribute('href', '/installations/55/claude');
   });
 
   it('shows a provider this deployment no longer runs honestly, and keeps the settings that name it', async () => {
@@ -609,7 +609,7 @@ describe('connected agents, teams and exceptions (#193)', () => {
     config.agents.vibe = { adapter: 'vibe', enabled: false };
     configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config })) }));
     const card = await screen.findByTestId('provider-vibe');
-    expect(card).toHaveTextContent('Not available here');
+    expect(card).toHaveTextContent('Not available');
     expect(within(card).queryByRole('button')).toBeNull();
     expect(within(screen.getByTestId('coding-vibe')).getByRole('checkbox')).toBeDisabled();
   });
@@ -626,18 +626,18 @@ describe('the full editor', () => {
     const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
     configPage(api);
     await openFull();
-    const publish = await screen.findByRole('button', { name: 'Publish' });
-    // Nothing changed since version 1.
-    expect(publish).toBeDisabled();
+    // Nothing changed since version 1: the button says there is nothing to publish.
+    expect(await screen.findByRole('button', { name: 'No changes' })).toBeDisabled();
     await userEvent.click(within(screen.getByTestId('repo-acme/api')).getByRole('checkbox', { name: 'Work in acme/api' }));
     expect(screen.getByTestId('draft-state')).toHaveTextContent('Unsaved changes');
     const api_ = screen.getByTestId('repo-acme/api');
     await userEvent.type(within(api_).getByLabelText('Verify commands'), 'npm test');
-    await userEvent.click(publish);
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
     expect(api.publishConfig).toHaveBeenCalledWith(55, { config: expect.any(Object), baseVersion: 1 });
     expect(sentConfig(api).repositories['acme/api']).toEqual({ enabled: true, workflows: ['implement'], publish: 'draft-pr', commentOnFailure: true, verify: ['npm test'], ci: {} });
     expect(await screen.findByTestId('config-published')).toHaveTextContent('Published version 2');
     expect(screen.getByTestId('draft-state')).toHaveTextContent('Version 2 is active');
+    expect(screen.getByRole('button', { name: 'No changes' })).toBeDisabled();
   });
 
   it('pauses a repository, and gives it its own allowed actors', async () => {
@@ -856,7 +856,7 @@ describe('the full editor', () => {
     expect(await screen.findByTestId('config-tenant-source')).toHaveTextContent('Version 3 was published with tenant-admin');
     expect(screen.getByTestId('config-tenant-source')).toHaveTextContent('Publishing from here replaces that config, including its tiers and anything else the console can\'t show.');
     expect(screen.getByTestId('config-readonly')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'No changes' })).toBeDisabled();
   });
 
   it('adds a workflow with the packaged prompts on a label of its own, and resets an edited prompt', async () => {
@@ -966,7 +966,7 @@ describe('the page and the compiled config agree (#193)', () => {
     configPage(api);
     await userEvent.click(await screen.findByRole('button', { name: 'View config' }));
     expect(JSON.stringify(previewed(api))).toBe(JSON.stringify(sample));
-    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'No changes' })).toBeDisabled();
     expect(screen.queryByTestId('pending-changes')).toBeNull();
     // Only the advanced sample needs the full editor; its custom settings are named, not converted.
     expect(screen.queryByTestId('simple-config') !== null).toBe(name !== 'advanced');
@@ -1036,23 +1036,23 @@ describe('the page and the compiled config agree (#193)', () => {
   it('offers Connect ChatGPT on the Codex card only where the deployment supports it, and Claude\'s link is unchanged', async () => {
     const twoAgents = () => view({ config: clone(TWO_PROVIDERS.start), agents: ['claude', 'codex', 'kiro'], agentKeys: { KIRO_API_KEY: true } });
     const base = { configured: true, enabled: true, worker: null };
-    const chatgpt = () => screen.queryByRole('link', { name: 'Connect ChatGPT account →' });
+    const chatgpt = () => screen.queryByRole('link', { name: /Use your ChatGPT plan/ });
     const available = fakeApi({ config: vi.fn().mockResolvedValue(twoAgents()), nativeClaude: async () => ({ ...base, codexAvailable: true }),
       nativeCodex: async () => ({ ...base, worker: { status: 'auth-required', online: true, busy: false, lastHeartbeatAt: '2026-11-26T10:00:00Z', workerVersion: 'v1' } }) });
     const first = configPage(available);
     const codex = await screen.findByTestId('provider-codex');
-    const link = await within(codex).findByRole('link', { name: 'Connect ChatGPT account →' });
+    const link = await within(codex).findByRole('link', { name: /Use your ChatGPT plan →/ });
     expect(link).toHaveAttribute('href', '/installations/55/codex');
-    expect(codex).toHaveTextContent('Codex can run on a ChatGPT plan instead of an API key');
+    expect(link).toHaveTextContent('Instead of an API key');
     await waitFor(() => expect(codex).toHaveTextContent('Needs sign-in'));
-    expect(within(screen.getByTestId('provider-claude')).getByRole('link', { name: 'Claude subscription routing' })).toHaveAttribute('href', '/installations/55/claude');
+    expect(within(screen.getByTestId('provider-claude')).getByRole('link', { name: /Use your Claude subscription/ })).toHaveAttribute('href', '/installations/55/claude');
     expect(within(screen.getByTestId('provider-claude')).queryByRole('link', { name: /ChatGPT/ })).toBeNull();
     first.unmount();
     for (const nativeClaude of [async () => ({ ...base, codexAvailable: false }), async () => base, async () => { throw new Error('down'); }]) {
       const { unmount } = configPage(fakeApi({ config: vi.fn().mockResolvedValue(twoAgents()), nativeClaude }));
       await screen.findByTestId('provider-codex');
       await waitFor(() => expect(chatgpt()).toBeNull());
-      expect(within(screen.getByTestId('provider-claude')).getByRole('link', { name: 'Claude subscription routing' })).toHaveAttribute('href', '/installations/55/claude');
+      expect(within(screen.getByTestId('provider-claude')).getByRole('link', { name: /Use your Claude subscription/ })).toHaveAttribute('href', '/installations/55/claude');
       unmount();
     }
   });
@@ -1069,7 +1069,7 @@ describe('the page and the compiled config agree (#193)', () => {
       publishConfig: publishedOk(1),
     });
     configPage(api);
-    expect(await screen.findByTestId('provider-kiro')).toHaveTextContent('Saved, checked on first use');
+    expect(await screen.findByTestId('provider-kiro')).toHaveTextContent('Saved');
     await connect('claude', 'Claude Code', 'sk-ant-abc');
     await waitFor(() => expect(within(screen.getByTestId('provider-claude')).getByText('Connected')).toBeInTheDocument());
     await connect('codex', 'Codex', 'sk-proj-abc');
@@ -1104,12 +1104,12 @@ describe('the page and the compiled config agree (#193)', () => {
     configPage(api);
     await screen.findByTestId('provider-kiro');
     await connect('kiro', 'Kiro', 'ksk_abcdefghijklmnopqrstuvwxyz0123456789');
-    await waitFor(() => expect(screen.getByTestId('provider-kiro')).toHaveTextContent('Saved, checked on first use'));
+    await waitFor(() => expect(screen.getByTestId('provider-kiro')).toHaveTextContent('Saved'));
     expect(setAgentKey).toHaveBeenCalledWith(55, 'KIRO_API_KEY', 'ksk_abcdefghijklmnopqrstuvwxyz0123456789');
     expect(screen.getByTestId('provider-kiro')).toHaveTextContent('Not in any team yet.');
     for (const role of ['coding', 'review']) expect(within(screen.getByTestId(`${role}-kiro`)).getByRole('checkbox', { name: 'Kiro' })).not.toBeChecked();
     expect(screen.queryByTestId('pending-changes')).toBeNull();
-    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'No changes' })).toBeDisabled();
     await userEvent.click(screen.getByRole('button', { name: 'View config' }));
     expect(JSON.stringify(previewed(api))).toBe(JSON.stringify(sample));
   });
@@ -1125,7 +1125,7 @@ describe('the page and the compiled config agree (#193)', () => {
     configPage(api);
     const card = await screen.findByTestId('provider-claude');
     await waitFor(() => expect(within(card).getByText('Last use failed')).toBeInTheDocument());
-    expect(screen.getByTestId('coding-claude')).toHaveTextContent('its last run could not use the key: reconnect it');
+    expect(screen.getByTestId('coding-claude')).toHaveTextContent('Key failed: reconnect it');
 
     await userEvent.click(within(card).getByRole('button', { name: 'Reconnect Claude Code' }));
     await userEvent.type(within(card).getByLabelText(/Claude Console API key/), 'sk-ant-new');
@@ -1133,11 +1133,11 @@ describe('the page and the compiled config agree (#193)', () => {
     expect(setAgentKey).toHaveBeenCalledWith(55, 'ANTHROPIC_API_KEY', 'sk-ant-new');
     await waitFor(() => expect(within(card).getByText('Connected')).toBeInTheDocument());
     expect(within(card).queryByText('Last use failed')).toBeNull();
-    expect(screen.getByTestId('coding-claude')).not.toHaveTextContent('could not use the key');
+    expect(screen.getByTestId('coding-claude')).not.toHaveTextContent('Key failed');
     expect(within(screen.getByTestId('coding-claude')).getByRole('checkbox', { name: 'Claude Code' })).toBeChecked();
     expect(within(screen.getByTestId('review-claude')).getByRole('checkbox', { name: 'Claude Code' })).toBeChecked();
     expect(screen.queryByTestId('pending-changes')).toBeNull();
-    expect(screen.getByRole('button', { name: 'Publish' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'No changes' })).toBeDisabled();
     await userEvent.click(screen.getByRole('button', { name: 'View config' }));
     expect(previewed(api)).toEqual(withRepo());
   });
@@ -1251,7 +1251,7 @@ describe('accessibility and layout of the configuration page (#193)', () => {
       claude: { status: 'Connected', action: 'Replace Claude Code key' },
       codex: { status: 'Last use failed', action: 'Reconnect Codex' },
       kiro: { status: 'Not connected', action: 'Connect Kiro' },
-      vibe: { status: 'Not available here', action: null },
+      vibe: { status: 'Not available', action: null },
     };
     await waitFor(() => expect(within(screen.getByTestId('provider-codex')).getByText('Last use failed')).toBeInTheDocument());
     for (const [a, { status, action }] of Object.entries(expected)) {
@@ -1267,7 +1267,9 @@ describe('accessibility and layout of the configuration page (#193)', () => {
 
     // A Kiro key cannot be checked before a job uses it: that is said too.
     configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: true } })) }));
-    expect(within(await screen.findByTestId('provider-kiro')).getByText('Saved, checked on first use')).toBeInTheDocument();
+    const kiro = await screen.findByTestId('provider-kiro');
+    expect(within(kiro).getByText('Saved')).toBeInTheDocument();
+    expect(within(kiro).getByRole('button', { name: 'About Kiro keys' })).toHaveAccessibleDescription(/first job that uses it is the check/);
   });
 
   it('focus moves through the steps in order: connect, team, where work starts, then publishing', async () => {
@@ -1332,3 +1334,80 @@ async function checkLayoutAt(width: number): Promise<number> {
       viewport(1024);
     }
 }
+
+describe('feedback and emphasis on the configuration page', () => {
+  it('shows the shape of the page while it loads, then the page', async () => {
+    let resolve: (v: ConfigView) => void = () => undefined;
+    configPage(fakeApi({ config: vi.fn().mockReturnValue(new Promise<ConfigView>((r) => (resolve = r))) }));
+    const skeleton = screen.getByTestId('config-skeleton');
+    expect(skeleton).toHaveAttribute('aria-busy', 'true');
+    expect(skeleton).toHaveAttribute('role', 'status');
+    expect(skeleton).toHaveTextContent('Loading the configuration');
+    resolve(published());
+    expect(await screen.findByTestId('simple-config')).toBeInTheDocument();
+    expect(screen.queryByTestId('config-skeleton')).toBeNull();
+  });
+
+  it('gives a failing provider\'s fix the primary action, and keeps optional providers quiet, with every action in one row', async () => {
+    const config = withRepo();
+    const agentKeys = vi.fn().mockResolvedValue(keyView([key('ANTHROPIC_API_KEY', { lastUsed: { at: '2026-11-20T00:00:00Z', ok: false } }), key('CODEX_API_KEY'), key('KIRO_API_KEY', { configured: false })]));
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published({ config, agents: ['claude', 'codex', 'kiro'], agentKeys: { ANTHROPIC_API_KEY: true, CODEX_API_KEY: true, KIRO_API_KEY: false } })), agentKeys }));
+    const claude = await screen.findByTestId('provider-claude');
+    const reconnect = await within(claude).findByRole('button', { name: 'Reconnect Claude Code' });
+    expect(reconnect).toHaveClass('btn-primary');
+    // One message: what is wrong, not "in use" beside "last use failed".
+    expect(claude).toHaveTextContent('Its last run could not use the key.');
+    expect(claude).not.toHaveTextContent('In your team');
+    // Manage sits in the same row as the button, styled as a button of the same size.
+    const manage = within(claude).getByRole('link', { name: 'Manage' });
+    expect(manage.parentElement).toBe(reconnect.parentElement);
+    expect(manage).toHaveClass('btn', 'btn-sm');
+    expect(within(screen.getByTestId('provider-kiro')).getByRole('button', { name: 'Connect Kiro' })).not.toHaveClass('btn-primary');
+    expect(within(screen.getByTestId('provider-codex')).getByRole('button', { name: 'Replace Codex key' })).not.toHaveClass('btn-primary');
+    expect(screen.getByTestId('provider-codex')).toHaveTextContent('Uses your OpenAI API key. In your team.');
+  });
+
+  it('numbers the first setup\'s steps and ticks each off as it is done', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(view()) }));
+    const progress = await screen.findByTestId('setup-progress');
+    // Claude Code and Codex are connected and chosen; no repository is on yet.
+    expect(progress).toHaveTextContent('Connect agents (done)Choose your agent team (done)Choose where work starts');
+    expect(progress).not.toHaveTextContent('Choose where work starts (done)');
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Work in acme/web' }));
+    expect(progress).toHaveTextContent('Choose where work starts (done)');
+    // A returning user gets no progress row.
+    cleanup();
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published()) }));
+    await screen.findByTestId('simple-config');
+    expect(screen.queryByTestId('setup-progress')).toBeNull();
+  });
+
+  it('says what to do when nothing runs yet, and when no one can start work', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(view({ config: { ...baseConfig(), allowedActors: [] } })) }));
+    expect(await screen.findByTestId('effective-empty')).toHaveTextContent('Nothing runs yet. Turn on a repository, then label an issue updraft to start.');
+    expect(screen.getByText('No one yet: add your GitHub login (pat) to start')).toBeInTheDocument();
+  });
+
+  it('after a publish, says it is live and what to try next, and the button says there is nothing more to publish', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(published()), publishConfig: publishedOk(2) });
+    configPage(api);
+    await userEvent.type(within(await screen.findByTestId('repo-acme/web')).getByLabelText('Checks'), 'npm test');
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const done = await screen.findByTestId('config-published');
+    expect(done).toHaveTextContent('Published version 2. New jobs use it');
+    expect(within(done).getByTestId('publish-next')).toHaveTextContent('Next: label an issue updraft to start work.');
+    expect(screen.getByRole('button', { name: 'No changes' })).toBeDisabled();
+    expect(screen.queryByTestId('first-publish')).toBeNull();
+  });
+
+  it('the first publish says you are live and links each repository to try it in', async () => {
+    const api = fakeApi({ config: vi.fn().mockResolvedValue(view()), publishConfig: publishedOk(1) });
+    configPage(api);
+    await userEvent.click(await screen.findByRole('checkbox', { name: 'Work in acme/web' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    const done = await screen.findByTestId('config-published');
+    expect(done).toHaveTextContent('You’re live. Published version 1.');
+    expect(within(done).getByTestId('first-publish')).toHaveTextContent('A coding agent picks it up and opens a pull request.');
+    expect(screen.queryByTestId('publish-next')).toBeNull();
+  });
+});
