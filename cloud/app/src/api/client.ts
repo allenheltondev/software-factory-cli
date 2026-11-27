@@ -706,7 +706,8 @@ export interface Insights {
 /** Repository readiness (#137): server/src/tenants/readiness-service.ts. */
 export type ReadinessCheckState = 'verified' | 'failing' | 'unverified' | 'off';
 export type ReadinessProblem = 'invalid_config' | 'missing_credentials' | 'permissions' | 'reconnect' | 'transient' | 'paused' | 'provider';
-export type ReadinessFixTarget = 'config' | 'keys' | 'claude' | 'telemetry' | 'workflows' | 'job' | 'github';
+/** `claude`, `codex`: the page of that subscription (Codex's is the ChatGPT page). */
+export type ReadinessFixTarget = 'config' | 'keys' | 'claude' | 'codex' | 'telemetry' | 'workflows' | 'job' | 'github';
 export interface ReadinessCheck {
   id: string;
   stage: 'installation' | 'config' | 'github' | 'credentials' | 'subscription' | 'review' | 'ci' | 'capacity' | 'pauses' | 'telemetry' | 'egress' | 'execution';
@@ -716,6 +717,8 @@ export interface ReadinessCheck {
   unverified?: 'read_failed' | 'not_checked' | 'needs_run';
   summary: string;
   fix?: { text: string; target: ReadinessFixTarget };
+  /** A subscription check's provider when it is not Claude's (absent: Claude). */
+  provider?: 'codex';
 }
 export type RepositoryReadinessStatus = 'ready' | 'action_needed' | 'temporarily_unavailable' | 'paused' | 'unknown' | 'not_configured';
 export interface RepositoryReadiness {

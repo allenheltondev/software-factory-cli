@@ -3,13 +3,16 @@ import { createApp } from '../app.js';
 import type { Caller } from '../caller.js';
 import { FlowError } from '../flows/github.js';
 import type { GitHubInstallation, GitHubRepository } from '../github/client.js';
-import type { NativeReadiness } from '../jobs/launch.js';
+import { createLauncher, type LaunchDeps, type NativeLaunch, type NativeReadiness } from '../jobs/launch.js';
+import { parseManagedWorkerId } from '../native/provider.js';
+import { createMemoryStore } from '../store/store.js';
+import { dispatchRules } from './dispatch.js';
 import { DEFAULT_QUOTAS } from '../jobs/quotas.js';
 import { createKillSwitch } from '../jobs/kill-switch.js';
 import type { ConfigVersion, DispatchRules, HeldPause, JobSummary, TelemetrySettings, Tenant, Usage } from '../store/store.js';
 import type { AgentKeyView } from './agent-key-service.js';
 import {
-  combineStatus, createReadinessService, executionCheck, subscriptionCheck,
+  codexUnsupportedCheck, combineStatus, createReadinessService, executionCheck, nativeBindingOf, routedToSubscription, subscriptionCheck,
   type NativeBinding, type ReadinessCheck, type ReadinessReport, type ReadinessServiceDeps,
 } from './readiness-service.js';
 
@@ -37,6 +40,8 @@ interface World {
   imageVersion: string | null | Error;
   truncated?: boolean;
   native?: Partial<NativeBinding> & { readiness?: () => Promise<NativeReadiness> } | Error;
+  /** Codex's session (ChatGPT plan); absent: no Codex deployed (no `codex` dependency). */
+  codex?: Partial<NativeBinding> & { readiness?: () => Promise<NativeReadiness> } | Error | null;
 }
 
 function world(over: Partial<World> = {}): World {
@@ -76,6 +81,11 @@ function setup(w: World, extra: Partial<ReadinessServiceDeps> = {}) {
     if (!n || n instanceof Error || !n.readiness) return 'ready' as NativeReadiness;
     return n.readiness();
   });
+  const codexReadiness = vi.fn(async () => {
+    const n = w.codex;
+    if (!n || n instanceof Error || !n.readiness) return 'ready' as NativeReadiness;
+    return n.readiness();
+  });
   const member = async (_c: Caller, id: number) => {
     if (!w.member || id !== 55) throw new FlowError('not_authorized', 403, 'You are not a member of that installation');
     return { tenant: w.tenant, summary: {} as never };
@@ -111,9 +121,19 @@ function setup(w: World, extra: Partial<ReadinessServiceDeps> = {}) {
       if (!n) return undefined;
       return { enabled: n.enabled ?? true, explicitTriggers: n.explicitTriggers ?? false, triggers: n.triggers ?? [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }], readiness };
     }),
+    ...(w.codex !== undefined ? {
+      codex: track('codex', async (id: number) => {
+        expect(id).toBe(55);
+        const n = w.codex;
+        if (n instanceof Error) throw n;
+        if (!n) return undefined;
+        return { enabled: n.enabled ?? true, explicitTriggers: true, triggers: n.triggers ?? [{ repositoryId: 9, repository: 'acme/web', label: 'updraft' }], readiness: codexReadiness,
+          ...(n.unavailable ? { unavailable: n.unavailable, ...(n.image ? { image: n.image } : {}) } : {}) };
+      }),
+    } : {}),
     ...extra,
   };
-  return { service: createReadinessService(deps), clock, calls, readiness };
+  return { service: createReadinessService(deps), clock, calls, readiness, codexReadiness };
 }
 
 const repo = (r: ReadinessReport, name = 'acme/web') => r.repositories.find((x) => x.repository.toLowerCase() === name)!;
@@ -349,6 +369,153 @@ describe('repository readiness (#137)', () => {
       const r2 = await off.service.readiness(caller, 55);
       expect(get(r2, 'agent-keys')).toMatchObject({ state: 'failing', problem: 'missing_credentials' });
       expect(off.readiness).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a workflow on the Codex subscription (ChatGPT plan, #200)', () => {
+    const codexRule = (keys: string[], over: Partial<Rule> = {}): DispatchRules => ({ loop: true, repositories: { 'acme/web': rule({ keys, ...over }) } });
+
+    it('needs no CODEX_API_KEY when routed to Codex, and still needs a Claude reviewer\'s key', async () => {
+      const r = await setup(world({ rules: codexRule(['CODEX_API_KEY']), keys: [], codex: { readiness: async () => 'ready' } })).service.readiness(caller, 55);
+      expect(get(r, 'agent-keys')).toBeUndefined();
+      expect(get(r, 'codex-subscription')).toMatchObject({ state: 'verified', provider: 'codex' });
+      expect(repo(r).status).toBe('ready');
+      // A job routed to the Codex subscription runs on its own environment: no job image is needed.
+      expect(get(r, 'job-image')).toBeUndefined();
+      // Codex codes, Claude reviews on its API key (no Claude subscription here): that key is still required.
+      const reviewer = await setup(world({ rules: codexRule(['CODEX_API_KEY', 'ANTHROPIC_API_KEY']), keys: [], codex: {} })).service.readiness(caller, 55);
+      expect(get(reviewer, 'agent-keys')).toMatchObject({ state: 'failing', problem: 'missing_credentials', summary: expect.stringContaining('ANTHROPIC_API_KEY') });
+      expect(get(reviewer, 'agent-keys')!.summary).not.toContain('CODEX_API_KEY');
+      expect(get(reviewer, 'codex-subscription')).toMatchObject({ state: 'verified' });
+    });
+
+    it('still reports a missing CODEX_API_KEY for a trigger not routed to Codex, and reads no Codex worker', async () => {
+      for (const codex of [{ triggers: [{ repositoryId: 9, repository: 'acme/web', label: 'other' }] }, { enabled: false }, null]) {
+        const s = setup(world({ rules: codexRule(['CODEX_API_KEY']), keys: [], codex }));
+        const r = await s.service.readiness(caller, 55);
+        expect(get(r, 'agent-keys')).toMatchObject({ state: 'failing', problem: 'missing_credentials', summary: expect.stringContaining('CODEX_API_KEY') });
+        expect(get(r, 'codex-subscription')).toBeUndefined();
+        expect(s.codexReadiness).not.toHaveBeenCalled();
+      }
+    });
+
+    it('shows a Codex check only when a trigger is routed to Codex', async () => {
+      // A Claude workflow on Claude's subscription, with Codex deployed: Codex is never asked.
+      const claude = setup(world({ native: { readiness: async () => 'ready' }, codex: { readiness: async () => 'expired' } }));
+      const r = await claude.service.readiness(caller, 55);
+      expect(get(r, 'codex-subscription')).toBeUndefined();
+      expect(get(r, 'subscription')).toMatchObject({ state: 'verified' });
+      expect(claude.codexReadiness).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['ready', 'verified', undefined, 'ready'],
+      ['auth-required', 'failing', 'missing_credentials', 'action_needed'],
+      ['not-connected', 'failing', 'missing_credentials', 'action_needed'],
+      ['expired', 'failing', 'missing_credentials', 'action_needed'],
+      ['environment-ended', 'failing', 'reconnect', 'action_needed'],
+      ['worker-starting', 'failing', 'transient', 'temporarily_unavailable'],
+    ] as const)('maps the Codex worker\'s %s to what dispatch would do', async (readiness, state, problem, status) => {
+      const r = await setup(world({ rules: codexRule(['CODEX_API_KEY']), keys: [], codex: { readiness: async () => readiness } })).service.readiness(caller, 55);
+      const c = get(r, 'codex-subscription')!;
+      expect(c).toMatchObject({ stage: 'subscription', provider: 'codex', state, ...(problem ? { problem } : {}) });
+      expect(c.summary).toContain('Codex');
+      expect(c.summary).not.toContain('Claude');
+      if (problem === 'missing_credentials' || problem === 'reconnect') expect(c.fix).toMatchObject({ target: 'codex', text: expect.stringContaining('ChatGPT') });
+      expect(repo(r).status).toBe(status);
+    });
+
+    it('fails, naming the image, when the worker image cannot run Codex, and never asks the worker', async () => {
+      const s = setup(world({ rules: codexRule(['CODEX_API_KEY']), keys: [], codex: { unavailable: 'no Codex capability', image: 'v7', readiness: async () => 'ready' } }));
+      const r = await s.service.readiness(caller, 55);
+      expect(get(r, 'codex-subscription')).toMatchObject({ state: 'failing', problem: 'provider', provider: 'codex', fix: { target: 'codex' }, summary: expect.stringContaining('image (v7) does not support Codex') });
+      expect(s.codexReadiness).not.toHaveBeenCalled();
+      // The job is refused, never moved to the API key: the key is still not needed.
+      expect(get(r, 'agent-keys')).toBeUndefined();
+      expect(repo(r).status).toBe('temporarily_unavailable');
+      expect(codexUnsupportedCheck(undefined).summary).toContain("subscription worker image does not support Codex");
+    });
+
+    it('is unverified when the Codex binding or worker cannot be read, and never says the key is missing', async () => {
+      const r = await setup(world({ rules: codexRule(['CODEX_API_KEY']), keys: [], codex: new Error('DynamoDB') })).service.readiness(caller, 55);
+      expect(get(r, 'codex-subscription')).toMatchObject({ state: 'unverified', unverified: 'read_failed', provider: 'codex', summary: expect.stringContaining('Codex subscription routing') });
+      expect(get(r, 'agent-keys')).toMatchObject({ state: 'unverified', summary: expect.stringContaining('CODEX_API_KEY is not set') });
+      expect(get(r, 'agent-keys')!.summary).toContain('Codex subscription');
+      expect(repo(r).status).toBe('unknown');
+      // A workflow that cannot be Codex's is not held up by Codex's routing.
+      const claudeOnly = await setup(world({ codex: new Error('DynamoDB') })).service.readiness(caller, 55);
+      expect(get(claudeOnly, 'codex-subscription')).toBeUndefined();
+      expect(repo(claudeOnly).status).toBe('ready');
+      // The worker itself unreadable.
+      const worker = await setup(world({ rules: codexRule(['CODEX_API_KEY']), keys: [], codex: { readiness: async () => { throw new Error('VM'); } } })).service.readiness(caller, 55);
+      expect(get(worker, 'codex-subscription')).toMatchObject({ state: 'unverified', unverified: 'read_failed', summary: expect.stringContaining('Codex subscription worker could not be read') });
+    });
+
+    it('leaves Claude\'s check as it was', () => {
+      expect(subscriptionCheck('expired')).toEqual(subscriptionCheck('expired', 'claude'));
+      expect(subscriptionCheck('expired')).not.toHaveProperty('provider');
+      expect(subscriptionCheck('not-connected', 'codex')).toMatchObject({ id: 'codex-subscription', provider: 'codex', fix: { text: 'Sign in with ChatGPT', target: 'codex' } });
+    });
+  });
+
+  describe('readiness and dispatch route a trigger the same way (#200)', () => {
+    const SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:updraft/native-workers/root';
+    const trigger = { repositoryId: 9, repository: 'acme/web', label: 'updraft' };
+    const launchBinding = (provider: 'claude' | 'codex', enabled = true): NativeLaunch => ({
+      route: { installationId: 55, workerId: provider === 'codex' ? 'managed-codex-55' : 'managed-55', microvmId: `mvm-${provider}`, imageVersion: '7', generation: `${provider}-gen`, controlSecretArn: SECRET_ARN },
+      ...(provider === 'codex' ? { provider } : {}),
+      secret: async () => `${provider}-scoped-worker-secret-0123456789`,
+      mode: async () => ({ enabled, revision: 1, routingVersion: 4, triggers: [trigger] }),
+      readiness: async () => 'ready',
+    });
+
+    it.each([
+      ['a Claude-routed trigger', ['ANTHROPIC_API_KEY'], true, true, 'claude'],
+      ['a Codex-routed trigger', ['CODEX_API_KEY'], true, true, 'codex'],
+      ['a trigger both could take (Claude first)', ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'], true, true, 'claude'],
+      ['a trigger both could take, with Claude routing off', ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'], false, true, 'codex'],
+      ['a trigger with Codex routing off', ['CODEX_API_KEY'], true, false, undefined],
+      ['a workflow that does not need CODEX_API_KEY', ['KIRO_API_KEY'], true, true, undefined],
+    ] as const)('%s', async (_name, keys, claudeOn, codexOn, expected) => {
+      const store = createMemoryStore();
+      await store.putTenantWithMember({ installationId: 55, accountId: 900, accountLogin: 'acme', accountType: 'Organization', status: 'active', createdAt: '', createdBy: 's' },
+        { installationId: 55, sub: 's', role: 'owner', githubUserId: 1, githubLogin: 'pat', addedAt: '' });
+      const version = await store.createConfigVersion(55, { sha256: keys.join(), files: [], publishedBy: 's', publishedAt: '', dispatch: dispatchRules({
+        dispatch: { allowedActors: ['pat'] }, repositories: { 'acme/web': { id: 9, workflows: [{ trigger: { label: 'updraft' } }] } },
+      }, { keysFor: () => [...keys] }) });
+      await store.markConfigReady(55, version as number);
+      await store.activateConfig(55, version as number);
+      // Every key set: a trigger left to the API-key path launches there rather than being refused.
+      for (const name of keys) await store.putAgentKeyMeta(55, { name, updatedAt: 't', updatedBy: 'pat' });
+      const claude = launchBinding('claude', claudeOn);
+      const codex = launchBinding('codex', codexOn);
+      const deps: LaunchDeps = {
+        store,
+        settings: { region: 'us-east-1', bucket: 'b', imageArn: 'arn:image', executionRoleArn: 'arn:role', ingressConnectorArn: 'in', egressConnectorArn: 'out',
+          logGroup: 'lg', brokerFunctionName: 'broker', maximumDurationSeconds: 10800, watchdogReserveSeconds: 600 },
+        imageVersion: async () => '3',
+        putEvent: async () => {},
+        runMicrovm: async () => ({ microvmId: 'mvm-api' }),
+        quotas: { concurrentJobs: 10, jobsPerDay: 100, microvmMinutesPerMonth: 100_000, platformConcurrentJobs: 10 },
+        now: () => NOW,
+        log: () => {},
+        retryDelayMs: 1,
+        resolveNative: async () => claude,
+        resolveCodex: async () => codex,
+      };
+      const payload = { action: 'labeled', issue: { number: 12 }, label: { name: 'updraft' }, sender: { login: 'pat' }, repository: { id: 9, full_name: 'acme/web' } };
+      const result = await createLauncher(deps)({ installationId: 55, deliveryId: 'delivery-1', body: JSON.stringify(payload), payload });
+      expect(result).toMatchObject({ disposition: 'launched' });
+      const job = (await store.getJob(result.jobId!))!;
+      const dispatched = job.native ? parseManagedWorkerId(job.native.workerId)?.provider : undefined;
+
+      // The same published rules and the same bindings, read as readiness reads them.
+      const rules = (await store.getConfigVersion(55, version as number))!.dispatch!;
+      const r = rules.repositories['acme/web']!;
+      const bindings = { claude: await nativeBindingOf(claude), codex: await nativeBindingOf(codex, 'codex') };
+      const assessed = routedToSubscription(bindings, 'acme/web', r, r.triggers[0]!);
+      expect(dispatched).toBe(expected);
+      expect(assessed).toBe(dispatched);
     });
   });
 
