@@ -104,7 +104,9 @@ itself:
 - the ref is at Updraft's push: GitHub has not caught up. The head on record stays the pushed
   commit (the poller does not take such a read for a move, however old the push is), and its
   reviewer job is not canceled: it stays queued and is looked at again after the worker's next
-  poll (logged, not recorded as an error);
+  poll (logged, not recorded as an error). `updraft run-event` looks at it again every tick and
+  does not take it for a stuck job until it has been looked at five more times after its usual
+  stall time (at most five minutes), however long each look takes on the machine;
 - the ref is anywhere else (a person pushed the branch back, say): the move is believed at once.
 
 That wait has real bounds
