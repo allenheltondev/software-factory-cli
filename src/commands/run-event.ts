@@ -43,6 +43,7 @@ import { createPublisher, publicationEnabled, type PublishDeps } from '../publis
 import { evaluateCiAll, postCiNotices } from '../publish/ci.js';
 import { evaluateAutoMerges } from '../publish/merge.js';
 import { evaluateSuggestionsAll } from '../publish/suggestions.js';
+import { resolveVerifiedThreadsAll } from '../publish/thread-resolve.js';
 import { createReviewLoopPublisher, reviewsEnabled } from '../publish/review.js';
 import { createRevisionPublisher, findRevisionClaims, revisionsEnabled, SUPERSEDED_PREFIX } from '../publish/revision.js';
 import { reviewOf, revisionOf, type Job, type RepoRef, type VerificationSummary } from '../types.js';
@@ -810,6 +811,8 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       // The worker's clock, as for the review poller above and the publishers of the drain: the CI
       // step's wait is measured across both.
       const ciDeps = { db: openDb, config, api, log: log.child({ component: 'ci' }), scope };
+      // Verified threads not resolved yet (#190): every event is a moment to try again.
+      await resolveVerifiedThreadsAll({ ...ciDeps, log: log.child({ component: 'threads' }) }, undefined, { only: { repoId: repo.id, prNumber: n } });
       // The suggestion step first (review.suggestions): a head's checks are read once its suggestions are settled.
       const suggested = await evaluateSuggestionsAll({ ...ciDeps, log: log.child({ component: 'suggestions' }) }, undefined, { only: { repoId: repo.id, prNumber: n } });
       const ci = await evaluateCiAll(ciDeps, undefined, { only: { repoId: repo.id, prNumber: n }, force: true });

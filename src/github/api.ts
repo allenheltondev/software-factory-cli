@@ -263,6 +263,10 @@ export interface ReviewThread {
   isResolved: boolean;
   /** REST id of its first comment; null when GitHub does not say. */
   rootCommentId: number | null;
+  /**
+   * Login of the first comment's author, as REST spells it: an App is `<slug>[bot]`, which is how
+   * the worker's own login and its REST comments read, though GraphQL names a Bot `<slug>` alone.
+   */
   rootAuthor: string | null;
 }
 

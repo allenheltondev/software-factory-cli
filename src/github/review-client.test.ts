@@ -116,6 +116,33 @@ describe('createGitHubApi: the review loop', () => {
     await api.unresolveReviewThread!(repo, 'T1');
     expect(JSON.parse(calls.at(-1)!.body!)).toMatchObject({ query: expect.stringContaining('unresolveReviewThread'), variables: { id: 'T1' } });
 
+    // A GitHub App: GraphQL names its bot "<slug>" (Bot); the thread reads as REST spells it, "<slug>[bot]" (#190).
+    // A person's login is never given the suffix, and a login already in the REST spelling is kept.
+    const app = await createGitHubApi({
+      token: 't',
+      fetch: fakeFetch(() =>
+        json({
+          data: {
+            repository: {
+              databaseId: 42,
+              pullRequest: {
+                reviewThreads: {
+                  nodes: [
+                    { id: 'T1', isResolved: false, comments: { nodes: [{ databaseId: 70, author: { __typename: 'Bot', login: 'updraft-bot' } }] } },
+                    { id: 'T2', isResolved: false, comments: { nodes: [{ databaseId: 71, author: { __typename: 'User', login: 'updraft-bot' } }] } },
+                    { id: 'T3', isResolved: false, comments: { nodes: [{ databaseId: 72, author: { __typename: 'Bot', login: 'other[bot]' } }] } },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      ).fn,
+    });
+    const appThreads = await app.listReviewThreads!(repo, 5);
+    expect(appThreads.map((t) => t.rootAuthor)).toEqual(['updraft-bot[bot]', 'updraft-bot', 'other[bot]']);
+    expect(appThreads.filter((t) => sameLogin(t.rootAuthor, 'updraft-bot[bot]')).map((t) => t.id)).toEqual(['T1']);
+
     // A thread on the second page is found.
     const paged = fakeFetch((_url, call) => {
       const vars = JSON.parse(call.body!).variables as { cursor: string | null };

@@ -543,10 +543,22 @@ interface RawReviewThreads {
     pullRequest: {
       reviewThreads?: {
         pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
-        nodes?: Array<{ id: string; isResolved?: boolean; comments?: { nodes?: Array<{ databaseId?: number | null; author?: { login?: string } | null } | null> } } | null>;
+        nodes?: Array<{ id: string; isResolved?: boolean; comments?: { nodes?: Array<{ databaseId?: number | null; author?: { __typename?: string; login?: string } | null } | null> } } | null>;
       };
     } | null;
   } | null;
+}
+
+/**
+ * An author as GraphQL reports it, spelled as REST does. GraphQL names a GitHub App's bot
+ * `<slug>` (`__typename` Bot), REST and the worker's own identity `<slug>[bot]`: without this, the
+ * worker's own threads never matched its login (#190), so none of them was ever resolved or
+ * reopened. A person's login is left as it is: only a Bot gets the suffix.
+ */
+function restLogin(author: { __typename?: string; login?: string } | null): string | null {
+  const login = author?.login ?? null;
+  if (!login || author?.__typename !== 'Bot' || login.toLowerCase().endsWith('[bot]')) return login;
+  return `${login}[bot]`;
 }
 
 /** Pages of 100 review threads read at most: a pull request with more is reported as not fully read. */
@@ -558,7 +570,7 @@ const REVIEW_THREADS_QUERY = `query($owner: String!, $name: String!, $number: In
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
-        nodes { id isResolved comments(first: 1) { nodes { databaseId author { login } } } }
+        nodes { id isResolved comments(first: 1) { nodes { databaseId author { __typename login } } } }
       }
     }
   }
@@ -1136,7 +1148,7 @@ export async function createGitHubApi(opts: CreateGitHubApiOptions = {}): Promis
         for (const t of threads?.nodes ?? []) {
           if (!t) continue;
           const first = t.comments?.nodes?.[0] ?? null;
-          out.push({ id: t.id, isResolved: t.isResolved === true, rootCommentId: first?.databaseId ?? null, rootAuthor: first?.author?.login ?? null });
+          out.push({ id: t.id, isResolved: t.isResolved === true, rootCommentId: first?.databaseId ?? null, rootAuthor: restLogin(first?.author ?? null) });
         }
         if (!threads?.pageInfo?.hasNextPage) return out;
         cursor = threads.pageInfo.endCursor ?? null;
