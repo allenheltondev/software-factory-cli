@@ -39,7 +39,7 @@ import { pauseControlOf, pausedWorkflow, pauseNoticedMessage, resumedWorkflow } 
 import { createRecovery, type RecoveryDeps } from './recovery.js';
 import type { BlockNotifier } from '../jobs/notices.js';
 import type { WorkflowStore } from './store.js';
-import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, HEAD_LAG_LIMIT_MS, LOOP_WAITS_ON_HEAD, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
+import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, HEAD_LAG_LIMIT_MS, HEAD_LAG_RECHECK_MS, LOOP_WAITS_ON_HEAD, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
 
 export interface WorkflowReconcilerDeps {
   store: WorkflowStore;
@@ -239,11 +239,18 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     if (w.stage !== 'waiting-for-ci') {
       // Waiting on a review of the head while GitHub's pull request still shows another commit
       // than its branch: the App's push never reached the pull request, and the job that pushed
-      // could not review it (#199). Blocked once that has lasted HEAD_LAG_LIMIT_MS, never silent.
+      // could not review it (#199). Blocked once that has lasted HEAD_LAG_LIMIT_MS, never silent;
+      // and only when two looks at least HEAD_LAG_RECHECK_MS apart in this wait found the branch
+      // at the same commit, so a push GitHub had not shown yet at one look does not block it.
       if (waitsOnHead && deps.github.branchHead && (pr.headRepoId == null || pr.headRepoId === w.repositoryId) && pr.headRef) {
         const branch = await deps.github.branchHead(token, w.repository, pr.headRef);
         if (branch && !samePrefix(branch, pr.headSha)) {
-          if (waited < HEAD_LAG_LIMIT_MS) return void (await later(HEAD_LAG_LIMIT_MS - waited));
+          const seenAt = w.headLag?.branch === branch ? Date.parse(w.headLag.at) : NaN;
+          const seen = seenAt >= Date.parse(w.waitingSince ?? w.updatedAt) ? seenAt : undefined;
+          const lookAgain = (ms: number) =>
+            change(w, (cur) => ({ workflow: { ...cur, headLag: seen !== undefined && cur.headLag ? cur.headLag : { branch, at: iso(at) }, nextCheckAt: iso(at + ms), updatedAt: iso(at) } }));
+          if (waited < HEAD_LAG_LIMIT_MS) return void (await lookAgain(Math.max(HEAD_LAG_LIMIT_MS - waited, HEAD_LAG_RECHECK_MS)));
+          if (seen === undefined || at - seen < HEAD_LAG_RECHECK_MS) return void (await lookAgain(seen === undefined ? HEAD_LAG_RECHECK_MS : HEAD_LAG_RECHECK_MS - (at - seen)));
           const minutes = Math.round(HEAD_LAG_LIMIT_MS / 60_000);
           return block(
             'lag_stuck',

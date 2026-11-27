@@ -583,6 +583,17 @@ describe('the suggestion step, when things go wrong', () => {
     s.db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ? WHERE id = ?").run((stuck as { reason: string }).reason, job!.id);
     expect(prStage(s.db, s.pr(), 3, { suggestions: true })).toMatchObject({ stage: 'needs-human', detail: expect.stringContaining(LAG_STUCK) });
     expect(s.schedule()).toEqual([]);
+    // Past the cap, with no review of the push waiting, the poller no longer reads the ref on every poll; the lagging read is still not believed.
+    let refReads = 0;
+    s.gh.branchSha = () => (refReads++, H2);
+    expect(await observeLiveHead({ db: s.db, api: s.gh.api }, { id: REPO_ID, fullName: FULL }, s.pr(), H1, new Date(s.tick()).toISOString())).toBe(false);
+    expect(refReads).toBe(0);
+    expect(s.pr().headSha).toBe(H2);
+    // A re-run of the review waits on the ref again.
+    s.db.prepare("UPDATE jobs SET status = 'queued' WHERE id = ?").run(job!.id);
+    expect(await observeLiveHead({ db: s.db, api: s.gh.api }, { id: REPO_ID, fullName: FULL }, s.pr(), H1, new Date(s.tick()).toISOString())).toBe(false);
+    expect(refReads).toBe(1);
+    s.db.prepare("UPDATE jobs SET status = 'canceled' WHERE id = ?").run(job!.id);
 
     // A push dated after now (a clock that ran ahead) is not waited for either.
     const { s: v } = await pushedUnseen();

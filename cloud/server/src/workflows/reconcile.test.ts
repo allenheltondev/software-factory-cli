@@ -5,7 +5,7 @@ import type { Job, JobSummary } from '../store/store.js';
 import { createWorkflowRecorder, updateWorkflow } from './recorder.js';
 import { createWorkflowReconciler } from './reconcile.js';
 import { createMemoryWorkflowStore } from './store.js';
-import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, HEAD_LAG_LIMIT_MS, LOST_JOB_LOOK_MS, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
+import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, HEAD_LAG_LIMIT_MS, HEAD_LAG_RECHECK_MS, LOST_JOB_LOOK_MS, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
 
 const T0 = Date.parse('2026-11-25T12:00:00.000Z');
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
@@ -208,7 +208,7 @@ describe('workflow reconciliation', () => {
     it('is looked at within HEAD_LAG_LIMIT_MS, and then blocked as lag_stuck with a please-act notice and a timeline block', async () => {
       const s = setup({ branch: PUSHED });
       await awaitingReview(s);
-      expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'awaiting-review', nextCheckAt: new Date(T0 + HEAD_LAG_LIMIT_MS).toISOString() });
+      expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'awaiting-review', nextCheckAt: new Date(T0 + HEAD_LAG_LIMIT_MS - HEAD_LAG_RECHECK_MS).toISOString() });
       // A look before the cap (another workflow was due): it waits on, looked at again at the cap.
       await updateWorkflow(s.store, 55, '99-i7', (w) => ({ workflow: { ...w!, nextCheckAt: new Date(T0 + 10 * 60_000).toISOString() } }));
       s.tick(10 * 60_000);
@@ -230,11 +230,37 @@ describe('workflow reconciliation', () => {
       expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).filter((e) => e.kind === 'blocked')).toEqual([expect.objectContaining({ reason: 'lag_stuck' })]);
     });
 
+    it('a mismatch seen at only one look (a push GitHub showed soon after, or a branch that moved again) is not blocked: it takes two looks at the same commit, HEAD_LAG_RECHECK_MS apart', async () => {
+      const OTHER = 'c'.repeat(40);
+      let branch: string = PUSHED;
+      const s = setup();
+      s.github.branchHead.mockImplementation(async () => branch);
+      await awaitingReview(s);
+      // First seen past the cap: looked at once more, not blocked.
+      s.tick(HEAD_LAG_LIMIT_MS);
+      expect(await s.reconcile()).toMatchObject({ blocked: 0 });
+      expect(await s.wf()).toMatchObject({ status: 'waiting', nextCheckAt: new Date(T0 + HEAD_LAG_LIMIT_MS + HEAD_LAG_RECHECK_MS).toISOString() });
+      // The branch moved meanwhile: a new sighting, looked at once more again.
+      branch = OTHER;
+      s.tick(HEAD_LAG_RECHECK_MS);
+      expect(await s.reconcile()).toMatchObject({ blocked: 0 });
+      expect(await s.wf()).toMatchObject({ status: 'waiting', headLag: { branch: OTHER } });
+      // GitHub's pull request shows it now: no block, the ordinary stall wait.
+      branch = HEAD;
+      s.tick(HEAD_LAG_RECHECK_MS);
+      expect(await s.reconcile()).toMatchObject({ blocked: 0 });
+      expect(await s.wf()).toMatchObject({ status: 'waiting', nextCheckAt: new Date(T0 + STALL_LIMIT_MS).toISOString() });
+      expect(s.notices).toEqual([]);
+    });
+
     it('applies to the revising and reviewing waits too; a pull request that caught up, or a client that cannot read the ref, waits for STALL_LIMIT_MS as before', async () => {
       for (const stage of ['reviewing', 'revising'] as const) {
         const s = setup({ branch: PUSHED });
         await awaitingReview(s, stage);
-        s.tick(HEAD_LAG_LIMIT_MS);
+        s.tick(HEAD_LAG_LIMIT_MS - HEAD_LAG_RECHECK_MS);
+        expect(await s.reconcile()).toMatchObject({ blocked: 0 });
+        expect(await s.wf()).toMatchObject({ status: 'waiting', nextCheckAt: new Date(T0 + HEAD_LAG_LIMIT_MS).toISOString() });
+        s.tick(HEAD_LAG_RECHECK_MS);
         expect(await s.reconcile()).toMatchObject({ blocked: 1 });
         expect(await s.wf()).toMatchObject({ reason: 'lag_stuck', stage });
       }

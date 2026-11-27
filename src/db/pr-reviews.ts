@@ -293,6 +293,14 @@ export function ownPushOnRecord(db: Db, repoId: number, prNumber: number, sha: s
   return row?.head_sha ?? null;
 }
 
+/** Whether a reviewer job for `headSha` of the PR (its first, a requeue or a rerun) is queued or running. */
+export function reviewJobWaiting(db: Db, repoId: number, prNumber: number, headSha: string): boolean {
+  const base = reviewEventId(prNumber, headSha);
+  return !!db
+    .prepare("SELECT 1 AS x FROM jobs WHERE repo_id = ? AND (event_id = ? OR event_id LIKE ?) AND status IN ('queued', 'running') LIMIT 1")
+    .get(repoId, base, `${base}:%`);
+}
+
 /**
  * When the worker's own revision push moved the PR from `olderSha` to `headSha`: its pushed_at,
  * or null when no revision of the worker made that move.
