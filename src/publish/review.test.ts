@@ -27,7 +27,11 @@ import { publishRun, type PublishDeps } from './publish.js';
 import { createReviewLoopPublisher, postReview, reviewMarker } from './review.js';
 import { findingsOfRun, getFinding, recordCheck, recordResolution } from '../db/review-findings.js';
 import { renderReviewPrompt } from '../agents/review-prompt.js';
-import { findingMarker } from './threads.js';
+import { answerFindings, findingMarker } from './threads.js';
+import { resolveVerifiedThreadsAll } from './thread-resolve.js';
+import { createGitHubApi } from '../github/client.js';
+import type { GitHubCredentials } from '../github/credentials.js';
+import type { Logger } from '../util/log.js';
 import { postLimitNotices } from './revision.js';
 
 const REPO_ID = 42;
@@ -1171,6 +1175,164 @@ describe('findings as threads', () => {
     expect(s.gh.thread(f1.commentId!)[0]!.body).toContain('this is still not fixed.\n\n> Still retires a stale worker.');
     expect(s.gh.reviews[1]!.body).toContain(`still not fixed; followed up in [its thread](${f1.commentUrl})`);
     expect(revisionOf(getJob(s.db, getPrReview(s.db, second.runId)!.revisionJobId!)!)!.findings!.map((f) => f.key)).toEqual([f1.key]);
+  });
+});
+
+/** A logger that keeps what was said, for the lines a step must leave. */
+function recordingLog(): Logger & { lines: string[] } {
+  const lines: string[] = [];
+  const make = (): Logger => ({
+    debug: () => undefined,
+    info: (m) => lines.push(`info ${m}`),
+    warn: (m) => lines.push(`warn ${m}`),
+    error: (m) => lines.push(`error ${m}`),
+    child: () => make(),
+  });
+  return Object.assign(make(), { lines });
+}
+
+/**
+ * The real GitHub client (client.ts) as a GitHub App, over the in-memory GitHub's state: GraphQL
+ * names the App's bot `<slug>` with `__typename` Bot, REST and the identity `<slug>[bot]`.
+ */
+async function appClientOver(gh: FakeLoopGitHub, slug: string) {
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  const graphqlAuthor = (login: string) => (login.endsWith('[bot]') ? { __typename: 'Bot', login: login.slice(0, -'[bot]'.length) } : { __typename: 'User', login });
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.pathname === `/repositories/${REPO_ID}/pulls/${PR}`) {
+      const p = gh.pull!;
+      return json({ number: PR, node_id: 'PR_x', html_url: `https://github.com/${FULL}/pull/${PR}`, state: p.state, merged: p.merged, draft: p.draft, head: { ref: p.headRef, sha: gh.headSha() }, base: { ref: p.baseRef } });
+    }
+    if (url.pathname === '/graphql') {
+      const body = JSON.parse(String(init?.body)) as { query: string; variables: { id?: string } };
+      if (body.query.includes('resolveReviewThread(')) {
+        await gh.resolveReviewThread({ id: REPO_ID, fullName: FULL }, body.variables.id!);
+        return json({ data: { resolveReviewThread: { thread: { isResolved: true } } } });
+      }
+      const nodes = gh.reviewComments
+        .filter((c) => c.inReplyToId === null)
+        .map((c) => ({ id: `T_${c.id}`, isResolved: gh.resolved.has(c.id), comments: { nodes: [{ databaseId: c.id, author: graphqlAuthor(c.user!) }] } }));
+      return json({ data: { repository: { databaseId: REPO_ID, pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } } } } });
+    }
+    throw new Error(`unexpected request ${init?.method ?? 'GET'} ${url.pathname}`);
+  }) as typeof globalThis.fetch;
+  const credentials = {
+    kind: 'app',
+    app: { appId: 1, app: async () => ({ id: 1, slug }) },
+    token: async () => 'installation-token',
+    reject: () => undefined,
+  } as unknown as GitHubCredentials;
+  return createGitHubApi({ fetch, credentials });
+}
+
+describe('verified threads end resolved (#190)', () => {
+  const SUGGESTION = { findings: [{ id: 'F1', severity: 'suggestion', title: 'Lock is taken before the window is validated', path: 'src/a.ts', line: 3, problem: 'The lock is taken first.', suggestion: 'Validate first.' }] };
+
+  /**
+   * The #185 shape, as a GitHub App: round 1's suggestion F1 has an inline thread; a revision
+   * fixes it at H2 and replies in the thread; round 2 verifies it on H2.
+   */
+  const shape185 = async (o: { failResolve?: GitHubError } = {}) => {
+    const s = setup();
+    s.gh.login = 'updraft-bot[bot]';
+    s.gh.files = [{ path: 'src/a.ts', status: 'modified', patch: PATCH }];
+    const [job1] = s.schedule();
+    const round1 = s.reviewed(job1!, 'changes-requested', structuredFindings(SUGGESTION));
+    await postReview(s.deps, round1);
+    const f1 = getFinding(s.db, REPO_ID, PR, `${round1}#F1`)!;
+    expect(f1.commentId).not.toBeNull();
+    // The revision: pushed at H2, its answer in the thread.
+    s.push(H2);
+    observeHead(s.db, REPO_ID, PR, H2, new Date(s.tick()).toISOString());
+    await answerFindings(
+      { db: s.db, api: s.api, guard: () => undefined, repoFullName: FULL, runId: 'run_fix' },
+      {
+        repo: { id: REPO_ID, fullName: FULL },
+        prNumber: PR,
+        runId: 'run_fix',
+        sha: H2,
+        prUrl: `https://github.com/${FULL}/pull/${PR}`,
+        login: s.gh.login,
+        findings: [{ key: f1.key, severity: 'suggestion', title: f1.title, problem: f1.problem, suggestion: f1.suggestion, path: f1.path, line: f1.line, threadUrl: f1.commentUrl }],
+        resolutions: [{ finding: f1.key, status: 'fixed', note: 'Validated first.', tests: null }],
+      },
+    );
+    if (o.failResolve) s.gh.failAlways.resolveReviewThread = o.failResolve;
+    // Round 2 verifies it on H2, with a run log to read.
+    const [job2] = s.schedule();
+    const round2 = s.reviewed(job2!, 'ready-to-merge', structuredFindings({ findings: [], checks: [{ finding: f1.key, status: 'verified', note: 'The window is validated first.' }] }));
+    const logPath = join(s.paths.dataDir, 'round2.log');
+    s.db.prepare('UPDATE runs SET log_path = ? WHERE id = ?').run(logPath, round2);
+    expect(await postReview(s.deps, round2)).toMatchObject({ status: 'published' });
+    const replies = s.gh.thread(f1.commentId!).map((c) => c.body);
+    expect(replies[0]).toContain('**Coding agent:** Fixed in');
+    expect(replies[1]).toContain(`**Review agent · Round 2:** I verified this on \`${H2.slice(0, 12)}\`.`);
+    return { s, f1, logPath };
+  };
+
+  it('resolves the thread of a suggestion a revision fixed and the next round verified, as a GitHub App', async () => {
+    const { s, f1 } = await shape185();
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(true);
+    expect(getFinding(s.db, REPO_ID, PR, f1.key)).toMatchObject({ status: 'verified', statusSha: H2, threadResolvedAt: expect.any(String) });
+  });
+
+  it('says why a resolution failed, never in a pull request comment, and resolves it on a later poll', async () => {
+    const { s, f1, logPath } = await shape185({ failResolve: new GitHubError('POST /graphql (resolving a review thread of octo/widgets) failed: Resource not accessible by integration', 403) });
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(false);
+    expect(getFinding(s.db, REPO_ID, PR, f1.key)).toMatchObject({ status: 'verified', threadResolvedAt: null });
+    const { readFileSync } = await import('node:fs');
+    expect(readFileSync(logPath, 'utf8')).toContain(`could not resolve the thread of ${f1.key}; it is verified, not resolved yet`);
+    const comments = s.gh.comments.map((c) => c.body).join('\n');
+    expect(comments).not.toContain('resolve');
+
+    // The next poll tries again, and says so while GitHub still refuses.
+    const log = recordingLog();
+    const deps = { ...s.deps, log };
+    await resolveVerifiedThreadsAll(deps);
+    expect(log.lines.some((l) => l.startsWith('warn') && l.includes(f1.key) && l.includes('tried again on the next poll'))).toBe(true);
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(false);
+
+    // Once GitHub takes it, the poll (the publisher's retryDue, as the worker runs it) resolves it, once.
+    delete s.gh.failAlways.resolveReviewThread;
+    await createReviewLoopPublisher(deps).retryDue();
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(true);
+    expect(getFinding(s.db, REPO_ID, PR, f1.key)!.threadResolvedAt).not.toBeNull();
+    const resolves = s.gh.writes.filter((w) => w.startsWith('resolve')).length;
+    await resolveVerifiedThreadsAll(deps);
+    expect(s.gh.writes.filter((w) => w.startsWith('resolve'))).toHaveLength(resolves);
+    expect(s.gh.comments.map((c) => c.body).join('\n')).not.toContain('resolve');
+  });
+
+  it('stops trying once the pull request is closed', async () => {
+    const { s, f1 } = await shape185({ failResolve: new GitHubError('POST /graphql failed: FORBIDDEN', 403) });
+    delete s.gh.failAlways.resolveReviewThread;
+    s.gh.pull!.state = 'closed';
+    await resolveVerifiedThreadsAll(s.deps);
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(false);
+  });
+
+  it('logs a line when the client cannot list or resolve threads, instead of skipping in silence', async () => {
+    const { s, f1 } = await shape185({ failResolve: new GitHubError('POST /graphql failed: FORBIDDEN', 403) });
+    const log = recordingLog();
+    const api = { ...s.api, getPullRequest: s.api.getPullRequest, listReviewThreads: undefined, resolveReviewThread: undefined };
+    await resolveVerifiedThreadsAll({ ...s.deps, api, log });
+    expect(log.lines).toEqual([expect.stringMatching(new RegExp(`^warn threads: ${f1.key.replace(/[#]/g, '\\$&')} verified, not resolved yet: this GitHub client cannot list or resolve review threads`))]);
+  });
+
+  it('resolves through the real GitHub client, which names the App without "[bot]" in GraphQL', async () => {
+    // Round 2's own try is refused (as on #185, the thread is left unresolved after the reply).
+    const { s, f1 } = await shape185({ failResolve: new GitHubError('POST /graphql failed: FORBIDDEN', 403) });
+    delete s.gh.failAlways.resolveReviewThread;
+    const api = await appClientOver(s.gh, 'updraft-bot');
+    expect(await api.getWorkerIdentity()).toMatchObject({ login: 'updraft-bot[bot]' });
+    // The thread as the real client reads it: the worker's, in the REST spelling of its login.
+    expect((await api.listReviewThreads!({ id: REPO_ID, fullName: FULL }, PR)).find((t) => t.rootCommentId === f1.commentId)).toMatchObject({ rootAuthor: 'updraft-bot[bot]', isResolved: false });
+    const log = recordingLog();
+    const [result] = await resolveVerifiedThreadsAll({ ...s.deps, api, log });
+    expect(result).toMatchObject({ resolved: [f1.key], left: [] });
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(true);
+    expect(getFinding(s.db, REPO_ID, PR, f1.key)!.threadResolvedAt).not.toBeNull();
   });
 });
 

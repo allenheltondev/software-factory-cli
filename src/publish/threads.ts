@@ -408,7 +408,7 @@ export async function recordPostedThreads(
 
 /** The worker's own thread whose first comment is `rootCommentId`, among the pull request's threads (read once per step). */
 export async function findThread(
-  deps: ThreadDeps,
+  deps: Pick<ThreadDeps, 'api'>,
   repo: RepoRef,
   prNumber: number,
   rootCommentId: number,
@@ -557,11 +557,17 @@ export async function answerInThreads(
       settle(deps, err, log, `could not answer the check of ${root.key} in its thread; the review summary has it`);
       continue;
     }
-    if (c.status !== 'verified' || !deps.api.listReviewThreads || !deps.api.resolveReviewThread) continue;
+    if (c.status !== 'verified') continue;
+    // Whatever stops the resolution here is said, and the poll's resolve step (thread-resolve.ts)
+    // tries again for as long as the pull request is open.
+    if (!deps.api.listReviewThreads || !deps.api.resolveReviewThread) {
+      log.push(`threads: this GitHub client cannot list or resolve review threads; ${root.key} is verified, not resolved`);
+      continue;
+    }
     try {
       const thread = await findThread(deps, repo, prNumber, root.commentId, o.login, cache);
       if (!thread) {
-        log.push(`threads: the thread of ${root.key} is not among the pull request's threads; it is verified, not resolved`);
+        log.push(`threads: the thread of ${root.key} is not among the pull request's threads as the worker's (${o.login}); it is verified, not resolved yet`);
         continue;
       }
       if (!thread.isResolved) {
@@ -581,7 +587,7 @@ export async function answerInThreads(
       deps.guard();
       markThreadResolved(deps.db, repo.id, prNumber, root.key, deps.now);
     } catch (err) {
-      settle(deps, err, log, `could not resolve the thread of ${root.key}; it is verified, not resolved`);
+      settle(deps, err, log, `could not resolve the thread of ${root.key}; it is verified, not resolved yet`);
     }
   }
   return { log };

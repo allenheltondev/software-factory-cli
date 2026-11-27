@@ -182,6 +182,24 @@ export function openSuggestions(db: Db, repoId: number, prNumber: number, limit 
   ).map(toFinding);
 }
 
+/**
+ * Thread roots a reviewer verified whose thread on GitHub is not recorded as resolved, on pull
+ * requests of `repoId` that are still open: what the resolve step of each poll
+ * (src/publish/thread-resolve.ts) resolves. By pull request, oldest first, at most `limit`.
+ */
+export function verifiedUnresolvedThreads(db: Db, repoId: number, limit = 200): ReviewFinding[] {
+  return (
+    db
+      .prepare(
+        `SELECT f.* FROM review_findings f JOIN revision_prs p ON p.repo_id = f.repo_id AND p.pr_number = f.pr_number
+          WHERE f.repo_id = ? AND p.state = 'open' AND f.thread_key = f.finding_key AND f.status = 'verified'
+            AND f.comment_id IS NOT NULL AND f.thread_resolved_at IS NULL
+          ORDER BY f.pr_number, f.created_at, f.rowid LIMIT ?`,
+      )
+      .all(repoId, limit) as unknown as Row[]
+  ).map(toFinding);
+}
+
 /** The suggestions of a pull request deferred to follow-up issue `issue`, oldest first: what that issue lists. */
 export function deferredSuggestions(db: Db, repoId: number, prNumber: number, issue: number): ReviewFinding[] {
   return (

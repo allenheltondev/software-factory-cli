@@ -49,6 +49,7 @@ import { verdictTrigger } from '../poller/review-trigger.js';
 import { reviewOf, type Job, type ReviewResult, type ReviewRunRequest, type ReviewVerdict, type RevisionFinding, type RevisionRequest, type Run } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
 import { evaluateCiAll, postCiNotices } from './ci.js';
+import { resolveVerifiedThreadsAll } from './thread-resolve.js';
 import { evaluateSuggestionsAll, queueSuggestions, suggestionStatus, type QueueDecision } from './suggestions.js';
 import { verdictStatus } from './verdict-status.js';
 import { noteStatus, quietFor } from './status-comment.js';
@@ -646,6 +647,9 @@ export function createReviewLoopPublisher(deps: PublishDeps, inner?: Publisher):
         await post(runId, signal);
       }
       schedule();
+      if (signal?.aborted) return;
+      // Verified threads whose resolution did not happen yet (#190): tried on every poll until GitHub confirms it.
+      await resolveVerifiedThreadsAll(deps, signal);
       if (signal?.aborted) return;
       // The suggestions of heads found ready (review.suggestions), before their checks and merge.
       await evaluateSuggestionsAll(deps, signal);
