@@ -15,7 +15,7 @@ import { activeCooldowns } from '../db/capacity.js';
 import type { Db } from '../db/database.js';
 import { activeForeignHolds, holdSubject } from '../db/holds.js';
 import { listCiCandidates, listMergeCandidates, listPendingCiNotices, listPendingMergeNotices, listSuggestionCandidates, type LoopPr } from '../db/pr-reviews.js';
-import { getJob, getRun } from '../db/queue.js';
+import { getJob, getRun, NOT_STARTED_YET } from '../db/queue.js';
 import { listPendingLimitNotices, REVISION_MAX_AUTO_ATTEMPTS } from '../db/revisions.js';
 import { MAX_CI_NOTICE_ATTEMPTS } from '../publish/ci.js';
 import { MAX_NOTICE_ATTEMPTS } from '../publish/merge.js';
@@ -91,7 +91,15 @@ export function nextRetryAt(db: Db, scope: Pick<EventScope, 'run'> | null = null
 
 export interface PendingWork {
   /** Queued jobs, each with how often it failed to start: unchanged while nothing makes progress on them. */
-  queued: Array<{ id: string; startFailures: number; waiting: boolean }>;
+  queued: Array<{
+    id: string;
+    startFailures: number;
+    waiting: boolean;
+    /** Its last pre-start check said "not yet" (DispatchCheck `retry`: GitHub has not caught up with a push, #197), not that it failed. */
+    deferred: boolean;
+    /** How often it was claimed (each pre-start check is one claim): grows while it is looked at again. */
+    claims: number;
+  }>;
   /** When the earliest scheduled retry is due (epoch millis), or null when none is scheduled. */
   nextRetryAt: number | null;
   /** Pull requests whose auto-merge has not settled: still to be evaluated, waiting for checks, or sent without an answer. */
@@ -111,9 +119,19 @@ export interface PendingWork {
 /** What is left to do in `db`, within `scope` when one is given. Local state only. */
 export function pendingWork(db: Db, config: UpdraftConfig, scope: EventScope | null, now: () => number = Date.now): PendingWork {
   const inScope = { job: (id: string) => scope?.job(id) ?? true, run: (id: string) => scope?.run(id) ?? true, pr: (r: number, n: number) => scope?.pr(r, n) ?? true };
-  const queued = (db.prepare("SELECT id, start_failures, status_reason FROM jobs WHERE status = 'queued' ORDER BY id").all() as Array<{ id: string; start_failures: number; status_reason: string | null }>)
+  const queued = (
+    db
+      .prepare("SELECT j.id, j.start_failures, j.status_reason, (SELECT COUNT(*) FROM runs r WHERE r.job_id = j.id) AS claims FROM jobs j WHERE j.status = 'queued' ORDER BY j.id")
+      .all() as Array<{ id: string; start_failures: number; status_reason: string | null; claims: number }>
+  )
     .filter((r) => inScope.job(r.id))
-    .map((r) => ({ id: r.id, startFailures: r.start_failures, waiting: r.status_reason?.startsWith('waiting:') ?? false }));
+    .map((r) => ({
+      id: r.id,
+      startFailures: r.start_failures,
+      waiting: r.status_reason?.startsWith('waiting:') ?? false,
+      deferred: r.status_reason?.startsWith(NOT_STARTED_YET) ?? false,
+      claims: Number(r.claims),
+    }));
 
   const nextRetry = nextRetryAt(db, scope);
 

@@ -6,12 +6,12 @@ import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { configSchema, type UpdraftConfig } from '../config/schema.js';
 import { openDatabase, type Db } from '../db/database.js';
 import { beginPublication, finishPublication, getPublication, listDuePublications } from '../db/publications.js';
-import { getJob, latestRunOfJob } from '../db/queue.js';
+import { getJob, latestRunOfJob, NOT_STARTED_YET } from '../db/queue.js';
 import { resolvePaths, type UpdraftPaths } from '../paths.js';
 import type { Publisher } from '../publish/publish.js';
 import { silentLogger } from '../util/log.js';
 import type { DaemonDeps } from './daemon.js';
-import { drainQueue, nextRetryAt, type DrainOptions } from './drain.js';
+import { drainQueue, MIN_DEFERRED_CHECKS, nextRetryAt, type DrainOptions } from './drain.js';
 import type { ExecutionResult, Executor } from './executor.js';
 import type { ProcessControl } from './process.js';
 
@@ -167,6 +167,40 @@ describe('drainQueue', { timeout: 20_000 }, () => {
     expect(await drainQueue(s.deps, FAST)).toEqual({ ended: 'stalled' });
     expect(checks).toBeGreaterThan(1); // tried again on later ticks before giving up
     expect(getJob(s.db, a)!.status).toBe('queued');
+    expect(s.executed).toEqual([]);
+  });
+
+  // The flaky #197 test on windows-latest: a reviewer job whose pushed head GitHub did not show
+  // yet ("not yet", three times) was given up on as stuck when those checks took longer than
+  // stallMs on a slow machine. It is given checks, not time.
+  it('waits for a job whose pre-start check says "not yet", however slow each check is, and runs it once it says yes', async () => {
+    let checks = 0;
+    const s = setup({
+      checkDispatchable: async () => {
+        checks++;
+        // Each check takes longer than the whole stall window.
+        await new Promise((r) => setTimeout(r, FAST.stallMs! * 2));
+        return checks <= 3 ? { ok: false, reason: 'GitHub has not caught up yet', retry: true } : { ok: true };
+      },
+    });
+    const a = insertQueuedJob(s.db, { repoId: 1, fullName: 'o/r', issue: 1 });
+    expect(await drainQueue(s.deps, FAST)).toEqual({ ended: 'idle' });
+    expect(checks).toBe(4);
+    expect(s.executed).toEqual([a]);
+  });
+
+  it('gives up on a job whose check says "not yet" for good, after MIN_DEFERRED_CHECKS more checks, and leaves it queued', async () => {
+    let checks = 0;
+    const s = setup({
+      checkDispatchable: async () => {
+        checks++;
+        return { ok: false, reason: 'GitHub has not caught up yet', retry: true };
+      },
+    });
+    const a = insertQueuedJob(s.db, { repoId: 1, fullName: 'o/r', issue: 1 });
+    expect(await drainQueue(s.deps, FAST)).toEqual({ ended: 'stalled' });
+    expect(checks).toBeGreaterThanOrEqual(MIN_DEFERRED_CHECKS);
+    expect(getJob(s.db, a)).toMatchObject({ status: 'queued', statusReason: `${NOT_STARTED_YET}GitHub has not caught up yet` });
     expect(s.executed).toEqual([]);
   });
 

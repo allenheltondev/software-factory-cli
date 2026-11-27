@@ -55,6 +55,11 @@ export function holdsWorkerLock(db: Db, workerId: string): boolean {
  * Counted in jobs.start_failures; the count resets when the user retries the job.
  */
 export const MAX_START_FAILURES = 3;
+/**
+ * How a queued job's status reason starts when its pre-start check said "not yet" rather than
+ * failing (DispatchCheck `retry`: a reviewer job whose pushed head GitHub does not show yet, #197).
+ */
+export const NOT_STARTED_YET = 'not started yet: ';
 
 /** Reason recorded on a job (and its run) canceled with `updraft cancel`. */
 export const CANCELED_BY_USER = 'canceled by user';
