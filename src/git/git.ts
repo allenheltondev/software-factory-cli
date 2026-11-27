@@ -191,8 +191,9 @@ export function selectRepoRemote(remotes: readonly Remote[], fullName: string, e
 }
 
 /** The remote's default branch: asks the remote, then falls back to the local refs/remotes/<remote>/HEAD. */
-export async function remoteDefaultBranch(remote: string, opts: GitOptions): Promise<string> {
-  const live = await runGit(['ls-remote', '--symref', remote, 'HEAD'], opts);
+/** `run`: what runs the network command (a publication's injected runner); default runGit. */
+export async function remoteDefaultBranch(remote: string, opts: GitOptions, run: (args: readonly string[], opts: GitOptions) => Promise<GitOutput> = runGit): Promise<string> {
+  const live = await run(['ls-remote', '--symref', remote, 'HEAD'], opts);
   const m = /^ref:\s*refs\/heads\/(\S+)\s+HEAD$/m.exec(live.stdout);
   if (m) return m[1]!;
   const local = await tryGit(['symbolic-ref', '--quiet', `refs/remotes/${remote}/HEAD`], opts);

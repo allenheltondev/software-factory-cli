@@ -39,7 +39,15 @@ role a step takes), `src/publish/review-form.ts` (formal or comment review),
 | A person forges an "own review" | Author must be the worker and the review must carry the marker; a marker in a person's review still counts as their request | same |
 | Stale approval | Formal review only when the live head is the reviewed commit; `commit_id` pinned; own outdated approvals dismissed | `review.test.ts` |
 | Misrepresenting a bot approval as a required human one | Review and PR text say what it does not replace; fallback comments never read as approvals | `review-form.test.ts` |
-| Adopting a person's unrelated pull request | Restore needs the job branch, same repository, the run marker, and the configured publisher as author | `src/commands/run-event-restore.ts` |
+| Adopting a person's unrelated pull request | Restore needs the job branch, same repository, the run marker, and the configured publisher as author; an author whose account id is not `github.publisher.id` is not adopted, and the adopted publication records the author's id so the rest of the loop checks it | `src/commands/run-event-restore.test.ts` |
+| A formal review refused for its event loses the inline threads | A refused formal review with inline comments is retried as a comment with the same inline comments first; only a refusal of those too moves the findings to the summary | `review.test.ts` "keeps the inline threads …" |
+| Duplicate jobs or self-trigger loops in the whole loop | The person-published loop end to end (publication, formal change request, revision, formal approval) on the standard and the native subscription worker paths, with separate profiles and with one profile in both roles, with auto-merge and with manual merge: exactly one revision, the App's own change request recorded as ignored, every push the person's over HTTPS | `src/worker/review-loop.test.ts` "the loop of a pull request a person published" |
+
+Deployment limitations of the local CLI: publication as a person needs the configured GitHub
+App for reviews (`github.app`) and the person's own `gh` sign-in on the worker machine; the
+tests run both worker paths against an in-memory GitHub, so GitHub's own review state, branch
+protection and CI on a real repository are for a person to check (below). Updraft Cloud does
+not offer it yet (next section).
 
 What the local CLI does **not** protect against: an agent runs as the same OS user as the
 worker, so without [isolation](isolation.md) it can run `gh auth token` itself. That is true

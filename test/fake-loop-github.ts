@@ -61,6 +61,10 @@ export class FakeLoopGitHub {
   issueBody = 'Please add a widget.';
   /** Every write, in order. */
   readonly writes: string[] = [];
+  /** Who made each write of `writes`, by index: this.login, or the person of a view of `as`. */
+  readonly writers: string[] = [];
+  /** List the worker's formal reviews (APPROVE, REQUEST_CHANGES) where the review poller reads reviews, as GitHub does. */
+  listFormalReviews = false;
   /** Every call, in order. */
   readonly calls: string[] = [];
   readonly merges: MergePullRequestInput[] = [];
@@ -256,6 +260,9 @@ export class FakeLoopGitHub {
     const state = event === 'APPROVE' ? 'APPROVED' : event === 'REQUEST_CHANGES' ? 'CHANGES_REQUESTED' : 'COMMENTED';
     const r: PullRequestReviewSummary = { id, state, user: this.login, body: input.body, htmlUrl: `https://github.com/${this.fullName}/pull/${pull}#pullrequestreview-${id}`, submittedAt: this.updatedAt, commitId: input.commitId ?? null };
     this.reviews.push(r);
+    if (this.listFormalReviews && event !== 'COMMENT') {
+      this.humanReviews.push({ id: `PRR_${id}`, state, author: this.login, submittedAt: this.updatedAt, body: input.body, url: r.htmlUrl, lastEditedAt: null, editor: null, comments: [], commentCount: 0, commitSha: input.commitId ?? null });
+    }
     for (const c of input.comments ?? []) {
       const cid = this.nextId++;
       this.reviewComments.push({ id: cid, reviewId: id, inReplyToId: null, user: this.login, body: c.body, path: c.path, htmlUrl: `https://github.com/${this.fullName}/pull/${pull}#discussion_r${cid}`, line: c.line, side: c.side, ...(c.startLine !== undefined ? { startLine: c.startLine } : {}) });
@@ -348,15 +355,58 @@ export class FakeLoopGitHub {
   }
 
   get api(): GitHubApi {
+    return this.view(null);
+  }
+
+  /**
+   * The same GitHub as `person` (a consenting publisher's own sign-in, publishAs user): what it
+   * writes is that account's, and it answers who it is and whether it may push to the repository.
+   */
+  as(person: { login: string; id: number; push?: boolean; repoId?: number }): GitHubApi {
+    return this.view(person);
+  }
+
+  private view(person: { login: string; id: number; push?: boolean; repoId?: number } | null): GitHubApi {
+    const own = person
+      ? {
+          getWorkerIdentity: async () => ({ kind: 'user' as const, login: person.login, id: person.id }),
+          getRepo: async () => ({
+            id: person.repoId ?? 42, fullName: this.fullName, owner: this.fullName.split('/')[0]!, name: this.fullName.split('/')[1]!, private: false, archived: false,
+            defaultBranch: 'main', description: null, permissions: { admin: false, push: person.push ?? true, pull: true },
+          }),
+        }
+      : {};
     return new Proxy(this, {
-      get(target, prop) {
+      get: (target, prop) => {
         // Not a thenable: an awaited api must resolve to itself.
-        if (prop in target || prop === 'then' || typeof prop === 'symbol') return Reflect.get(target, prop, target) as unknown;
-        return () => {
-          throw new Error(`the loop must not call ${String(prop)}`);
+        if (prop === 'then' || typeof prop === 'symbol') return Reflect.get(target, prop, target) as unknown;
+        if (prop in own) return own[prop as keyof typeof own];
+        if (!(prop in target)) {
+          return () => {
+            throw new Error(`the loop must not call ${String(prop)}`);
+          };
+        }
+        const value = Reflect.get(target, prop, target) as unknown;
+        if (typeof value !== 'function') return value;
+        // Every method writes what it writes before its first await, so the login it reads is the view's.
+        return (...args: unknown[]) => {
+          const before = target.login;
+          const from = target.writes.length;
+          if (person) target.login = person.login;
+          try {
+            return (value as (...a: unknown[]) => unknown).apply(target, args);
+          } finally {
+            for (let i = from; i < target.writes.length; i++) target.writers[i] = target.login;
+            target.login = before;
+          }
         };
       },
     }) as unknown as GitHubApi;
+  }
+
+  /** The writes `who` made, in order. */
+  writesOf(who: string): string[] {
+    return this.writes.filter((_, i) => this.writers[i] === who);
   }
 }
 

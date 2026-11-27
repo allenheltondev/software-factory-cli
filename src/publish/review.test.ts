@@ -1780,6 +1780,50 @@ describe('reviews of a pull request a person published (publishAs user)', () => 
     expect(body).not.toContain('submitted as a GitHub approval');
   });
 
+  const withInline = () => {
+    const s = asPerson();
+    s.gh.files = [{ path: 'src/a.ts', status: 'modified', patch: PATCH }];
+    return s;
+  };
+  const postFindings = async (s: ReturnType<typeof setup>) => {
+    const [job] = s.schedule();
+    const runId = s.reviewed(job!, 'changes-requested', structuredFindings(THREE));
+    return { runId, result: await postReview(s.deps, runId) };
+  };
+
+  it('keeps the inline threads when GitHub refuses only the formal event: the same review, inline comments and all, as an explained comment', async () => {
+    const s = withInline();
+    s.gh.refuseFormal = true;
+    const { runId, result } = await postFindings(s);
+    expect(result).toMatchObject({ status: 'published', review: { outcome: 'revision-queued' } });
+    expect(s.gh.writes.filter((w) => w.startsWith('review'))).toEqual([`review #${PR} COMMENT at ${H1} with 1 inline`]);
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toMatch(/posted as a comment, not as a GitHub change request, because GitHub refused it as one/);
+    expect(body).toContain('- **Blocker F1** · Generation not checked · `src/a.ts` line 3: in its thread on the diff');
+    expect(s.gh.reviewComments).toHaveLength(1);
+    expect(findingsOfRun(s.db, runId).find((f) => f.key === `${runId}#F1`)!.commentId).not.toBeNull();
+  });
+
+  it('drops the inline comments but keeps the formal event when GitHub refuses the inline comments themselves', async () => {
+    const s = withInline();
+    s.gh.refuseInline = true;
+    const { runId } = await postFindings(s);
+    expect(s.gh.writes.filter((w) => w.startsWith('review'))).toEqual([`review #${PR} REQUEST_CHANGES at ${H1}`]);
+    expect(s.gh.reviews[0]!.body).toContain('(GitHub did not accept it as an inline comment)');
+    expect(findingsOfRun(s.db, runId).every((f) => f.commentId === null)).toBe(true);
+  });
+
+  it('falls back to a comment with every finding in the summary when GitHub refuses both the formal event and the inline comments', async () => {
+    const s = withInline();
+    s.gh.refuseFormal = true;
+    s.gh.refuseInline = true;
+    await postFindings(s);
+    expect(s.gh.writes.filter((w) => w.startsWith('review'))).toEqual([`review #${PR} COMMENT at ${H1}`]);
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toMatch(/posted as a comment, not as a GitHub change request, because GitHub refused it as one/);
+    expect(body).toContain('(GitHub did not accept it as an inline comment)');
+  });
+
   it('only ever approves the current head: a verdict for an older commit is a comment', async () => {
     const s = asPerson();
     const [job] = s.schedule();

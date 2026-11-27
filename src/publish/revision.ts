@@ -601,7 +601,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       );
       return { ...target, localSha: sha, commitCount: count, descends: isAncestor };
     });
-    const protectedBranches = new Set([watched.baseBranch, repo.baseBranch, await remoteDefaultBranch(pushUrl, net)].filter((b): b is string => Boolean(b)));
+    const protectedBranches = new Set([watched.baseBranch, repo.baseBranch, await remoteDefaultBranch(pushUrl, net, run1)].filter((b): b is string => Boolean(b)));
     if (protectedBranches.has(prBranch)) throw new PublishRefusal(`${prBranch} is the base or default branch of ${repoFullName}; refusing to push to it`);
 
     /**

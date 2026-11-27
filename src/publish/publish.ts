@@ -768,7 +768,7 @@ export async function publishRun(
       return { status: 'skipped', reason, publication: getPublication(deps.db, runId)! };
     }
 
-    const baseBranch = pub.baseBranch ?? repo.baseBranch ?? (await remoteDefaultBranch(pushUrl, net));
+    const baseBranch = pub.baseBranch ?? repo.baseBranch ?? (await remoteDefaultBranch(pushUrl, net, run1));
     if (baseBranch !== pub.baseBranch) progress({ baseBranch });
     if (branch === baseBranch) throw new PublishRefusal(`the job branch ${branch} is the base branch; refusing to push to it`);
 

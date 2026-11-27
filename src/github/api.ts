@@ -200,6 +200,8 @@ export interface PullRequestDetails {
   mergeableState: string;
   /** Login of the account that opened it, as REST reports it (`<app-slug>[bot]` for an App); null when unknown. */
   author?: string | null;
+  /** Account id of that account; null when unknown. */
+  authorId?: number | null;
   /** Markdown body; '' when it has none. */
   body?: string;
   /** Stable ID of the head's repository; null when that repository was deleted. */

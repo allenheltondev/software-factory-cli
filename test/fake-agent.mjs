@@ -8,6 +8,8 @@
 // prompt it got to a file so tests can compare it with the rendered prompt.
 //
 // Modes:
+//   by-prompt review when the prompt is a review prompt ("Review the pull request..."), else success:
+//             the same agent profile as coder and reviewer
 //   success   write FAKE_AGENT.md in the working directory and commit it; exit 0
 //   fail      write partial.txt (uncommitted) and modify README.md; exit 3
 //   hang      start a child process, write both pids to --pids-file, and wait forever
@@ -44,9 +46,12 @@ const opt = (name) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 };
-const mode = opt('--mode') ?? 'success';
 const promptFile = opt('--prompt-file');
 const prompt = promptFile ? readFileSync(promptFile, 'utf8') : readFileSync(0, 'utf8');
+// by-prompt: one agent profile in both roles. It reviews when the prompt is a review prompt
+// (it starts with "Review the pull request"), and codes as in success mode otherwise.
+const asked = opt('--mode') ?? 'success';
+const mode = asked === 'by-prompt' ? (prompt.startsWith('Review the pull request') ? 'review' : 'success') : asked;
 const received = opt('--received');
 if (received) writeFileSync(received, prompt);
 

@@ -388,13 +388,27 @@ export async function postReview(deps: PublishDeps, runId: string, opts: { signa
           } catch (err) {
             if (!(err instanceof GitHubError) || err.status !== 422) throw err;
             // GitHub refused the formal review (the account may not, or a rule says no). It becomes a
-            // comment that says so, never a comment that reads as an approval. A refusal that may be
-            // about the inline comments is left to the caller, which drops them and keeps the form.
-            if (form.event !== 'COMMENT' && !input.comments?.length) {
+            // comment that says so, never a comment that reads as an approval.
+            if (form.event !== 'COMMENT') {
               const refused = form.event;
+              const formal = form;
               form = { event: 'COMMENT', instead: refused, why: `GitHub refused it as one (${inline(cap(err.message, 200))})` };
-              await runLog([`GitHub refused the ${refused} review (${err.message}); posting it as a comment review that says so`]);
-              return create(input, body);
+              if (!input.comments?.length) {
+                await runLog([`GitHub refused the ${refused} review (${err.message}); posting it as a comment review that says so`]);
+                return create(input, body);
+              }
+              // With inline comments the refusal may be the formal event's alone: first the same
+              // review, inline comments and all, as a comment, so no thread is lost for it.
+              await runLog([`GitHub refused the ${refused} review with ${input.comments.length} inline comment(s) (${err.message}); trying it as a comment review with the same inline comments`]);
+              try {
+                return await create(input, body);
+              } catch (again) {
+                if (!(again instanceof GitHubError) || again.status !== 422) throw again;
+                // Refused as a comment too: it is about the inline comments. The caller drops them
+                // and tries the formal form again, which falls back to a comment if refused once more.
+                form = formal;
+                throw again;
+              }
             }
             // The commit is no longer part of the pull request (its branch was rewritten). The body
             // names the commit, so the review is still worth having, unpinned.

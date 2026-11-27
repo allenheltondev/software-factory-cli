@@ -54,7 +54,7 @@ export async function readOwnPullRequest(
    * request they opened is Updraft's too, if it also has the job branch and the run's marker. A pull
    * request of theirs without those is never taken for one.
    */
-  publisher: { login: string } | null = null,
+  publisher: { login: string; id?: number } | null = null,
 ): Promise<OwnPullRequestAnswer> {
   let pr: PullRequestDetails;
   try {
@@ -71,7 +71,14 @@ export async function readOwnPullRequest(
   const opened = AGENT_MARKER.exec(pr.body ?? '') ?? OPENED_BY.exec(pr.body ?? '');
   const agent = opened && opened[1] === runId ? opened[2]!.trim() : null;
   if (publisher && pr.author && sameLogin(pr.author, publisher.login) && !pr.author.endsWith('[bot]')) {
-    return { kind: 'ours', own: { pr, runId, agent, publisher: { kind: 'user', login: pr.author, id: null } } };
+    // The account id is recorded, so the rest of this pull request's loop checks the sign-in by
+    // id as well as login (publisher-role.ts): the author's, as GitHub reports it, else the
+    // configured one. An author whose id is not the configured one is another account by that name.
+    const authorId = typeof pr.authorId === 'number' ? pr.authorId : null;
+    if (authorId !== null && publisher.id !== undefined && authorId !== publisher.id) {
+      return { kind: 'not-ours', why: `it was opened by ${pr.author} (account ${authorId}), not by account ${publisher.id} of github.publisher` };
+    }
+    return { kind: 'ours', own: { pr, runId, agent, publisher: { kind: 'user', login: pr.author, id: authorId ?? publisher.id ?? null } } };
   }
   const identity = await api.getWorkerIdentity();
   if (!isWorkerLogin(identity, pr.author)) {
