@@ -32,6 +32,12 @@ export interface DrainOptions {
   settleMs?: number;
   /** How long a queued job may sit with nothing running before the drain gives up on it. Default 60s. */
   stallMs?: number;
+  /**
+   * How long a queued job whose pre-start check keeps saying "not yet" (DispatchCheck `retry`) is
+   * waited for at most, once `stallMs` has passed and it was not checked MIN_DEFERRED_CHECKS times
+   * since. Default 5 minutes.
+   */
+  deferredWaitMs?: number;
   /** How often retries and stuck jobs are looked at. Default 5s. */
   tickMs?: number;
   /** How often GitHub is asked about an auto-merge that is waiting for checks. Default 30s. */
@@ -62,6 +68,9 @@ export const DEFAULT_STALL_MS = 60_000;
 export const DEFAULT_TICK_MS = 5_000;
 export const DEFAULT_MERGE_POLL_MS = 30_000;
 export const DEFAULT_COOLDOWN_WAIT_MS = 5 * 60_000;
+export const DEFAULT_DEFERRED_WAIT_MS = 5 * 60_000;
+/** Checks a "not yet" job gets after stallMs before the drain gives up on it (#197). */
+export const MIN_DEFERRED_CHECKS = 5;
 
 export { nextRetryAt } from './scope.js';
 
@@ -81,6 +90,7 @@ export async function drainQueue(deps: Omit<DaemonDeps, 'poll' | 'idle' | 'scope
   const stallMs = opts.stallMs ?? DEFAULT_STALL_MS;
   const tickMs = opts.tickMs ?? DEFAULT_TICK_MS;
   const mergePollMs = opts.mergePollMs ?? DEFAULT_MERGE_POLL_MS;
+  const deferredWaitMs = Math.max(stallMs, opts.deferredWaitMs ?? DEFAULT_DEFERRED_WAIT_MS);
   const scope = opts.scope ?? null;
   const startedAt = now();
   const deadlineAt = opts.deadlineMs !== undefined ? startedAt + opts.deadlineMs : null;
@@ -107,7 +117,7 @@ export async function drainQueue(deps: Omit<DaemonDeps, 'poll' | 'idle' | 'scope
   // GitHub is not answering and the drain stops asking.
   const mergeWaitMs = Math.max(0, ...Object.values(deps.config.repositories).map((r) => (r.autoMergeWaitMinutes ?? DEFAULT_AUTO_MERGE_WAIT_MINUTES) * 60_000)) + settleMs;
 
-  let stalled: { signature: string; since: number } | null = null;
+  let stalled: { signature: string; since: number; claims: Map<string, number> } | null = null;
   let settleUntil: number | null = null;
   let mergeSince: number | null = null;
   const idle = (): boolean => {
@@ -129,8 +139,14 @@ export async function drainQueue(deps: Omit<DaemonDeps, 'poll' | 'idle' | 'scope
       // Queued, and this pass did not start it. Normal for a moment (a pre-start check that
       // could not reach GitHub is tried again on the next tick); not for long.
       const signature = p.queued.map((j) => `${j.id}:${j.startFailures}`).join(',');
-      if (stalled?.signature !== signature) stalled = { signature, since: now() };
+      if (stalled?.signature !== signature) stalled = { signature, since: now(), claims: new Map(p.queued.map((j) => [j.id, j.claims])) };
       if (now() - stalled.since < stallMs) return false;
+      // A job whose pre-start check said "not yet" (GitHub catching up with a push, #197) is looked
+      // at again every tick: it is given MIN_DEFERRED_CHECKS more checks before it counts as stuck,
+      // however long a tick takes on this machine, within deferredWaitMs at most.
+      const since = stalled;
+      const checking = p.queued.some((j) => j.deferred && j.claims - (since.claims.get(j.id) ?? j.claims) < MIN_DEFERRED_CHECKS);
+      if (checking && now() - stalled.since < deferredWaitMs) return false;
       ended ??= 'stalled';
       deps.log.warn('queued work could not be started; giving up', { waitedMs: now() - stalled.since });
       return true;

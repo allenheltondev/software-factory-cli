@@ -21,6 +21,7 @@ import {
   setRunProcess,
   setRunSummary,
   WorkerLockLostError,
+  NOT_STARTED_YET,
   type Claim,
   type FinishedRun,
 } from '../db/queue.js';
@@ -443,7 +444,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<void> {
         // Not a failure: no error is recorded (a reviewer job whose pushed head GitHub does not show yet, #197).
         deferred.add(job.id);
         log.info('job not started yet; it stays queued until the next poll', { jobId: job.id, reason: check.reason });
-        releaseClaim(db, run.id, `not started yet: ${check.reason}`, now);
+        releaseClaim(db, run.id, `${NOT_STARTED_YET}${check.reason}`, now);
         continue;
       }
       if (!check.ok) {
