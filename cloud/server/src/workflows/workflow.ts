@@ -136,7 +136,7 @@ export interface WorkflowControl {
 }
 
 /** The route a job ran on, as the runner reported it (jobs/lifecycle.ts routingOf): fixed codes only. */
-export type WorkflowRouting = Pick<JobRouting, 'source' | 'pool' | 'tier' | 'requestedTier' | 'reason'>;
+export type WorkflowRouting = Pick<JobRouting, 'source' | 'pool' | 'tier' | 'requestedTier' | 'reason' | 'hops'>;
 
 /** One entry of a workflow's timeline. `id` is immutable and unique: recording an event twice changes nothing. */
 export interface WorkflowEvent {
@@ -156,9 +156,11 @@ export interface WorkflowEvent {
   prNumber?: number;
   prUrl?: string;
   /** The steps the job reported: role (implement, review, revision), agent profile, the adapter, model and effort it ran with, and outcome. */
-  steps?: { kind: string; agent?: string; adapter?: string; model?: string; effort?: string; outcome?: string; usage?: StepUsage }[];
+  steps?: { kind: string; agent?: string; adapter?: string; model?: string; effort?: string; modelSource?: 'configured' | 'response'; verificationPassed?: boolean; publication?: string; outcome?: string; usage?: StepUsage }[];
   /** The route the job ran on (tier, the tier first chosen, why), once the runner reported it. */
   routing?: WorkflowRouting;
+  verificationPassed?: boolean;
+  publication?: string;
   /** A code for why (a queue wait's reason, a queue end's, a block's). */
   reason?: string;
   /** The wait this event ended. */
@@ -388,6 +390,8 @@ export function onJobFinished(
     outcome,
     ...(prNumber !== undefined ? { prNumber } : {}),
     ...(detail?.prUrl ? { prUrl: detail.prUrl } : {}),
+    ...(typeof detail?.verificationPassed === 'boolean' ? { verificationPassed: detail.verificationPassed } : {}),
+    ...(detail?.updraftOutcome === 'publish-failed' ? { publication: 'failed' } : {}),
     ...(detail?.steps?.length ? { steps: detail.steps.map(stepOf) } : {}),
     ...(routingSummary(detail?.routing) ? { routing: routingSummary(detail?.routing)! } : {}),
     ...(loop ? { loop: { rounds: loop.rounds, reviews: loop.reviews, ...(loop.maxRevisions !== undefined ? { maxRevisions: loop.maxRevisions } : {}), ...(loop.verdict ? { verdict: loop.verdict } : {}) } } : {}),
@@ -463,6 +467,9 @@ function stepOf(s: NonNullable<JobFinishDetail['steps']>[number]): NonNullable<W
     ...(s.adapter ? { adapter: s.adapter } : {}),
     ...(s.model ? { model: s.model } : {}),
     ...(s.effort ? { effort: s.effort } : {}),
+    ...(s.modelSource ? { modelSource: s.modelSource } : {}),
+    ...(typeof s.verificationPassed === 'boolean' ? { verificationPassed: s.verificationPassed } : {}),
+    ...(s.publication ? { publication: s.publication } : {}),
     ...(s.outcome ? { outcome: s.outcome } : {}),
     ...(usage ? { usage } : {}),
   };
@@ -473,6 +480,7 @@ function routingSummary(r: JobRouting | undefined): WorkflowRouting | null {
   return {
     source: r.source,
     ...(r.pool ? { pool: r.pool } : {}),
+    ...(r.hops !== undefined ? { hops: r.hops } : {}),
     ...(r.tier ? { tier: r.tier } : {}),
     ...(r.requestedTier ? { requestedTier: r.requestedTier } : {}),
     ...(r.reason ? { reason: r.reason } : {}),

@@ -4,6 +4,7 @@ import { Alert, Button, Card, CardBody, CardHeader, CardTitle, PageHero, PageHer
 import { api as defaultApi, type ApiClient, type WorkflowEvent, type WorkflowHistory, type WorkflowPause, type WorkflowTotals, type WorkflowView } from '../api/client';
 import { WORKFLOW_STATUS, WorkflowHistoryNote, WorkflowTimeline, WorkflowTotalsView, stageLabel, workflowTitle } from '../components/workflows';
 import { relativeTime } from '../lib/time';
+import { WorkflowLifecycle } from '../components/WorkflowLifecycle';
 
 type WorkflowApi = Pick<ApiClient, 'workflow'> & Partial<Pick<ApiClient, 'resumeWorkflow'>>;
 type Load = { state: 'loading' } | { state: 'ok'; workflow: WorkflowView; events: WorkflowEvent[]; totals?: WorkflowTotals; history?: WorkflowHistory; pause?: WorkflowPause } | { state: 'error'; message: string };
@@ -43,7 +44,7 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
 
   // Refreshed while something can change without the viewer: a job runs, or the workflow waits
   // (for capacity, CI, a sign-in). One read of this workflow each time, never of its jobs.
-  const active = load.state === 'ok' && (load.workflow.status === 'active' || load.workflow.status === 'waiting');
+  const active = load.state === 'ok' && (load.workflow.status === 'active' || load.workflow.status === 'waiting' || !!load.pause);
   useEffect(() => {
     if (!active) return;
     const timer = setInterval(() => void refresh(), refreshMs);
@@ -100,6 +101,7 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
               ))}
             </div>
           </PageHero>
+          <Card><CardBody><WorkflowLifecycle workflow={load.workflow} events={load.events} base={base} pause={load.pause} history={load.history} /></CardBody></Card>
           {(load.workflow.reconstructed || (load.workflow.gaps?.length ?? 0) > 0) && (
             <Alert variant="info" data-testid="workflow-rebuilt">
               {(load.workflow.gaps ?? ['Rebuilt from job records.']).join(' ')}
@@ -123,7 +125,7 @@ export function WorkflowPage({ api = defaultApi, refreshMs = WORKFLOW_REFRESH_MS
           )}
           <Card>
             <CardHeader>
-              <CardTitle>Timeline</CardTitle>
+              <CardTitle><span id="workflow-history">Timeline</span></CardTitle>
             </CardHeader>
             <CardBody>
               <div className="flex flex-col gap-4">
