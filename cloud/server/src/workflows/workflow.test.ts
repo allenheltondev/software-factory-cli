@@ -26,6 +26,18 @@ function setup() {
 }
 
 describe('workflows', () => {
+  it('durably keeps the allowlisted lifecycle selection and verification metadata', async () => {
+    const s = setup();
+    await s.recorder.started(job());
+    await s.recorder.finished(job(), 'succeeded', {
+      routing: { source: 'tier', tier: 'complex', hops: 2 }, verificationPassed: false,
+      updraftOutcome: 'publish-failed',
+      steps: [{ kind: 'implement', agent: 'coder', adapter: 'codex', model: 'gpt-example', modelSource: 'response', effort: 'high', runId: 'run_123', verificationPassed: false, publication: 'failed', usage: { durationMs: 1234 }, outcome: 'failed' }],
+    });
+    const finish = (await s.events()).find((e) => e.kind === 'job_finished')!;
+    expect(finish).toMatchObject({ routing: { source: 'tier', tier: 'complex', hops: 2 }, verificationPassed: false, publication: 'failed', steps: [{ adapter: 'codex', model: 'gpt-example', modelSource: 'response', effort: 'high', verificationPassed: false, publication: 'failed', usage: { durationMs: 1234 } }] });
+    expect(await s.store.listWorkflowEvents(66, '99-i7', 100)).toEqual([]);
+  });
   it('follows an issue from its label through its pull request\'s review loop as one workflow', async () => {
     const s = setup();
     await s.recorder.started(job());

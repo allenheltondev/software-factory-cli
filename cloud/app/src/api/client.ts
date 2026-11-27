@@ -398,9 +398,11 @@ export interface WorkflowEvent {
   stage?: string;
   prNumber?: number;
   prUrl?: string;
-  steps?: { kind: string; agent?: string; adapter?: string; model?: string; effort?: string; outcome?: string; usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number; durationMs?: number } }[];
+  steps?: { kind: string; agent?: string; adapter?: string; model?: string; effort?: string; modelSource?: 'configured' | 'response'; verificationPassed?: boolean; publication?: string; outcome?: string; usage?: { inputTokens?: number; outputTokens?: number; costUsd?: number; durationMs?: number } }[];
   /** The route the job ran on, once reported: the tier, the tier first chosen, and why (fixed codes). */
-  routing?: { source: string; pool?: string; tier?: string; requestedTier?: string; reason?: string };
+  routing?: { source: string; pool?: string; tier?: string; requestedTier?: string; reason?: string; hops?: number };
+  verificationPassed?: boolean;
+  publication?: string;
   reason?: string;
   waited?: WorkflowWait;
   control?: { action: 'stop_requested' | 'paused' | 'canceled' | 'resumed' | string; by: string; reason?: string };

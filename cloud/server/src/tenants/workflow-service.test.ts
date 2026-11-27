@@ -33,6 +33,7 @@ describe('the workflow views', () => {
     await expect(service.get(caller, 55, '../x')).rejects.toMatchObject({ status: 404 });
     await expect(service.get(caller, 55, '99-i8')).rejects.toMatchObject({ status: 404 });
     await expect(service.list(caller, 66)).rejects.toMatchObject({ status: 403 });
+    await expect(service.get(caller, 66, '99-i7')).rejects.toMatchObject({ status: 403 });
     expect(members.every((m) => m === 55)).toBe(true);
   });
 
