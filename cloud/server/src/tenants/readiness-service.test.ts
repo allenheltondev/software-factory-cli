@@ -451,6 +451,16 @@ describe('repository readiness (#137)', () => {
       expect(get(worker, 'codex-subscription')).toMatchObject({ state: 'unverified', unverified: 'read_failed', summary: expect.stringContaining('Codex subscription worker could not be read') });
     });
 
+    it('names each provider whose routing is unread when no job image is published', async () => {
+      const both = rule({ keys: ['ANTHROPIC_API_KEY', 'CODEX_API_KEY'] });
+      const unread = await setup(world({ rules: { loop: true, repositories: { 'acme/web': both } }, keys: [], imageVersion: null, native: new Error('x'), codex: new Error('y') })).service.readiness(caller, 55);
+      expect(get(unread, 'job-image')).toMatchObject({ state: 'unverified', summary: expect.stringContaining('rather than the Claude or Codex subscription') });
+      const claude = await setup(world({ keys: [], imageVersion: null, native: new Error('x') })).service.readiness(caller, 55);
+      expect(get(claude, 'job-image')!.summary).toContain('rather than the Claude subscription');
+      const codex = await setup(world({ rules: codexRule(['CODEX_API_KEY']), keys: [], imageVersion: null, codex: new Error('y') })).service.readiness(caller, 55);
+      expect(get(codex, 'job-image')!.summary).toContain('rather than the Codex subscription');
+    });
+
     it('leaves Claude\'s check as it was', () => {
       expect(subscriptionCheck('expired')).toEqual(subscriptionCheck('expired', 'claude'));
       expect(subscriptionCheck('expired')).not.toHaveProperty('provider');

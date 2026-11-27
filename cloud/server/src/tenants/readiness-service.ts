@@ -325,7 +325,7 @@ export function installationChecks(f: InstallationFacts, jobImage: 'required' | 
   if (jobImage !== 'none') {
     if (f.imageVersion === null) out.push(unverifiedCheck('job-image', 'capacity', 'Whether a job image is published is not checked in this deployment.', 'not_checked'));
     else if (!f.imageVersion.ok) out.push(unverifiedCheck('job-image', 'capacity', 'Whether a job image is published could not be read just now.'));
-    else if (!f.imageVersion.value && jobImage === 'uncertain') out.push(unverifiedCheck('job-image', 'capacity', `No job image is published; whether these workflows need one (rather than the ${f.native && !f.native.ok ? 'Claude' : 'Codex'} subscription) could not be read just now.`));
+    else if (!f.imageVersion.value && jobImage === 'uncertain') out.push(unverifiedCheck('job-image', 'capacity', `No job image is published; whether these workflows need one (rather than the ${unreadSubscriptions(f)} subscription) could not be read just now.`));
     else out.push(f.imageVersion.value
       ? check({ id: 'job-image', stage: 'capacity', required: true, state: 'verified', summary: `Jobs run on image ${f.imageVersion.value}.` })
       : check({ id: 'job-image', stage: 'capacity', required: true, state: 'failing', problem: 'provider', summary: 'No job image is published in this deployment yet, so jobs are off.' }));
@@ -334,6 +334,12 @@ export function installationChecks(f: InstallationFacts, jobImage: 'required' | 
   out.push(...capacityChecks(f));
   out.push(...telemetryChecks(f));
   return out;
+}
+
+/** The providers whose subscription routing could not be read: 'Claude', 'Codex' or 'Claude or Codex'. */
+function unreadSubscriptions(f: InstallationFacts): string {
+  const unread = [f.native && !f.native.ok ? 'Claude' : '', f.codex && !f.codex.ok ? 'Codex' : ''].filter(Boolean);
+  return unread.length ? unread.join(' or ') : 'Codex';
 }
 
 function capacityChecks(f: InstallationFacts): ReadinessCheck[] {
