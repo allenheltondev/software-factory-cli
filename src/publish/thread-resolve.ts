@@ -29,6 +29,21 @@ export interface ThreadResolveResult {
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+/**
+ * Threads that were not found among the pull request's threads (their root comment deleted, for
+ * example), by database: each is tried again after a growing wait, not on every poll, and the
+ * warning says when. Found again (or resolved), it is forgotten.
+ */
+const MISSING_FIRST_WAIT_MS = 5 * 60_000;
+const MISSING_MAX_WAIT_MS = 6 * 60 * 60_000;
+const missing = new WeakMap<object, Map<string, { misses: number; until: number }>>();
+const missingOf = (db: object) => {
+  let m = missing.get(db);
+  if (!m) missing.set(db, (m = new Map()));
+  return m;
+};
+const missingKey = (repoId: number, prNumber: number, f: ReviewFinding) => `${repoId}:${prNumber}:${f.key}:${f.commentId}`;
+
 /** One pull request's verified threads, resolved. Never throws for GitHub's answers; a later poll retries what is left. */
 async function resolvePr(deps: ThreadResolveDeps, repo: RepoRef, prNumber: number, findings: ReviewFinding[]): Promise<ThreadResolveResult> {
   const { db, api, log } = deps;
@@ -37,6 +52,11 @@ async function resolvePr(deps: ThreadResolveDeps, repo: RepoRef, prNumber: numbe
     for (const key of keys) out.left.push({ key, why });
     log.warn(`threads: ${keys.join(', ')} verified, not resolved yet: ${why}; tried again on the next poll`, { repo: repo.fullName, pr: prNumber });
   };
+  const clock = deps.now ?? Date.now;
+  const waiting = missingOf(db);
+  // A thread not found before waits out its backoff (already said in the warning that set it).
+  findings = findings.filter((f) => (waiting.get(missingKey(repo.id, prNumber, f))?.until ?? 0) <= clock());
+  if (findings.length === 0) return out;
   const keys = findings.map((f) => f.key);
   if (!api.listReviewThreads || !api.resolveReviewThread) {
     leave(keys, 'this GitHub client cannot list or resolve review threads');
@@ -57,10 +77,19 @@ async function resolvePr(deps: ThreadResolveDeps, repo: RepoRef, prNumber: numbe
   for (const f of findings) {
     try {
       const thread = await findThread({ api }, repo, prNumber, f.commentId!, login, threads);
+      const mk = missingKey(repo.id, prNumber, f);
       if (!thread) {
-        leave([f.key], `its thread (comment ${f.commentId}) is not among the pull request's threads as ${login}'s`);
+        const misses = (waiting.get(mk)?.misses ?? 0) + 1;
+        const wait = Math.min(MISSING_FIRST_WAIT_MS * 2 ** (misses - 1), MISSING_MAX_WAIT_MS);
+        waiting.set(mk, { misses, until: clock() + wait });
+        out.left.push({ key: f.key, why: `its thread (comment ${f.commentId}) is not among the pull request's threads as ${login}'s` });
+        log.warn(
+          `threads: ${f.key} verified, not resolved yet: its thread (comment ${f.commentId}) is not among the pull request's threads as ${login}'s; tried again in ${Math.round(wait / 60_000)} minutes`,
+          { repo: repo.fullName, pr: prNumber },
+        );
         continue;
       }
+      waiting.delete(mk);
       // Right before: still a verified root with this thread, not resolved by another attempt meanwhile.
       const now = getFinding(db, repo.id, prNumber, f.key);
       if (now?.status !== 'verified' || now.threadKey !== now.key || now.commentId !== f.commentId) continue;

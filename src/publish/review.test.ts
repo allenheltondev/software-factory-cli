@@ -25,7 +25,7 @@ import { postFailureComment } from './failure-comment.js';
 import { evaluateAutoMerges, mergeBlockedMarker, MERGE_RECHECK_MS, outstandingChangeRequests, postMergeNotices } from './merge.js';
 import { publishRun, type PublishDeps } from './publish.js';
 import { createReviewLoopPublisher, postReview, reviewMarker } from './review.js';
-import { findingsOfRun, getFinding, recordCheck, recordResolution } from '../db/review-findings.js';
+import { findingsOfRun, getFinding, recordCheck, recordResolution, verifiedUnresolvedThreads } from '../db/review-findings.js';
 import { renderReviewPrompt } from '../agents/review-prompt.js';
 import { answerFindings, findingMarker } from './threads.js';
 import { resolveVerifiedThreadsAll } from './thread-resolve.js';
@@ -1233,7 +1233,7 @@ describe('verified threads end resolved (#190)', () => {
    * The #185 shape, as a GitHub App: round 1's suggestion F1 has an inline thread; a revision
    * fixes it at H2 and replies in the thread; round 2 verifies it on H2.
    */
-  const shape185 = async (o: { failResolve?: GitHubError } = {}) => {
+  const shape185 = async (o: { failResolve?: GitHubError; appClient?: boolean } = {}) => {
     const s = setup();
     s.gh.login = 'updraft-bot[bot]';
     s.gh.files = [{ path: 'src/a.ts', status: 'modified', patch: PATCH }];
@@ -1259,12 +1259,19 @@ describe('verified threads end resolved (#190)', () => {
       },
     );
     if (o.failResolve) s.gh.failAlways.resolveReviewThread = o.failResolve;
+    if (o.appClient) {
+      // Round 2 reads and resolves threads, and knows its own login, through the real client as a GitHub App.
+      const app = await appClientOver(s.gh, 'updraft-bot');
+      const real = { getWorkerIdentity: app.getWorkerIdentity, listReviewThreads: app.listReviewThreads, resolveReviewThread: app.resolveReviewThread };
+      s.deps.api = new Proxy(s.api, { get: (target, prop) => (prop in real ? real[prop as keyof typeof real] : Reflect.get(target, prop)) as unknown });
+    }
     // Round 2 verifies it on H2, with a run log to read.
     const [job2] = s.schedule();
     const round2 = s.reviewed(job2!, 'ready-to-merge', structuredFindings({ findings: [], checks: [{ finding: f1.key, status: 'verified', note: 'The window is validated first.' }] }));
     const logPath = join(s.paths.dataDir, 'round2.log');
     s.db.prepare('UPDATE runs SET log_path = ? WHERE id = ?').run(logPath, round2);
-    expect(await postReview(s.deps, round2)).toMatchObject({ status: 'published' });
+    const posted = await postReview(s.deps, round2);
+    expect(posted, JSON.stringify(posted)).toMatchObject({ status: 'published' });
     const replies = s.gh.thread(f1.commentId!).map((c) => c.body);
     expect(replies[0]).toContain('**Coding agent:** Fixed in');
     expect(replies[1]).toContain(`**Review agent · Round 2:** I verified this on \`${H2.slice(0, 12)}\`.`);
@@ -1318,6 +1325,53 @@ describe('verified threads end resolved (#190)', () => {
     const api = { ...s.api, getPullRequest: s.api.getPullRequest, listReviewThreads: undefined, resolveReviewThread: undefined };
     await resolveVerifiedThreadsAll({ ...s.deps, api, log });
     expect(log.lines).toEqual([expect.stringMatching(new RegExp(`^warn threads: ${f1.key.replace(/[#]/g, '\\$&')} verified, not resolved yet: this GitHub client cannot list or resolve review threads`))]);
+  });
+
+  it("resolves in round 2's own step through the real GitHub client as a GitHub App", async () => {
+    const { s, f1 } = await shape185({ appClient: true });
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(true);
+    // Round 2 read the threads through the real client's GraphQL, not the in-memory listing.
+    expect(s.gh.calls).not.toContain('listReviewThreads');
+    expect(getFinding(s.db, REPO_ID, PR, f1.key)).toMatchObject({ status: 'verified', statusSha: H2, threadResolvedAt: expect.any(String) });
+    // Nothing is left for the poll.
+    expect(await resolveVerifiedThreadsAll(s.deps)).toEqual([]);
+  });
+
+  it('backs off a thread that is not among the pull request\'s threads, and says when', async () => {
+    const { s, f1 } = await shape185({ failResolve: new GitHubError('POST /graphql failed: FORBIDDEN', 403) });
+    delete s.gh.failAlways.resolveReviewThread;
+    // Its root is gone from GitHub's threads.
+    const root = s.gh.reviewComments.find((c) => c.id === f1.commentId)!;
+    s.gh.reviewComments.splice(s.gh.reviewComments.indexOf(root), 1);
+    const log = recordingLog();
+    const deps = { ...s.deps, log };
+    await resolveVerifiedThreadsAll(deps);
+    expect(log.lines).toEqual([expect.stringMatching(/^warn threads: .* not among the pull request's threads .*; tried again in 5 minutes$/)]);
+    // The next polls inside the wait read nothing and say nothing more.
+    s.gh.calls.length = 0;
+    s.tick(60_000);
+    expect(await resolveVerifiedThreadsAll(deps)).toEqual([{ repoId: REPO_ID, prNumber: PR, resolved: [], left: [] }]);
+    expect(s.gh.calls).toEqual([]);
+    expect(log.lines).toHaveLength(1);
+    // After it, tried again, with a longer wait while still missing.
+    s.tick(5 * 60_000);
+    await resolveVerifiedThreadsAll(deps);
+    expect(log.lines.at(-1)).toMatch(/tried again in 10 minutes$/);
+    // Back on GitHub: resolved once the wait is over.
+    s.gh.reviewComments.push(root);
+    s.tick(10 * 60_000);
+    const [result] = await resolveVerifiedThreadsAll(deps);
+    expect(result).toMatchObject({ resolved: [f1.key], left: [] });
+    expect(s.gh.resolved.has(f1.commentId!)).toBe(true);
+  });
+
+  it("takes at most a few threads of one pull request per poll, so one pull request's threads never crowd out another's", async () => {
+    const { s, f1 } = await shape185({ failResolve: new GitHubError('POST /graphql failed: FORBIDDEN', 403) });
+    const cols = (s.db.prepare('PRAGMA table_info(review_findings)').all() as { name: string }[]).map((c) => c.name);
+    const picked = cols.map((c) => (c === 'finding_key' || c === 'thread_key' ? '? || ' + c : c)).join(', ');
+    for (const n of [2, 3]) s.db.prepare(`INSERT INTO review_findings (${cols.join(', ')}) SELECT ${picked} FROM review_findings WHERE repo_id = ? AND pr_number = ? AND finding_key = ?`).run(...cols.flatMap((c) => (c === 'finding_key' || c === 'thread_key' ? [`x${n}`] : [])), REPO_ID, PR, f1.key);
+    expect(verifiedUnresolvedThreads(s.db, REPO_ID)).toHaveLength(3);
+    expect(verifiedUnresolvedThreads(s.db, REPO_ID, 200, 2).map((f) => f.key)).toEqual([f1.key, `x2${f1.key}`]);
   });
 
   it('resolves through the real GitHub client, which names the App without "[bot]" in GraphQL', async () => {
