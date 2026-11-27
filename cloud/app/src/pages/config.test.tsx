@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import { AuthProvider, configureAuth } from '@readysetcloud/ui/auth';
 import userEvent from '@testing-library/user-event';
 import axe from 'axe-core';
@@ -11,6 +11,7 @@ import { ConfigHistoryPage, diffFiles } from './ConfigHistoryPage';
 import { ConfigPage, issuesAt, parseLogins } from './ConfigPage';
 import { InstallationPage } from './InstallationPage';
 import { keysNeeded, workflowConflict } from './config/model';
+import { tipPlacement } from './config/Simple';
 // The settings the server's round-trip and compile tests use (server/src/tenants/config-service.test.ts).
 import fixture from '../../../server/src/tenants/fixtures/console-samples.json';
 
@@ -1412,27 +1413,59 @@ describe('feedback and emphasis on the configuration page', () => {
     expect(screen.queryByTestId('publish-next')).toBeNull();
   });
 
-  it('opens a tile\'s tooltip towards the side that keeps it on a phone\'s screen', async () => {
-    viewport(375);
+  it('keeps a tile\'s tooltip inside the window, wherever its icon is, and follows a resize while open', async () => {
+    const width = window.innerWidth;
     try {
-      configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
-      const button = await within(await screen.findByTestId('coding-kiro')).findByRole('button', { name: 'Why Kiro cannot be used' });
-      const tip = document.getElementById(button.getAttribute('aria-describedby')!)!;
-      const at = (left: number) => vi.spyOn(button.parentElement!, 'getBoundingClientRect').mockReturnValue({ left, right: left + 32, top: 0, bottom: 32, width: 32, height: 32, x: left, y: 0, toJSON: () => ({}) } as DOMRect);
-      // A right-column tile: a 240px tip from x=300 would end near x=540, so it opens leftwards.
-      at(300);
-      await userEvent.hover(button);
-      expect(tip).toHaveAttribute('data-side', 'right');
-      expect(tip).toHaveClass('right-0');
-      await userEvent.unhover(button);
-      // A left-column tile has room to its right.
-      at(40);
-      await userEvent.hover(button);
-      expect(tip).toHaveAttribute('data-side', 'left');
-      expect(tip).toHaveClass('left-0');
+      for (const vw of [375, 320]) {
+        viewport(vw);
+        const { unmount } = configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
+        const button = await within(await screen.findByTestId('coding-kiro')).findByRole('button', { name: 'Why Kiro cannot be used' });
+        const tip = document.getElementById(button.getAttribute('aria-describedby')!)!;
+        const spy = vi.spyOn(button.parentElement!, 'getBoundingClientRect');
+        const at = (left: number) => spy.mockReturnValue({ left, right: left + 32, top: 0, bottom: 32, width: 32, height: 32, x: left, y: 0, toJSON: () => ({}) } as DOMRect);
+        /** Where the tip is in the window: its offset is from the icon's left edge. */
+        const span = (iconLeft: number) => {
+          const left = iconLeft + parseFloat(tip.style.left);
+          return [left, left + parseFloat(tip.style.width)] as const;
+        };
+        // A left-column icon (x=140 at 375px), a right-column one (x=320), and the edges.
+        for (const x of vw === 375 ? [140, 320, 40, 8, 340] : [120, 270, 8]) {
+          at(x);
+          await userEvent.hover(button);
+          const [left, right] = span(x);
+          expect(left, `${vw}px, icon at ${x}`).toBeGreaterThanOrEqual(8);
+          expect(right, `${vw}px, icon at ${x}`).toBeLessThanOrEqual(vw - 8);
+          expect(parseFloat(tip.style.width)).toBe(Math.min(240, vw - 16));
+          await userEvent.unhover(button);
+        }
+        // Open, then the window turns narrower: the tip is placed again.
+        at(140);
+        await userEvent.hover(button);
+        viewport(300);
+        at(120);
+        act(() => {
+          window.dispatchEvent(new Event('resize'));
+        });
+        const [left, right] = span(120);
+        expect(left).toBeGreaterThanOrEqual(8);
+        expect(right).toBeLessThanOrEqual(292);
+        await userEvent.unhover(button);
+        unmount();
+      }
     } finally {
+      viewport(width);
       viewport(1024);
     }
+  });
+
+  it('places a tooltip from its icon: at the icon when it fits, else moved just enough to stay 8px inside', () => {
+    expect(tipPlacement({ left: 40 }, 375)).toEqual({ left: 0, width: 240 });
+    // Left column at 375px: the tip would end at 380, so it moves 13px left, not to the icon's right edge.
+    expect(tipPlacement({ left: 140 }, 375)).toEqual({ left: -13, width: 240 });
+    expect(tipPlacement({ left: 320 }, 375)).toEqual({ left: -193, width: 240 });
+    expect(tipPlacement({ left: 2 }, 375)).toEqual({ left: 6, width: 240 });
+    // A narrow window: the tip is as wide as the window less 1rem, from 8px.
+    expect(tipPlacement({ left: 200 }, 240)).toEqual({ left: -192, width: 224 });
   });
 
   it('a chosen agent that is not connected says so on its tile, as its card does', async () => {

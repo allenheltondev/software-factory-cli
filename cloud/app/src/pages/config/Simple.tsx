@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode, type SyntheticEvent } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
 import { Button, Card, CardBody, CardDescription, CardHeader, EmptyState, Input, ProgressIndicator, Select, StatusBadge } from '@readysetcloud/ui';
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepository, ConsoleWorkflow } from '../../api/client';
@@ -178,29 +178,36 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
   const agentBox = (a: AgentAdapter, on: boolean, onToggle: (v: boolean) => void, name?: string) => {
     const c = connection(a);
     const ok = eligible(c);
+    // A chosen agent that cannot run says so on its tile, as its card does.
+    const note = !on || ok ? null : c === 'failing' ? 'Key failed: reconnect it' : c === 'missing' ? 'Not connected: connect it, or untick it' : 'Not available: untick it';
+    const tip = !ok && (
+      <InfoTip
+        label={`Why ${AGENT_LABEL[a]} cannot be used`}
+        text={
+          c === 'unavailable'
+            ? `Updraft Cloud no longer runs ${AGENT_LABEL[a]}.${on ? ' Untick it.' : ''}`
+            : on
+              ? `${AGENT_LABEL[a]}'s ${AGENT_GUIDES[a].credential} was removed. Connect it again, or untick ${AGENT_LABEL[a]}. Click to connect.`
+              : `Connect ${AGENT_LABEL[a]} with your ${AGENT_GUIDES[a].credential} to use it. Click to connect.`
+        }
+        hidden={connecting === a}
+        onClick={c !== 'unavailable' ? () => setConnecting(connecting === a ? null : a) : undefined}
+      />
+    );
     return (
       <div className={`flex min-h-11 flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md border px-3 py-1.5 transition-colors ${on ? 'border-primary-500 bg-primary-500/10' : 'border-border'}`}>
         <Check checked={on} disabled={!ok && !on} onChange={onToggle} className="min-h-8 min-w-0 flex-1 cursor-pointer">
           <span className="font-medium">{name ?? AGENT_LABEL[a]}</span>
         </Check>
-        {!ok && (
-          <InfoTip
-            label={`Why ${AGENT_LABEL[a]} cannot be used`}
-            text={
-              c === 'unavailable'
-                ? `Updraft Cloud no longer runs ${AGENT_LABEL[a]}.${on ? ' Untick it.' : ''}`
-                : on
-                  ? `${AGENT_LABEL[a]}'s ${AGENT_GUIDES[a].credential} was removed. Connect it again, or untick ${AGENT_LABEL[a]}. Click to connect.`
-                  : `Connect ${AGENT_LABEL[a]} with your ${AGENT_GUIDES[a].credential} to use it. Click to connect.`
-            }
-            hidden={connecting === a}
-            onClick={c !== 'unavailable' ? () => setConnecting(connecting === a ? null : a) : undefined}
-          />
+        {/* With a note, the info icon goes on the note's line, leaving the name its row. */}
+        {note ? (
+          <span className="flex basis-full items-center justify-between gap-1 text-xs text-error">
+            {note}
+            {tip}
+          </span>
+        ) : (
+          tip
         )}
-        {/* A chosen agent that cannot run says so on its tile, as its card does. */}
-        {c === 'failing' && on && <span className="basis-full pb-1 text-xs text-error">Key failed: reconnect it</span>}
-        {c === 'missing' && on && <span className="basis-full pb-1 text-xs text-error">Not connected: connect it, or untick it</span>}
-        {c === 'unavailable' && on && <span className="basis-full pb-1 text-xs text-error">Not available: untick it</span>}
       </div>
     );
   };
@@ -311,7 +318,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                   <div className="flex min-h-8 items-center justify-between gap-2">
                     <h3 className="min-w-0 font-semibold leading-snug">{AGENT_LABEL[a]}</h3>
                     <span className="flex shrink-0 items-center gap-0.5">
-                      {c === 'unverified' && <InfoTip label={`About ${AGENT_LABEL[a]} keys`} text={`${provider?.company ?? AGENT_LABEL[a]} has no way to check a key ahead of time, so the first job that uses it is the check.`} align="right" />}
+                      {c === 'unverified' && <InfoTip label={`About ${AGENT_LABEL[a]} keys`} text={`${provider?.company ?? AGENT_LABEL[a]} has no way to check a key ahead of time, so the first job that uses it is the check.`} />}
                       <StatusBadge tone={badge.tone} className="whitespace-nowrap">
                         {badge.text}
                       </StatusBadge>
@@ -872,22 +879,57 @@ function AltPlan({ to, name, status, testId }: { to: string; name: string; statu
   );
 }
 
+/** The tooltip's widest (15rem) and how close it may come to either edge of the window. */
+const TIP_WIDTH = 240;
+const TIP_MARGIN = 8;
+
+/**
+ * Where a tooltip goes, for an icon at `left`..`right` in a window `viewport` wide: as wide as
+ * min(15rem, 100vw - 1rem), starting at the icon, and moved along so that it stays at least 8px
+ * inside both edges. `left` is its offset from the icon's left edge (the tip's containing box).
+ */
+export function tipPlacement(icon: { left: number }, viewport: number): { left: number; width: number } {
+  const width = Math.min(TIP_WIDTH, viewport - 2 * TIP_MARGIN);
+  const start = Math.min(Math.max(icon.left, TIP_MARGIN), viewport - TIP_MARGIN - width);
+  return { left: start - icon.left, width };
+}
+
 /**
  * An info icon with a tooltip, shown on hover and on focus (so a tap shows it too); clicking it may
- * act. The tip takes no room until it shows, so it never widens a phone's page, and by default it
- * opens towards whichever side keeps it on screen.
+ * act. The tip takes no room until it shows, so it never widens a phone's page, and it is placed
+ * from the icon's position, when it opens and whenever the window changes while it is open, so it
+ * always stays on screen.
  */
-function InfoTip({ label, text, onClick, hidden, align = 'auto' }: { label: string; text: string; onClick?: () => void; hidden?: boolean; align?: 'auto' | 'left' | 'right' }) {
+function InfoTip({ label, text, onClick, hidden }: { label: string; text: string; onClick?: () => void; hidden?: boolean }) {
   const id = useId();
-  const [side, setSide] = useState<'left' | 'right'>(align === 'right' ? 'right' : 'left');
-  /** Where the icon is now: a tip that would run past the right edge opens leftwards instead. */
-  const place = (e: SyntheticEvent<HTMLElement>) => {
-    if (align !== 'auto') return;
-    const box = e.currentTarget.getBoundingClientRect();
-    setSide(box.left + TIP_WIDTH > window.innerWidth - 8 ? 'right' : 'left');
+  const anchor = useRef<HTMLSpanElement>(null);
+  const [open, setOpen] = useState(false);
+  const [place, setPlace] = useState<{ left: number; width: number } | null>(null);
+  const measure = useCallback(() => {
+    if (anchor.current) setPlace(tipPlacement(anchor.current.getBoundingClientRect(), window.innerWidth));
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    window.addEventListener('resize', measure);
+    window.addEventListener('orientationchange', measure);
+    return () => {
+      window.removeEventListener('resize', measure);
+      window.removeEventListener('orientationchange', measure);
+    };
+  }, [open, measure]);
+  const show = () => {
+    measure();
+    setOpen(true);
   };
   return (
-    <span className="group relative inline-flex" onMouseEnter={place} onFocus={place}>
+    <span
+      ref={anchor}
+      className="group relative inline-flex shrink-0"
+      onMouseEnter={show}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={show}
+      onBlur={() => setOpen(false)}
+    >
       <button type="button" aria-label={label} aria-describedby={id} onClick={onClick} className="inline-flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500">
         <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className="h-4 w-4">
           <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.25v3.25a.75.75 0 0 0 1.5 0V9.75A.75.75 0 0 0 10 9H9Z" clipRule="evenodd" />
@@ -896,14 +938,11 @@ function InfoTip({ label, text, onClick, hidden, align = 'auto' }: { label: stri
       <span
         role="tooltip"
         id={id}
-        data-side={side}
-        className={`pointer-events-none absolute bottom-full z-20 mb-2 w-60 max-w-[calc(100vw-3rem)] rounded-md ${side === 'right' ? 'right-0' : 'left-0'} hidden bg-foreground px-3 py-2 text-xs leading-snug text-background shadow-lg ${hidden ? '' : 'group-hover:block group-focus-within:block'}`}
+        style={place ? { left: place.left, width: place.width } : undefined}
+        className={`pointer-events-none absolute bottom-full left-0 z-20 mb-2 w-[min(15rem,calc(100vw-1rem))] rounded-md hidden bg-foreground px-3 py-2 text-xs font-normal leading-snug text-background shadow-lg ${hidden ? '' : 'group-hover:block group-focus-within:block'}`}
       >
         {text}
       </span>
     </span>
   );
 }
-
-/** The tooltip's width (w-60), for choosing its side. */
-const TIP_WIDTH = 240;
