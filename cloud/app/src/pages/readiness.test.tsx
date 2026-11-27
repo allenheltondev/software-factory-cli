@@ -123,4 +123,25 @@ describe('repository readiness in the console (#137)', () => {
     expect(within(all).getByTestId('check-kill-switch')).toHaveTextContent('Paused');
     expect(screen.getByTestId('readiness-acme/web').querySelector('summary')).toHaveTextContent('Paused');
   });
+
+  it('shows the Codex subscription check under its own name, with its fix on the ChatGPT page (#200)', async () => {
+    show(vi.fn().mockResolvedValue(report({
+      repositories: [{
+        repository: 'acme/web', repositoryId: 9, status: 'action_needed',
+        checks: [
+          c('subscription', { stage: 'subscription', summary: 'The Claude subscription worker is connected and signed in.' }),
+          c('codex-subscription', { stage: 'subscription', provider: 'codex', state: 'failing', problem: 'missing_credentials',
+            summary: 'The Codex subscription sign-in has expired: jobs wait until an owner signs in with ChatGPT again.', fix: { text: 'Sign in with ChatGPT', target: 'codex' } }),
+        ],
+      }],
+    })));
+    const web = await screen.findByTestId('readiness-acme/web');
+    const codex = within(web).getByTestId('check-codex-subscription');
+    expect(codex).toHaveTextContent('Codex subscription');
+    expect(codex).not.toHaveTextContent('Claude');
+    expect(codex).toHaveTextContent('Failing');
+    expect(within(codex).getByRole('link', { name: 'Sign in with ChatGPT' })).toHaveAttribute('href', '/installations/55/codex');
+    // Claude's check keeps its heading.
+    expect(within(web).getByTestId('check-subscription')).toHaveTextContent('Claude subscription');
+  });
 });

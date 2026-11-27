@@ -31,6 +31,9 @@ const STAGE: Record<ReadinessCheck['stage'], string> = {
   review: 'Review', ci: 'CI repair', capacity: 'Capacity', pauses: 'Pauses', telemetry: 'Telemetry', egress: 'Network', execution: 'Last run',
 };
 
+/** A check's heading: a subscription check names its provider (Claude's when none is given). */
+const stageOf = (c: ReadinessCheck) => c.stage === 'subscription' && c.provider === 'codex' ? 'Codex subscription' : STAGE[c.stage];
+
 function stateOf(c: ReadinessCheck): { label: string; tone: Tone } {
   if (c.state === 'failing' && (c.problem === 'transient' || c.problem === 'paused' || c.problem === 'provider')) return { label: c.problem === 'paused' ? 'Paused' : 'Waiting', tone: 'warning' };
   if (c.state === 'failing' && !c.required) return { label: 'Optional', tone: 'warning' };
@@ -61,7 +64,7 @@ function CheckList({ checks, base, tenant, lastJob, label }: { checks: Readiness
           <li key={c.id} className="flex min-w-0 flex-col gap-1 py-2" data-testid={`check-${c.id}`}>
             <div className="flex min-w-0 flex-wrap items-center gap-2">
               <StatusBadge tone={s.tone}>{s.label}</StatusBadge>
-              <span className="text-sm font-medium">{STAGE[c.stage]}</span>
+              <span className="text-sm font-medium">{stageOf(c)}</span>
               {!c.required && <span className="text-sm text-muted-foreground">optional</span>}
             </div>
             <p className="min-w-0 break-words text-sm">{c.summary}</p>

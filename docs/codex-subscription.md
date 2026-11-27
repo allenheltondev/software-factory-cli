@@ -333,8 +333,10 @@ MCP server, before any thread, model or network call; that exact outcome passes,
 (above all `unknown configuration field`) fails the image build. So a feature key a new pin no
 longer knows can never ship.
 
-Still to do: a separate credential UID per CLI, the readiness checklist's Codex entry, and a
-connected-account page shared with Claude's (#123).
+The readiness checklist reports Codex's session as its own check (`codex-subscription`, #200).
+
+Still to do: a separate credential UID per CLI, and a connected-account page shared with
+Claude's (#123).
 
 ## Verify live, with a real ChatGPT account
 

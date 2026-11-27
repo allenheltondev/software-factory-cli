@@ -30,7 +30,7 @@ import { managedWorkerId } from './native/provider.js';
 import { browserLoginGrant } from './native/browser-login.js';
 import { legacyNativeTriggers, nativeRoute } from './native/route.js';
 import { createKillSwitch, KILL_SWITCH_PARAMETER } from './jobs/kill-switch.js';
-import { createReadinessService } from './tenants/readiness-service.js';
+import { createReadinessService, nativeBindingOf } from './tenants/readiness-service.js';
 import { createNativeModeStore, createNativeStore } from './native/store.js';
 import { createNativeSettingsService } from './native/settings.js';
 import { createRegistryPolicyService } from './native/registries.js';
@@ -220,10 +220,10 @@ const app = createApp({
           native: async (id) => {
             // The binding dispatch would use: the pinned route for its installation, else the managed session.
             const binding = native?.launch?.route.installationId === id ? native.launch : await native?.resolveNative?.(id);
-            if (!binding) return undefined;
-            const mode = await binding.mode();
-            return { enabled: mode.enabled, explicitTriggers: mode.triggers !== undefined, triggers: mode.triggers ?? legacyNativeTriggers(binding.route), readiness: binding.readiness };
+            return binding ? nativeBindingOf(binding) : undefined;
           },
+          // Codex on a ChatGPT plan (#196): the binding dispatch resolves (resolveCodex), read the same way.
+          ...(native?.resolveCodex ? { codex: async (id: number) => nativeBindingOf(await native.resolveCodex!(id), 'codex') } : {}),
         }),
         // Insights: the tenant's shared state database, read only (tenants/*/state/state.db).
         telemetry: createTelemetryService({ store, github, secrets: createSecretsManagerPort(), check: checkHoneycombKey() }),

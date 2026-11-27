@@ -2,10 +2,11 @@ import type { Caller } from '../caller.js';
 import type { GitHubFlows } from '../flows/github.js';
 import type { GitHubInstallation, GitHubRepository } from '../github/client.js';
 import type { KillSwitch, KillSwitchState } from '../jobs/kill-switch.js';
-import { readinessAction, type NativeReadiness } from '../jobs/launch.js';
+import { readinessAction, type NativeLaunch, type NativeReadiness } from '../jobs/launch.js';
 import { dayOf, monthOf, tenantQuotas } from '../jobs/quotas.js';
 import { jobResult, type JobResult } from '../jobs/status.js';
-import { sameNativeTrigger, type NativeTrigger } from '../native/route.js';
+import type { NativeProvider } from '../native/provider.js';
+import { legacyNativeTriggers, sameNativeTrigger, type NativeTrigger } from '../native/route.js';
 import { isWaiting, type QueueEntry, type QueueStore } from '../jobs/queue-store.js';
 import type { ConfigVersion, DispatchRules, HeldPause, JobSummary, Quotas, Store, Tenant, TelemetrySettings, Usage } from '../store/store.js';
 import type { AgentKeyService, AgentKeyView } from './agent-key-service.js';
@@ -29,8 +30,8 @@ import { missingPermissions } from './status-service.js';
  * they are `required: false`, and `off` when they are simply not in use.
  *
  * Only cheap, bounded reads: the tenant's records, GitHub's installation and repository list, the
- * kill switch and image parameters, and the subscription worker's heartbeat (a VM state read at
- * most). Nothing here starts a worker, calls a model, or writes anything. Readiness is advisory:
+ * kill switch and image parameters, and the subscription workers' heartbeats (Claude's and
+ * Codex's, each only when a trigger runs on it; a VM state read at most). Nothing here starts a worker, calls a model, or writes anything. Readiness is advisory:
  * the launcher decides again with current state at dispatch, and before every privileged step.
  */
 
@@ -55,8 +56,8 @@ export type CheckProblem =
 export type Unverified = 'read_failed' | 'not_checked' | 'needs_run';
 export type ReadinessStage = 'installation' | 'config' | 'github' | 'credentials' | 'subscription' | 'review' | 'ci' | 'capacity' | 'pauses' | 'telemetry' | 'egress' | 'execution';
 /** Where a fix is made: a console page of the installation, or its settings on GitHub. */
-/** `job`: the repository's `lastJob`. */
-export type FixTarget = 'config' | 'keys' | 'claude' | 'telemetry' | 'workflows' | 'job' | 'github';
+/** `job`: the repository's `lastJob`. `claude`, `codex`: the page of that subscription (Codex's is the ChatGPT page). */
+export type FixTarget = 'config' | 'keys' | 'claude' | 'codex' | 'telemetry' | 'workflows' | 'job' | 'github';
 
 export interface ReadinessCheck {
   id: string;
@@ -68,6 +69,8 @@ export interface ReadinessCheck {
   unverified?: Unverified;
   summary: string;
   fix?: { text: string; target: FixTarget };
+  /** A subscription check's provider when it is not Claude's (absent: Claude, as before). */
+  provider?: 'codex';
 }
 
 export type RepositoryStatus = 'ready' | 'action_needed' | 'temporarily_unavailable' | 'paused' | 'unknown' | 'not_configured';
@@ -101,6 +104,31 @@ export interface NativeBinding {
   /** The owner chose triggers (mode.triggers): then only triggers that need the Anthropic key are routed. */
   explicitTriggers: boolean;
   readiness(): Promise<NativeReadiness>;
+  /**
+   * Codex's route on an image that cannot run Codex (NativeLaunch.unavailable, #196): dispatch
+   * still routes its triggers there and refuses them, never asking the worker's readiness.
+   */
+  unavailable?: string;
+  /** The worker's image version, named when it cannot run this provider. */
+  image?: string;
+}
+
+/**
+ * A subscription binding exactly as the launcher reads it (jobs/launch.ts): the same mode, the same
+ * enabled fallback and the same triggers. Claude's falls back to the pinned route's legacy triggers
+ * and is on unless it says otherwise; Codex's has only the triggers its owner chose, and is off
+ * unless it says it is on.
+ */
+export async function nativeBindingOf(launch: NativeLaunch, provider: NativeProvider = 'claude'): Promise<NativeBinding> {
+  const mode = await launch.mode?.();
+  const enabled = mode?.enabled ?? await launch.enabled?.() ?? provider === 'claude';
+  const triggers = mode?.triggers ?? (provider === 'claude' ? legacyNativeTriggers(launch.route) : []);
+  return {
+    enabled, triggers, explicitTriggers: provider === 'codex' || mode?.triggers !== undefined,
+    // A worker that reports no reason keeps dispatch's meaning of not ready: sign-in.
+    readiness: launch.readiness ? () => launch.readiness!() : async () => (launch.ready ? (await launch.ready()) ? 'ready' : 'auth-required' : 'ready'),
+    ...(launch.unavailable ? { unavailable: launch.unavailable, image: launch.route.imageVersion } : {}),
+  };
 }
 
 export interface ReadinessServiceDeps {
@@ -113,6 +141,8 @@ export interface ReadinessServiceDeps {
   /** The published job image version; null while jobs are off. Absent: not checked here. */
   imageVersion?: () => Promise<string | null>;
   native?: (installationId: number) => Promise<NativeBinding | undefined>;
+  /** The installation's Codex session (ChatGPT plan, #196), as dispatch sees it (`resolveCodex`). Absent: none deployed. */
+  codex?: (installationId: number) => Promise<NativeBinding | undefined>;
   /** The admission queue (jobs/queue-store.ts), read only: what waits, for information. */
   queue?: Pick<QueueStore, 'list' | 'depth'>;
   now?: () => number;
@@ -182,27 +212,48 @@ export function combineStatus(checks: ReadinessCheck[]): Exclude<RepositoryStatu
   return 'ready';
 }
 
-/** The readiness of a subscription worker, as a check: what dispatch would do with a job now. */
-export function subscriptionCheck(readiness: NativeReadiness): ReadinessCheck {
-  const base = { id: 'subscription', stage: 'subscription' as const, required: true };
+const PROVIDER = {
+  claude: { name: 'Claude', id: 'subscription', signIn: 'Sign in to Claude', reconnect: 'Reconnect Claude', session: 'Claude subscription', who: 'an owner signs in' },
+  codex: { name: 'Codex', id: 'codex-subscription', signIn: 'Sign in with ChatGPT', reconnect: 'Reconnect ChatGPT', session: 'Codex subscription', who: 'an owner signs in with ChatGPT' },
+} as const;
+
+/**
+ * The readiness of a subscription worker, as a check: what dispatch would do with a job now.
+ * Claude's (the default) is as before; Codex's says Codex, and its fix is the ChatGPT page.
+ */
+export function subscriptionCheck(readiness: NativeReadiness, provider: NativeProvider = 'claude'): ReadinessCheck {
+  const p = PROVIDER[provider];
+  const target: FixTarget = provider;
+  const base = { id: p.id, stage: 'subscription' as const, required: true, ...(provider === 'codex' ? { provider } : {}) };
   const action = readinessAction(readiness);
-  if (action === 'none') return { ...base, state: 'verified', summary: 'The Claude subscription worker is connected and signed in.' };
+  if (action === 'none') return { ...base, state: 'verified', summary: provider === 'codex' ? 'The Codex subscription worker is connected and signed in with ChatGPT.' : 'The Claude subscription worker is connected and signed in.' };
   if (action === 'sign-in') {
     return { ...base, state: 'failing', problem: 'missing_credentials',
-      summary: readiness === 'expired' ? 'The Claude subscription sign-in has expired: jobs wait until an owner signs in again.'
-        : readiness === 'not-connected' ? 'No Claude subscription session is connected: jobs wait until an owner signs in.'
-          : 'The Claude subscription worker needs sign-in: jobs wait until an owner signs in.',
-      fix: { text: 'Sign in to Claude', target: 'claude' } };
+      summary: readiness === 'expired' ? `The ${p.session} sign-in has expired: jobs wait until ${provider === 'codex' ? 'an owner signs in with ChatGPT again' : 'an owner signs in again'}.`
+        : readiness === 'not-connected' ? `No ${p.session} session is connected: jobs wait until ${p.who}.`
+          : `The ${p.name} subscription worker needs sign-in: jobs wait until ${p.who}.`,
+      fix: { text: p.signIn, target } };
   }
   if (action === 'reconnect') {
     const image = readiness.startsWith('image-') || readiness === 'protocol-incompatible';
     return { ...base, state: 'failing', problem: 'reconnect',
-      summary: image ? `The Claude environment's image is not approved to run jobs (${readiness}): jobs wait for a reconnect onto a compatible image.`
-        : `The Claude environment can no longer run jobs (${readiness}): jobs wait for a reconnect.`,
-      fix: { text: 'Reconnect Claude', target: 'claude' } };
+      summary: image ? `The ${p.name} environment's image is not approved to run jobs (${readiness}): jobs wait for a reconnect onto a compatible image.`
+        : `The ${p.name} environment can no longer run jobs (${readiness}): jobs wait for a reconnect.`,
+      fix: { text: p.reconnect, target } };
   }
   return { ...base, state: 'failing', problem: 'transient',
-    summary: `The Claude environment is not taking jobs right now (${readiness}); a waiting job starts on its own once it is.` };
+    summary: `The ${p.name} environment is not taking jobs right now (${readiness}); a waiting job starts on its own once it is.` };
+}
+
+/**
+ * Codex routed on a worker image that cannot run Codex (#196): dispatch refuses these jobs, and
+ * never moves them to an API key. An operator publishes an image verified with Codex, or an owner
+ * takes the trigger off the ChatGPT plan.
+ */
+export function codexUnsupportedCheck(image: string | undefined): ReadinessCheck {
+  return { id: PROVIDER.codex.id, stage: 'subscription', required: true, provider: 'codex', state: 'failing', problem: 'provider',
+    summary: `This deployment's subscription worker image${image ? ` (${image})` : ''} does not support Codex yet, so Codex work on the ChatGPT plan is not started (and never moved to an API key).`,
+    fix: { text: 'Review Codex routing', target: 'codex' } };
 }
 
 interface InstallationFacts {
@@ -220,6 +271,9 @@ interface InstallationFacts {
   imageVersion: Read<string | null> | null;
   native: Read<NativeBinding | undefined> | null;
   nativeReadiness: Read<NativeReadiness> | null;
+  /** Codex's session (ChatGPT plan); absent or null: none deployed. */
+  codex?: Read<NativeBinding | undefined> | null;
+  codexReadiness?: Read<NativeReadiness> | null;
   quotas?: Quotas;
 }
 
@@ -271,7 +325,7 @@ export function installationChecks(f: InstallationFacts, jobImage: 'required' | 
   if (jobImage !== 'none') {
     if (f.imageVersion === null) out.push(unverifiedCheck('job-image', 'capacity', 'Whether a job image is published is not checked in this deployment.', 'not_checked'));
     else if (!f.imageVersion.ok) out.push(unverifiedCheck('job-image', 'capacity', 'Whether a job image is published could not be read just now.'));
-    else if (!f.imageVersion.value && jobImage === 'uncertain') out.push(unverifiedCheck('job-image', 'capacity', 'No job image is published; whether these workflows need one (rather than the Claude subscription) could not be read just now.'));
+    else if (!f.imageVersion.value && jobImage === 'uncertain') out.push(unverifiedCheck('job-image', 'capacity', `No job image is published; whether these workflows need one (rather than the ${unreadSubscriptions(f)} subscription) could not be read just now.`));
     else out.push(f.imageVersion.value
       ? check({ id: 'job-image', stage: 'capacity', required: true, state: 'verified', summary: `Jobs run on image ${f.imageVersion.value}.` })
       : check({ id: 'job-image', stage: 'capacity', required: true, state: 'failing', problem: 'provider', summary: 'No job image is published in this deployment yet, so jobs are off.' }));
@@ -280,6 +334,12 @@ export function installationChecks(f: InstallationFacts, jobImage: 'required' | 
   out.push(...capacityChecks(f));
   out.push(...telemetryChecks(f));
   return out;
+}
+
+/** The providers whose subscription routing could not be read: 'Claude', 'Codex' or 'Claude or Codex'. */
+function unreadSubscriptions(f: InstallationFacts): string {
+  const unread = [f.native && !f.native.ok ? 'Claude' : '', f.codex && !f.codex.ok ? 'Codex' : ''].filter(Boolean);
+  return unread.length ? unread.join(' or ') : 'Codex';
 }
 
 function capacityChecks(f: InstallationFacts): ReadinessCheck[] {
@@ -312,12 +372,26 @@ function telemetryChecks(f: InstallationFacts): ReadinessCheck[] {
 
 type Rule = DispatchRules['repositories'][string];
 
-/** Whether dispatch would route this trigger to the subscription worker (jobs/launch.ts `selected`). */
-function routedToSubscription(binding: NativeBinding | undefined, name: string, rule: Rule, t: Rule['triggers'][number]): boolean {
-  if (!binding?.enabled) return false;
-  const keys = t.keys ?? rule.keys;
-  if (binding.explicitTriggers && !keys?.includes('ANTHROPIC_API_KEY')) return false;
-  return binding.triggers.some((n) => sameNativeTrigger(n, { repositoryId: rule.id, repository: name, label: t.label }));
+/** The subscription bindings dispatch reads for an installation: Claude's, and Codex's (ChatGPT plan). */
+export interface SubscriptionBindings { claude?: NativeBinding | undefined; codex?: NativeBinding | undefined }
+
+const keysOf = (rule: Rule, t: Rule['triggers'][number]) => t.keys ?? rule.keys;
+
+/**
+ * Which subscription dispatch would route this trigger's issues to (jobs/launch.ts), or undefined
+ * for the API-key path. Claude's is decided first, exactly as before: its triggers, and with
+ * owner-chosen triggers only a workflow that needs the Anthropic key. Only when Claude does not
+ * take it may Codex's: a workflow that needs CODEX_API_KEY, on a trigger chosen on the ChatGPT
+ * page, with Codex routing on. A Codex route on an image that cannot run Codex still takes it
+ * (dispatch refuses it there, never moving it to an API key).
+ */
+export function routedToSubscription(bindings: SubscriptionBindings, name: string, rule: Rule, t: Rule['triggers'][number]): NativeProvider | undefined {
+  const at = { repositoryId: rule.id, repository: name, label: t.label };
+  const keys = keysOf(rule, t);
+  const { claude, codex } = bindings;
+  if (claude?.enabled && !(claude.explicitTriggers && !keys?.includes('ANTHROPIC_API_KEY')) && claude.triggers.some((n) => sameNativeTrigger(n, at))) return 'claude';
+  if (codex?.enabled && keys?.includes('CODEX_API_KEY') && codex.triggers.some((n) => sameNativeTrigger(n, at))) return 'codex';
+  return undefined;
 }
 
 interface RepositoryFacts {
@@ -331,6 +405,9 @@ interface RepositoryFacts {
   pauses: Read<HeldPause[]>;
   native: Read<NativeBinding | undefined> | null;
   nativeReadiness: Read<NativeReadiness> | null;
+  /** Codex's session (ChatGPT plan); absent or null: none deployed. */
+  codex?: Read<NativeBinding | undefined> | null;
+  codexReadiness?: Read<NativeReadiness> | null;
   /** null: this deployment has no admission queue to read. */
   queue?: Read<QueueRead> | null;
   now?: number;
@@ -357,21 +434,50 @@ export function repositoryChecks(f: RepositoryFacts): ReadinessCheck[] {
     : { id: 'triggers', stage: 'config', required: true, state: 'failing', problem: 'invalid_config', summary: 'No workflow trigger is published for this repository.', fix: { text: 'Add a workflow', target: 'config' } });
 
   // Agent keys, or the subscription, per trigger: what dispatch checks for the label it sees.
-  const binding = f.native?.ok ? f.native.value : undefined;
-  const routed = rule.triggers.filter((t) => routedToSubscription(binding, name, rule, t));
-  const unknownKeys = rule.triggers.some((t) => (t.keys ?? rule.keys) === undefined);
+  const bindings: SubscriptionBindings = { claude: f.native?.ok ? f.native.value : undefined, codex: f.codex?.ok ? f.codex.value : undefined };
+  const route = new Map(rule.triggers.map((t) => [t, routedToSubscription(bindings, name, rule, t)]));
+  const routed = rule.triggers.filter((t) => route.get(t) === 'claude');
+  const codexRouted = rule.triggers.filter((t) => route.get(t) === 'codex');
+  const claudeUnread = !!f.native && !f.native.ok;
+  const codexUnread = !!f.codex && !f.codex.ok;
+  // With Codex's routing unread, a trigger Claude does not take whose workflow needs CODEX_API_KEY
+  // may be Codex's: dispatch fails it, retryably, rather than run it on the key (jobs/launch.ts).
+  const codexMaybe = codexUnread ? rule.triggers.filter((t) => route.get(t) !== 'claude' && !!keysOf(rule, t)?.includes('CODEX_API_KEY')) : [];
+  const unknownKeys = rule.triggers.some((t) => keysOf(rule, t) === undefined);
+  // `needed`: every key a trigger here may need. `uncertain`: ones that may not be, because the
+  // routing that decides it could not be read: one of them not being set is unknown, not missing.
   const needed = new Set<string>();
+  const certain = new Set<string>();
   for (const t of rule.triggers) {
-    const viaSubscription = routed.includes(t);
-    for (const k of t.keys ?? rule.keys ?? []) if (!(viaSubscription && k === 'ANTHROPIC_API_KEY')) needed.add(k);
+    const r = route.get(t);
+    const keys = keysOf(rule, t) ?? [];
+    for (const k of keys) {
+      // A subscription job never needs its own provider's key; another agent's (a reviewer's) it does.
+      if (r === 'claude' && k === 'ANTHROPIC_API_KEY') continue;
+      if (r === 'codex' && k === 'CODEX_API_KEY' && !(claudeUnread && keys.includes('ANTHROPIC_API_KEY'))) continue;
+      needed.add(k);
+      const unsure = (k === 'ANTHROPIC_API_KEY' && claudeUnread) || (k === 'CODEX_API_KEY' && (r === 'codex' || codexMaybe.includes(t)));
+      if (!unsure) certain.add(k);
+    }
   }
-  if (f.native && !f.native.ok) out.push(unverifiedCheck('subscription', 'subscription', 'Whether Claude subscription routing applies here could not be read just now.'));
+  if (claudeUnread) out.push(unverifiedCheck('subscription', 'subscription', 'Whether Claude subscription routing applies here could not be read just now.'));
   else if (routed.length) {
     const labels = `${routed.map((t) => `"${t.label}"`).join(', ')} ${routed.length > 1 ? 'run' : 'runs'} on the Claude subscription.`;
     if (f.nativeReadiness?.ok) {
       const c = subscriptionCheck(f.nativeReadiness.value);
       out.push({ ...c, summary: `${c.summary} ${labels}` });
     } else out.push(unverifiedCheck('subscription', 'subscription', `The Claude subscription worker could not be read just now. ${labels}`));
+  }
+  // Codex on a ChatGPT plan: only where some trigger is (or, unread, may be) routed to it.
+  const codexId = PROVIDER.codex.id;
+  if (codexMaybe.length) {
+    out.push({ ...unverifiedCheck(codexId, 'subscription', `Whether Codex subscription routing (ChatGPT plan) applies here could not be read just now: ${codexMaybe.map((t) => `"${t.label}"`).join(', ')} may run on it. Until it can, dispatch retries these jobs rather than run them on CODEX_API_KEY.`), provider: 'codex' });
+  } else if (!codexUnread && codexRouted.length) {
+    const labels = `${codexRouted.map((t) => `"${t.label}"`).join(', ')} ${codexRouted.length > 1 ? 'run' : 'runs'} on the Codex subscription (ChatGPT plan).`;
+    const c = bindings.codex?.unavailable ? codexUnsupportedCheck(bindings.codex.image)
+      : f.codexReadiness?.ok ? subscriptionCheck(f.codexReadiness.value, 'codex') : undefined;
+    out.push(c ? { ...c, summary: `${c.summary} ${labels}` }
+      : { ...unverifiedCheck(codexId, 'subscription', `The Codex subscription worker could not be read just now. ${labels}`), provider: 'codex' });
   }
   if (unknownKeys) out.push(unverifiedCheck('agent-keys', 'credentials', 'This configuration was published before agent keys were recorded with it: publish it again so they can be checked.', 'not_checked'));
   if (!f.keys.ok) {
@@ -380,15 +486,15 @@ export function repositoryChecks(f: RepositoryFacts): ReadinessCheck[] {
     const offered = new Set<string>(Object.values(AGENT_KEY_ENV));
     const retired = [...needed].filter((k) => !offered.has(k));
     const byName = new Map(f.keys.value.map((k) => [k.name, k]));
-    // Subscription routing could not be read: a trigger that may run on the subscription needs no
-    // Anthropic key, so that key not being set is unknown here, not missing.
-    const routingUnread = f.native !== null && !f.native.ok;
+    // Subscription routing could not be read: a trigger that may run on a subscription needs no key
+    // of that provider, so that key not being set is unknown here, not missing.
     const unset = [...needed].filter((k) => offered.has(k) && !byName.get(k)?.configured);
-    const missing = unset.filter((k) => !(routingUnread && k === 'ANTHROPIC_API_KEY'));
+    const missing = unset.filter((k) => certain.has(k));
     const uncertain = unset.filter((k) => !missing.includes(k));
+    const instead = [...new Set(uncertain.map((k) => k === 'CODEX_API_KEY' ? 'Codex' : 'Claude'))].join(' or ');
     if (retired.length) out.push({ id: 'agent-retired', stage: 'credentials', required: true, state: 'failing', problem: 'invalid_config', summary: `A workflow here runs an agent this deployment no longer runs (it needs ${retired.join(', ')}): choose another agent.`, fix: { text: 'Change the workflow', target: 'config' } });
     if (missing.length) out.push({ id: 'agent-keys', stage: 'credentials', required: true, state: 'failing', problem: 'missing_credentials', summary: `${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} needed by this repository's workflows (coding or review) and not set.`, fix: { text: missing.length > 1 ? 'Add the keys' : 'Add the key', target: 'keys' } });
-    else if (uncertain.length) out.push(unverifiedCheck('agent-keys', 'credentials', 'ANTHROPIC_API_KEY is not set. Whether these workflows need it, or run on the Claude subscription instead, could not be read just now.'));
+    else if (uncertain.length) out.push(unverifiedCheck('agent-keys', 'credentials', `${uncertain.join(' and ')} ${uncertain.length > 1 ? 'are' : 'is'} not set. Whether these workflows need ${uncertain.length > 1 ? 'them' : 'it'}, or run on the ${instead} subscription instead, could not be read just now.`));
     else if (!retired.length && !unknownKeys) {
       // A key is checked with its provider when it is saved. A later job's failure is recorded on
       // it, but that job may have failed for any reason: it is said, never taken as a bad key.
@@ -501,7 +607,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
   async function assess(caller: Caller, installationId: number, tenant: Tenant): Promise<Omit<ReadinessReport, 'cached'>> {
     const at = now();
     const read = <T>(p: () => Promise<T>) => within(p, timeout);
-    const [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, queue] = await Promise.all([
+    const [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, codex, queue] = await Promise.all([
       read(() => d.github.installation(caller, installationId)),
       tenant.activeConfigVersion === undefined ? Promise.resolve(null) : read(() => d.store.getConfigVersion(installationId, tenant.activeConfigVersion!, { consistent: true })),
       tenant.status === 'active' ? read(() => d.github.repositories(caller, installationId).then((r): Listed => Object.assign([...r.repositories], r.truncated ? { truncated: true as const } : {}))) : Promise.resolve(null),
@@ -513,6 +619,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
       d.killSwitch ? read(async (): Promise<KillSwitchState> => d.killSwitch!.state ? d.killSwitch!.state() : (await d.killSwitch!.engaged()) ? 'on' : 'off') : Promise.resolve(null),
       d.imageVersion ? read(() => d.imageVersion!()) : Promise.resolve(null),
       d.native ? read(() => d.native!(installationId)) : Promise.resolve(null),
+      d.codex ? read(() => d.codex!(installationId)) : Promise.resolve(null),
       d.queue ? read(async (): Promise<QueueRead> => {
         // The waiting count first: nothing waits, nothing to list.
         const depth = await d.queue!.depth(installationId);
@@ -520,18 +627,27 @@ export function createReadinessService(d: ReadinessServiceDeps) {
       }) : Promise.resolve(null),
     ]);
     const rules = version?.ok ? version.value?.dispatch : undefined;
-    const binding = native?.ok ? native.value : undefined;
+    const bindings: SubscriptionBindings = { claude: native?.ok ? native.value : undefined, codex: codex?.ok ? codex.value : undefined };
     const names = Object.entries(rules?.repositories ?? {});
-    const anyRouted = names.some(([name, rule]) => rule.triggers.some((t) => routedToSubscription(binding, name, rule, t)));
-    // The worker's readiness is read once, and only when some trigger runs on the subscription.
-    const nativeReadiness = binding && anyRouted ? await read(() => binding.readiness()) : null;
-    const allRouted = names.length > 0 && names.every(([name, rule]) => rule.triggers.every((t) => routedToSubscription(binding, name, rule, t)));
-    const facts: InstallationFacts = { tenant, gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, nativeReadiness, ...(d.quotas ? { quotas: d.quotas } : {}) };
-    const installation = installationChecks(facts, native && !native.ok ? 'uncertain' : allRouted ? 'none' : 'required');
+    const routes = names.flatMap(([name, rule]) => rule.triggers.map((t) => ({ route: routedToSubscription(bindings, name, rule, t), codexKey: !!keysOf(rule, t)?.includes('CODEX_API_KEY') })));
+    // Each worker's readiness is read once, and only when some trigger runs on its subscription
+    // (never for a Codex route on an image that cannot run Codex: dispatch does not ask it either).
+    const claudeBinding = bindings.claude;
+    const codexBinding = bindings.codex;
+    const [nativeReadiness, codexReadiness] = await Promise.all([
+      claudeBinding && routes.some((r) => r.route === 'claude') ? read(() => claudeBinding.readiness()) : Promise.resolve(null),
+      codexBinding && !codexBinding.unavailable && routes.some((r) => r.route === 'codex') ? read(() => codexBinding.readiness()) : Promise.resolve(null),
+    ]);
+    const allRouted = names.length > 0 && routes.every((r) => r.route !== undefined);
+    // Codex's routing unread: a trigger that may be Codex's is not known to need the job image.
+    const codexUncertain = codex !== null && !codex.ok && routes.some((r) => r.route === undefined && r.codexKey)
+      && routes.every((r) => r.route !== undefined || r.codexKey);
+    const facts: InstallationFacts = { tenant, gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, nativeReadiness, codex, codexReadiness, ...(d.quotas ? { quotas: d.quotas } : {}) };
+    const installation = installationChecks(facts, (native && !native.ok) || codexUncertain ? 'uncertain' : allRouted ? 'none' : 'required');
     const listed = reachable?.ok ? reachable.value : [];
     const live = new Map(listed.map((r) => [r.fullName.toLowerCase(), r]));
     const repositories: RepositoryReadiness[] = names.map(([name, rule]) => {
-      const checks = repositoryChecks({ name, rule, loop: rules?.loop === true, live: live.get(name), reachable, gh, keys, pauses, native, nativeReadiness, queue, now: at });
+      const checks = repositoryChecks({ name, rule, loop: rules?.loop === true, live: live.get(name), reachable, gh, keys, pauses, native, nativeReadiness, codex, codexReadiness, queue, now: at });
       const last = lastJobOf(jobs, name);
       checks.push(executionCheck(last, tenant.activeConfigVersion, jobs.ok));
       return { repository: live.get(name)?.fullName ?? name, repositoryId: rule.id, status: combineStatus([...installation, ...checks]), checks, ...(last ? { lastJob: last } : {}) };
@@ -542,7 +658,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
     }
     const order: Record<RepositoryStatus, number> = { action_needed: 0, temporarily_unavailable: 1, unknown: 2, paused: 3, ready: 4, not_configured: 5 };
     repositories.sort((a, b) => order[a.status] - order[b.status] || a.repository.localeCompare(b.repository));
-    const unread = [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, nativeReadiness, queue].filter((r) => r && !r.ok).length;
+    const unread = [gh, version, reachable, keys, usage, jobs, pauses, telemetry, killSwitch, imageVersion, native, nativeReadiness, codex, codexReadiness, queue].filter((r) => r && !r.ok).length;
     if (unread) log({ installationId, readiness: 'partial', unread });
     return { checkedAt: new Date(at).toISOString(), configVersion: tenant.activeConfigVersion ?? null, installation, repositories, limitations: LIMITATIONS };
   }
@@ -554,7 +670,7 @@ export function createReadinessService(d: ReadinessServiceDeps) {
      * published configuration or the tenant's status changed since; `refresh` reads again unless
      * the last check is only seconds old.
      *
-     * Agent keys, the Claude session and workflow pauses change outside this service (and in other
+     * Agent keys, the Claude and Codex sessions and workflow pauses change outside this service (and in other
      * containers), so they are not part of the cache key: the console asks with `refresh` whenever
      * the page is opened, which the 10 s floor bounds, and a non-refresh read is at most a minute old.
      */
