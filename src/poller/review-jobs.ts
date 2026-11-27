@@ -4,10 +4,11 @@
 // separately), so an agent is never spent on a commit nobody will merge.
 import { reviewActive, workflowId, type UpdraftConfig } from '../config/schema.js';
 import type { Db } from '../db/database.js';
-import { getLoopPr, HEAD_LAG_GRACE_MS, ownPushReplacing } from '../db/pr-reviews.js';
+import { getLoopPr, HEAD_LAG_GRACE_MS, HEAD_LAG_LIMIT_MS, ownPushReplacing } from '../db/pr-reviews.js';
 import { GitHubError, type GitHubApi, type PullRequestReviews } from '../github/api.js';
 import { branchSha } from './head-lag.js';
-import { reviewOf, type IssueSnapshot, type Job, type ReviewRunRequest } from '../types.js';
+import { sameLogin, workerLogin } from '../github/identity.js';
+import { reviewOf, type IssueSnapshot, type Job, type RepoRef, type ReviewRunRequest } from '../types.js';
 
 const short = (sha: string) => sha.slice(0, 12);
 
@@ -49,36 +50,83 @@ export function queuedReviewProblem(config: UpdraftConfig, db: Db, job: Job): st
   return null;
 }
 
+/** Hidden marker on the one comment that says GitHub's pull request never showed the worker's push of `sha` (#199). */
+export function lagStuckMarker(sha: string): string {
+  return `<!-- updraft-lag-stuck: ${sha} -->`;
+}
+
+/** The please-act comment of a head GitHub's pull request never caught up with: what happened, and what to do. */
+export function renderLagStuckNotice(o: { prNumber: number; pushedSha: string; githubHead: string; minutes: number }): string {
+  return [
+    `GitHub has not updated pull request #${o.prNumber} to the commit Updraft pushed: its branch is at \`${short(o.pushedSha)}\`, but the pull request still shows \`${short(o.githubHead)}\` after ${o.minutes} minutes, so Updraft stopped waiting and did not review it. ` +
+      'Please re-run the review (or retry the job) once the pull request shows the commit, or push a commit to the branch to continue.',
+    '',
+    lagStuckMarker(o.pushedSha),
+  ].join('\n');
+}
+
 /**
- * GitHub's pull request still names the commit the worker's own push of `review.headSha`
- * replaced (#197). That is GitHub catching up, not a move, when the branch's git ref is at the
- * pushed commit (or, for a client that cannot read the ref, when the push is less than
- * HEAD_LAG_GRACE_MS old; a push dated after `now`, a clock that ran ahead, is not). Canceling
- * then would leave the head the worker pushed without a review: its dedupe key would be spent,
- * and the worker's own push starts no event. The reason to wait, or null: a real move.
+ * Whether to wait for GitHub's pull request to show the worker's own push of `review.headSha`
+ * (#197): `wait` with why, `stuck` once it has waited long enough, or null for a real move.
+ *
+ * GitHub's pull request still names `githubHead`, the commit that push replaced. That is GitHub
+ * catching up, not a move, when the branch's git ref is at the pushed commit (or, for a client
+ * that cannot read the ref, when the push is less than HEAD_LAG_GRACE_MS old; a push dated after
+ * `now`, a clock that ran ahead, is not). Canceling as moved then would leave the head the worker
+ * pushed without a review: its dedupe key would be spent, and the worker's own push starts no
+ * event. With the ref at the push, the wait is bounded by HEAD_LAG_LIMIT_MS from the push (#199):
+ * past it (or for a push dated after `now`), `stuck`.
  */
 export async function laggingHead(
   deps: { api: Pick<GitHubApi, 'getBranchSha'>; db?: Db; now?: () => number },
   job: Job,
   review: ReviewRunRequest,
   githubHead: string,
-): Promise<string | null> {
+): Promise<{ wait: string } | { stuck: string } | null> {
   if (!deps.db) return null;
   const pushedAt = ownPushReplacing(deps.db, job.repoId, review.pullRequest.number, review.headSha, githubHead);
   if (!pushedAt) return null;
   const why = `GitHub's pull request #${review.pullRequest.number} still shows ${short(githubHead)}, the commit the worker's push of ${short(review.headSha)} (at ${pushedAt}) replaced`;
   const branch = await branchSha(deps.api, { id: job.repoId, fullName: job.repoFullName }, review.pullRequest.branch);
-  if (branch === review.headSha) return `${why}, and its branch is at ${short(review.headSha)}: GitHub has not caught up yet`;
-  if (branch !== undefined) return null;
   const age = (deps.now ?? Date.now)() - Date.parse(pushedAt);
-  return age >= 0 && age < HEAD_LAG_GRACE_MS ? `${why}, less than ${HEAD_LAG_GRACE_MS / 60_000} minutes ago` : null;
+  if (branch === review.headSha) {
+    if (age >= 0 && age < HEAD_LAG_LIMIT_MS) return { wait: `${why}, and its branch is at ${short(review.headSha)}: GitHub has not caught up yet` };
+    return { stuck: `${LAG_STUCK}: ${why}, and its branch is at ${short(review.headSha)}: GitHub did not catch up within ${HEAD_LAG_LIMIT_MS / 60_000} minutes of the push, so the review was not started` };
+  }
+  if (branch !== undefined) return null;
+  return age >= 0 && age < HEAD_LAG_GRACE_MS ? { wait: `${why}, less than ${HEAD_LAG_GRACE_MS / 60_000} minutes ago` } : null;
+}
+
+/** The code a reviewer job canceled because GitHub never showed its head starts its reason with (#199). */
+export const LAG_STUCK = 'lag_stuck';
+
+/**
+ * The please-act comment for a reviewer job that stopped waiting for GitHub (laggingHead `stuck`),
+ * once per pushed head: posted unless the worker's own comment with the marker is there. Rejects
+ * for a transient failure (the job then stays queued, and this is tried again); any other failure
+ * is returned, and the job is canceled all the same.
+ */
+async function noticeLagStuck(api: GitHubApi, repo: RepoRef, review: ReviewRunRequest, githubHead: string): Promise<string | null> {
+  try {
+    const login = await workerLogin(api);
+    const marker = lagStuckMarker(review.headSha);
+    const n = review.pullRequest.number;
+    if ((await api.listIssueComments(repo, n)).some((c) => c.body.includes(marker) && sameLogin(c.user, login))) return null;
+    await api.createIssueComment(repo, n, renderLagStuckNotice({ prNumber: n, pushedSha: review.headSha, githubHead, minutes: HEAD_LAG_LIMIT_MS / 60_000 }));
+    return null;
+  } catch (err) {
+    if (err instanceof GitHubError && (err.status === 0 || err.status >= 500 || err.isRateLimit)) throw err;
+    return err instanceof Error ? err.message : String(err);
+  }
 }
 
 /**
  * Final check before the worker starts a reviewer job: the config still asks for it, and the PR
  * is still open with the commit under review as its head. One request, two when GitHub's pull
  * request may only lag behind the worker's own push of that commit (laggingHead): then the job
- * is not canceled but left queued for the next pass (`retry`).
+ * is not canceled but left queued for the next pass (`retry`), for at most HEAD_LAG_LIMIT_MS
+ * after the push; past that it is canceled (its reason starts with LAG_STUCK), and a please-act
+ * comment on the pull request says so (#199).
  *
  * `vouchIssue` is the issue job's own check, as for a revision: when the issue's text is no
  * longer text an allowed actor stands behind, the review still runs (the commit is what it
@@ -112,7 +160,12 @@ export async function checkReviewDispatchable(
   }
   if (pr.headSha !== review.headSha) {
     const lag = await laggingHead(deps, job, review, pr.headSha);
-    if (lag) return { ok: false, reason: lag, retry: true };
+    if (lag && 'wait' in lag) return { ok: false, reason: lag.wait, retry: true };
+    if (lag) {
+      // Waited long enough (#199): a person is told on the pull request, and the job is canceled.
+      const failed = await noticeLagStuck(deps.api, { id: job.repoId, fullName }, review, pr.headSha);
+      return { ok: false, reason: failed ? `${lag.stuck} (the comment saying so could not be posted: ${failed})` : lag.stuck };
+    }
     return { ok: false, reason: moved(review, pr.headSha) };
   }
 

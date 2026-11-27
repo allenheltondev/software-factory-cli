@@ -14,8 +14,9 @@ import { insertQueuedJob } from '../../test/queue-fixtures.js';
 import { registerAdapter } from '../agents/adapters/registry.js';
 import { setCooldown } from '../db/capacity.js';
 import { openDatabase, type Db } from '../db/database.js';
+import { putHold, releaseHolds } from '../db/holds.js';
 import { mergeState } from '../db/merge.js';
-import { getLoopPr } from '../db/pr-reviews.js';
+import { getLoopPr, HEAD_LAG_LIMIT_MS } from '../db/pr-reviews.js';
 import { countRevisions } from '../db/revisions.js';
 import { claimNextJob, getJob } from '../db/queue.js';
 import type { GitHubIssue, GitHubPullRequest } from '../github/api.js';
@@ -503,6 +504,69 @@ describe('updraft run-event: the suggestion step on Updraft Cloud (#197)', { tim
     const three = vm(w, 'vm three', { repo, reviewerArgs, payload: suiteOf(w, head2) });
     three.download();
     expect((await three.run({ eventName: 'check_suite', deliveryId: 'd-3' })).summary).toMatchObject({ outcome: 'nothing-to-do' });
+  });
+
+  it('#199: without ciFix, a check suite of a head whose review a run that is still going has queued or running starts nothing; once that run has ended, it carries the loop on', async () => {
+    const repo = { ...LOOP, notifications: 'quiet' };
+    const { w, real } = suggestionWorld(1_000_000);
+    w.gh.checks = green;
+    const one = vm(w, 'vm one', { repo, reviewerArgs });
+    expect((await one.run({ deliveryId: 'd-1' })).summary.drain).toBe('stalled');
+    one.upload();
+    const head2 = real();
+    w.gh.headSha = real;
+    // As a checkpoint of a run that is still going shows it: the reviewer job of the head is queued, and that run holds it.
+    const reviewJob = withDb(w.shared, (db) => db.prepare("SELECT id FROM jobs WHERE event_id LIKE ? AND status = 'queued'").get(`pr-review:${PR}:${head2}%`) as { id: string });
+    expect(reviewJob).toBeDefined();
+    withDb(w.shared, (db) => putHold(db, { job: reviewJob.id }, { holder: 'wrk_live', delivery: 'd-live', until: new Date(Date.now() + 3_600_000).toISOString() }));
+    const writes = w.gh.writes.length;
+    const two = vm(w, 'vm two', { repo, reviewerArgs, payload: suiteOf(w, head2) });
+    two.download();
+    const skipped = await two.run({ eventName: 'check_suite', deliveryId: 'd-2' });
+    expect(skipped.summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'review-loop-off' });
+    expect(w.gh.writes.slice(writes)).toEqual([]);
+
+    // The same, with the job running in that run.
+    withDb(w.shared, (db) => db.prepare("UPDATE jobs SET status = 'running' WHERE id = ?").run(reviewJob.id));
+    const running = vm(w, 'vm running', { repo, reviewerArgs, payload: suiteOf(w, head2) });
+    running.download();
+    expect((await running.run({ eventName: 'check_suite', deliveryId: 'd-3' })).summary).toMatchObject({ outcome: 'nothing-to-do', reason: 'review-loop-off' });
+
+    // That run ended (its hold released) with the job still queued: the next check suite carries the loop on.
+    withDb(w.shared, (db) => {
+      db.prepare("UPDATE jobs SET status = 'queued' WHERE id = ?").run(reviewJob.id);
+      releaseHolds(db, 'wrk_live', new Date().toISOString());
+    });
+    const three = vm(w, 'vm three', { repo, reviewerArgs, payload: suiteOf(w, head2) });
+    three.download();
+    const r = await three.run({ eventName: 'check_suite', deliveryId: 'd-4' });
+    expect(r.err).not.toContain('ERROR');
+    expect(r.summary).toMatchObject({ loop: { verdictSha: head2, stage: 'merged', merged: true } });
+  });
+
+  it('#199: a pull request whose GitHub head never catches up with the push gets a please-act comment, and its stage says a person is needed, once the cap has passed', async () => {
+    const repo = { ...LOOP, notifications: 'quiet' };
+    // GitHub never shows the push; the branch ref is at it.
+    const { w, real } = suggestionWorld(1_000_000);
+    w.gh.checks = green;
+    const one = vm(w, 'vm one', { repo, reviewerArgs });
+    expect((await one.run({ deliveryId: 'd-1' })).summary.drain).toBe('stalled');
+    one.upload();
+    const head2 = real();
+    const marker = `<!-- updraft-lag-stuck: ${head2} -->`;
+    // Waiting within the cap is not news: nothing said on GitHub yet.
+    expect(w.gh.comments.filter((c) => c.body.includes(marker))).toEqual([]);
+    // The push is older than the cap by the time the next delivery (a check suite, ciFix off) comes.
+    withDb(w.shared, (db) => db.prepare('UPDATE revisions SET pushed_at = ? WHERE head_sha = ?').run(new Date(Date.now() - HEAD_LAG_LIMIT_MS - 60_000).toISOString(), head2));
+    const two = vm(w, 'vm two', { repo, reviewerArgs, payload: suiteOf(w, head2) });
+    two.download();
+    const r = await two.run({ eventName: 'check_suite', deliveryId: 'd-2' });
+    expect(r.err).not.toContain('ERROR');
+    expect(r.summary).toMatchObject({ loop: { headSha: head2, stage: 'needs-human', detail: expect.stringContaining('lag_stuck') } });
+    expect(w.gh.merges).toEqual([]);
+    const notices = w.gh.comments.filter((c) => c.body.includes(marker));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ issue: PR, body: expect.stringContaining(`GitHub has not updated pull request #${PR} to the commit Updraft pushed`) });
   });
 
   it('a person who pushes the branch back over the suggestion revision\'s push right after it is believed at once: the branch ref is not lag', async () => {

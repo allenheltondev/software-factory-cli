@@ -129,6 +129,21 @@ describe('the GitHub client', () => {
     await expect(createGitHubApi(async () => new Response('{}', { status: 403 })).matchingBranches!('ghs_x', 'acme/web', 'updraft/issue-7-', 5)).rejects.toBeInstanceOf(GitHubError);
   });
 
+  it("reads a branch's commit from its git ref (#199): null for no such branch, an error otherwise", async () => {
+    const urls: string[] = [];
+    const sha = 'b'.repeat(40);
+    const api = createGitHubApi(async (url) => {
+      urls.push(String(url));
+      return String(url).endsWith('/gone') ? new Response('{}', { status: 404 }) : new Response(JSON.stringify({ ref: 'refs/heads/updraft/issue-7-job_a', object: { sha, type: 'commit' } }), { status: 200 });
+    });
+    expect(await api.branchHead!('ghs_x', 'acme/web', 'updraft/issue-7-job_a')).toBe(sha);
+    expect(urls[0]).toBe('https://api.github.com/repos/acme/web/git/ref/heads/updraft/issue-7-job_a');
+    expect(await api.branchHead!('ghs_x', 'acme/web', 'gone')).toBeNull();
+    // Another ref than the one asked for is not that branch.
+    expect(await api.branchHead!('ghs_x', 'acme/web', 'updraft/issue-7')).toBeNull();
+    await expect(createGitHubApi(async () => new Response('{}', { status: 403 })).branchHead!('ghs_x', 'acme/web', 'x')).rejects.toBeInstanceOf(GitHubError);
+  });
+
   it('finds pull requests in any state from a head prefix since a time, and says when it could not look that far', async () => {
     const urls: string[] = [];
     const page = (n: number) => Array.from({ length: 100 }, (_, i) => ({ number: n * 100 + i, created_at: '2026-11-25T00:00:00Z', head: { ref: i === 3 ? 'updraft/issue-7-job_x-2' : 'feature' } }));

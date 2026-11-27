@@ -8,10 +8,11 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FakeLoopGitHub } from '../../test/fake-loop-github.js';
 import { insertQueuedJob } from '../../test/queue-fixtures.js';
+import { putHold, releaseHolds } from '../db/holds.js';
 import { configSchema, suggestionMode, type UpdraftConfig, type UpdraftConfigInput } from '../config/schema.js';
 import { validateConfig } from '../config/validate.js';
 import { openDatabase, type Db } from '../db/database.js';
-import { getLoopPr, HEAD_LAG_GRACE_MS, listCiCandidates, listMergeCandidates, MAX_REVIEW_REQUEUES, observeHead, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
+import { getLoopPr, HEAD_LAG_GRACE_MS, HEAD_LAG_LIMIT_MS, listCiCandidates, listMergeCandidates, MAX_REVIEW_REQUEUES, observeHead, prStage, scheduleAllReviews } from '../db/pr-reviews.js';
 import { getJob } from '../db/queue.js';
 import { getFinding, recordFindings } from '../db/review-findings.js';
 import { countRevisions } from '../db/revisions.js';
@@ -19,9 +20,10 @@ import { GitHubError, type GitHubApi } from '../github/api.js';
 import { observeLiveHead } from '../poller/head-lag.js';
 import { resolvePaths, type UpdraftPaths } from '../paths.js';
 import { checkJobDispatchable } from '../poller/poller.js';
-import { queuedReviewProblem } from '../poller/review-jobs.js';
+import { LAG_STUCK, lagStuckMarker, queuedReviewProblem } from '../poller/review-jobs.js';
 import { queuedRevisionProblem } from '../poller/reviews.js';
 import { suggestionsReviewId } from '../poller/review-trigger.js';
+import { loopWaits } from '../poller/webhook.js';
 import { revisionOf, reviewOf, type Job, type ReviewVerdict, type RunSummary } from '../types.js';
 import { silentLogger } from '../util/log.js';
 import { pendingWork } from '../worker/scope.js';
@@ -542,6 +544,84 @@ describe('the suggestion step, when things go wrong', () => {
     const [job4] = v.schedule();
     v.db.prepare("UPDATE revisions SET pushed_at = '2099-01-01T00:00:00.000Z' WHERE head_sha = ?").run(H2);
     expect(await checkJobDispatchable({ api: withoutRefs(v.gh.api), config: v.config, db: v.db, now: v.now }, job4!)).toEqual({ ok: false, reason: MOVED(H2, H1) });
+  });
+
+  it('#199: a pull request whose GitHub head never catches up with the push stops waiting after HEAD_LAG_LIMIT_MS: one please-act comment, and the job is canceled as lag_stuck', async () => {
+    const { s } = await pushedUnseen();
+    const [job] = s.schedule();
+    const check = () => checkJobDispatchable({ api: s.gh.api, config: s.config, db: s.db, now: s.now }, job!);
+    // The branch is at the push for good; GitHub's pull request never shows it.
+    s.gh.branchSha = () => H2;
+    expect(await check()).toMatchObject({ ok: false, retry: true });
+    // The poller does not take the lagging read for a move, however old the push is: the ref decides.
+    s.tick(HEAD_LAG_GRACE_MS * 2);
+    expect(await observeLiveHead({ db: s.db, api: s.gh.api }, { id: REPO_ID, fullName: FULL }, s.pr(), H1, new Date(s.tick()).toISOString())).toBe(false);
+    expect(s.pr().headSha).toBe(H2);
+    expect(queuedReviewProblem(s.config, s.db, job!)).toBeNull();
+    // Still within the cap: waiting, and nothing said on GitHub.
+    s.tick(HEAD_LAG_LIMIT_MS - HEAD_LAG_GRACE_MS * 2 - 60_000);
+    expect(await check()).toMatchObject({ ok: false, retry: true });
+    expect(s.gh.comments.filter((c) => c.body.includes(lagStuckMarker(H2)))).toEqual([]);
+
+    // A transient failure to say so leaves the job queued (the check rejects), and it is tried again.
+    s.tick(60_000);
+    s.gh.failNext.createIssueComment = new GitHubError('unavailable', 503);
+    await expect(check()).rejects.toThrow(/unavailable/);
+    const stuck = await check();
+    expect(stuck).toEqual({ ok: false, reason: expect.stringMatching(new RegExp(`^${LAG_STUCK}: .*did not catch up within ${HEAD_LAG_LIMIT_MS / 60_000} minutes`)) });
+    expect(stuck).not.toHaveProperty('retry');
+    const notices = s.gh.comments.filter((c) => c.body.includes(lagStuckMarker(H2)));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ issue: PR, body: expect.stringContaining("GitHub has not updated pull request #100 to the commit Updraft pushed") });
+    expect(notices[0]!.body).toContain('re-run the review');
+    expect(notices[0]!.body).toContain('push a commit');
+    // Said once per pushed head, however often it is checked.
+    expect(await check()).toMatchObject({ ok: false });
+    expect(s.gh.comments.filter((c) => c.body.includes(lagStuckMarker(H2)))).toHaveLength(1);
+
+    // Recorded: the job is canceled with that reason, the stage says a person is needed, and nothing queues it again.
+    s.db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ? WHERE id = ?").run((stuck as { reason: string }).reason, job!.id);
+    expect(prStage(s.db, s.pr(), 3, { suggestions: true })).toMatchObject({ stage: 'needs-human', detail: expect.stringContaining(LAG_STUCK) });
+    expect(s.schedule()).toEqual([]);
+
+    // A push dated after now (a clock that ran ahead) is not waited for either.
+    const { s: v } = await pushedUnseen();
+    const [job2] = v.schedule();
+    v.gh.branchSha = () => H2;
+    v.db.prepare("UPDATE revisions SET pushed_at = '2099-01-01T00:00:00.000Z' WHERE head_sha = ?").run(H2);
+    expect(await checkJobDispatchable({ api: v.gh.api, config: v.config, db: v.db, now: v.now }, job2!)).toEqual({ ok: false, reason: expect.stringMatching(new RegExp(`^${LAG_STUCK}: `)) });
+  });
+
+  it('#199: without ciFix, a check suite is worth a run only for a stuck shape: not while a run that is still going has the head\'s review or revision queued or running', async () => {
+    const s = setup();
+    await s.review('ready-to-merge', structured(TWO));
+    const [jobId] = s.suggestionJobs();
+    const live = () => putHold(s.db, { job: jobId! }, { holder: 'wrk_live', delivery: 'd-live', until: new Date(s.now() + 3_600_000).toISOString() });
+    // The suggestion revision is queued: held by a live run, that run carries the loop on.
+    expect(s.pr()).toMatchObject({ headSha: H1, suggestState: 'fixing', suggestJobId: jobId });
+    live();
+    expect(loopWaits(s.db, REPO_ID, PR, s.now())).toBe(false);
+    s.db.prepare("UPDATE jobs SET status = 'running' WHERE id = ?").run(jobId!);
+    expect(loopWaits(s.db, REPO_ID, PR, s.now())).toBe(false);
+    // Its hold expired (the run is gone) with the job left queued: worth a run again.
+    s.db.prepare("UPDATE jobs SET status = 'queued' WHERE id = ?").run(jobId!);
+    expect(loopWaits(s.db, REPO_ID, PR, s.now() + 2 * 3_600_000)).toBe(true);
+    releaseHolds(s.db, 'wrk_live', new Date(s.now()).toISOString());
+    expect(loopWaits(s.db, REPO_ID, PR, s.now())).toBe(true);
+    // The revision ended with a push the pull request does not show: the head it was for is not reviewed again, and it waits.
+    const { s: t } = await pushedUnseen();
+    expect(t.pr()).toMatchObject({ headSha: H1, suggestState: 'fixing' });
+    expect(loopWaits(t.db, REPO_ID, PR, t.now())).toBe(true);
+    // The push's review queued by a run that is still going: nothing to start; once that run is over, a run again.
+    const [review] = t.schedule();
+    expect(reviewOf(review!)!.headSha).toBe(H2);
+    putHold(t.db, { job: review!.id }, { holder: 'wrk_live', delivery: 'd-live', until: new Date(t.now() + 3_600_000).toISOString() });
+    expect(loopWaits(t.db, REPO_ID, PR, t.now())).toBe(false);
+    releaseHolds(t.db, 'wrk_live', new Date(t.now()).toISOString());
+    expect(loopWaits(t.db, REPO_ID, PR, t.now())).toBe(true);
+    // Canceled as "moved" (#197): a stuck shape, worth a run.
+    t.db.prepare("UPDATE jobs SET status = 'canceled', status_reason = ? WHERE id = ?").run(MOVED(H2, H1), review!.id);
+    expect(loopWaits(t.db, REPO_ID, PR, t.now())).toBe(true);
   });
 
   it('#197: a review of the pushed head that was canceled as "moved" while that head is the head is queued again, at most MAX_REVIEW_REQUEUES times; a cancel for any other reason is final', async () => {

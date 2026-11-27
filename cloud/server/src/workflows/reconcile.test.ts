@@ -5,7 +5,7 @@ import type { Job, JobSummary } from '../store/store.js';
 import { createWorkflowRecorder, updateWorkflow } from './recorder.js';
 import { createWorkflowReconciler } from './reconcile.js';
 import { createMemoryWorkflowStore } from './store.js';
-import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, LOST_JOB_LOOK_MS, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
+import { CI_FIRST_CHECK_MS, CI_RECHECK_MS, CI_WAIT_LIMIT_MS, FINISH_GRACE_MS, HEAD_LAG_LIMIT_MS, LOST_JOB_LOOK_MS, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS } from './workflow.js';
 
 const T0 = Date.parse('2026-11-25T12:00:00.000Z');
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
@@ -17,7 +17,7 @@ const job = (over: Record<string, unknown> = {}) =>
     ReturnType<typeof createWorkflowRecorder>['started']
   >[0];
 
-function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; engaged?: boolean; jobs?: Record<string, { job?: Partial<Job>; summary?: Partial<JobSummary> }> } = {}) {
+function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; branch?: string | null; engaged?: boolean; jobs?: Record<string, { job?: Partial<Job>; summary?: Partial<JobSummary> }> } = {}) {
   const store = createMemoryWorkflowStore();
   const controls = { getWorkflowPause: vi.fn(async (_i: number, _r: number, _s: number): Promise<import('../store/store.js').WorkflowPause | null> => null) };
   let clock = T0;
@@ -27,6 +27,8 @@ function setup(o: { checks?: CommitCheckCounts; pr?: Partial<PullRequestHead>; e
     createInstallationToken: vi.fn(async () => ({ token: 'ghs_x', expiresAt: clock + 3_600_000 })),
     pullRequestHead: vi.fn(async (): Promise<PullRequestHead> => ({ state: 'open', merged: false, headSha: HEAD, headRef: 'updraft/issue-7-job', ...o.pr })),
     commitChecks: vi.fn(async (): Promise<CommitCheckCounts> => o.checks ?? { total: 2, pending: 0, failed: 1, passed: 1, complete: true }),
+    /** The branch's git ref; by default where the pull request's head is. */
+    branchHead: vi.fn(async (): Promise<string | null> => (o.branch === undefined ? (o.pr?.headSha ?? HEAD) : o.branch)),
   };
   const notices: { reason: string; generation: number; nextAction: string }[] = [];
   const reconcile = createWorkflowReconciler({
@@ -193,6 +195,72 @@ describe('workflow reconciliation', () => {
     s.tick(STALL_LIMIT_MS);
     expect(await s.reconcile()).toMatchObject({ blocked: 1 });
     expect(await s.wf()).toMatchObject({ status: 'blocked', reason: 'stalled', nextAction: expect.stringMatching(/retry/) });
+  });
+
+  describe('a pull request whose GitHub head never catches up with the App\'s push (#199)', () => {
+    const PUSHED = 'b'.repeat(40);
+    /** A job pushed PUSHED and could not review it: GitHub's pull request still shows HEAD. */
+    const awaitingReview = async (s: ReturnType<typeof setup>, stage: 'awaiting-review' | 'reviewing' | 'revising' = 'awaiting-review') => {
+      await s.recorder.started(job());
+      await s.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 1, reviews: 1, stage } });
+    };
+
+    it('is looked at within HEAD_LAG_LIMIT_MS, and then blocked as lag_stuck with a please-act notice and a timeline block', async () => {
+      const s = setup({ branch: PUSHED });
+      await awaitingReview(s);
+      expect(await s.wf()).toMatchObject({ status: 'waiting', stage: 'awaiting-review', nextCheckAt: new Date(T0 + HEAD_LAG_LIMIT_MS).toISOString() });
+      // A look before the cap (another workflow was due): it waits on, looked at again at the cap.
+      await updateWorkflow(s.store, 55, '99-i7', (w) => ({ workflow: { ...w!, nextCheckAt: new Date(T0 + 10 * 60_000).toISOString() } }));
+      s.tick(10 * 60_000);
+      expect(await s.reconcile()).toMatchObject({ checked: 1, blocked: 0 });
+      expect(await s.wf()).toMatchObject({ status: 'waiting', nextCheckAt: new Date(T0 + HEAD_LAG_LIMIT_MS).toISOString() });
+      expect(s.github.branchHead).toHaveBeenCalledWith('ghs_x', 'acme/web', 'updraft/issue-7-job');
+      expect(s.github.createInstallationToken).toHaveBeenCalledWith(expect.any(String), 55, { repositoryIds: [99], permissions: { pull_requests: 'read', checks: 'read', statuses: 'read', contents: 'read' } });
+      expect(s.notices).toEqual([]);
+
+      s.tick(HEAD_LAG_LIMIT_MS - 10 * 60_000);
+      expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+      expect(await s.wf()).toMatchObject({
+        status: 'blocked', stage: 'awaiting-review', reason: 'lag_stuck',
+        message: expect.stringMatching(/GitHub has not updated pull request #12 to the pushed commit bbbbbbbbbbbb.*still shows aaaaaaaaaaaa after 30 minutes/),
+        nextAction: expect.stringMatching(/Re-run the last job.*or push a commit/),
+      });
+      expect((await s.wf())!.nextCheckAt).toBeUndefined();
+      expect(s.notices).toEqual([{ reason: 'lag_stuck', generation: 1, nextAction: expect.stringMatching(/push a commit/) }]);
+      expect((await s.store.listWorkflowEvents(55, '99-i7', 50)).filter((e) => e.kind === 'blocked')).toEqual([expect.objectContaining({ reason: 'lag_stuck' })]);
+    });
+
+    it('applies to the revising and reviewing waits too; a pull request that caught up, or a client that cannot read the ref, waits for STALL_LIMIT_MS as before', async () => {
+      for (const stage of ['reviewing', 'revising'] as const) {
+        const s = setup({ branch: PUSHED });
+        await awaitingReview(s, stage);
+        s.tick(HEAD_LAG_LIMIT_MS);
+        expect(await s.reconcile()).toMatchObject({ blocked: 1 });
+        expect(await s.wf()).toMatchObject({ reason: 'lag_stuck', stage });
+      }
+      // Caught up: the branch is where the pull request is.
+      const t = setup();
+      await awaitingReview(t);
+      t.tick(HEAD_LAG_LIMIT_MS);
+      expect(await t.reconcile()).toMatchObject({ blocked: 0 });
+      expect(await t.wf()).toMatchObject({ status: 'waiting', nextCheckAt: new Date(T0 + STALL_LIMIT_MS).toISOString() });
+      expect(t.notices).toEqual([]);
+      // No ref read: as before.
+      const u = setup({ branch: PUSHED });
+      delete (u.github as { branchHead?: unknown }).branchHead;
+      await awaitingReview(u);
+      u.tick(HEAD_LAG_LIMIT_MS);
+      expect(await u.reconcile()).toMatchObject({ blocked: 0 });
+      expect(await u.wf()).toMatchObject({ status: 'waiting' });
+      // Another stage is not about the head's review: the ref is not read.
+      const v = setup({ branch: PUSHED });
+      await v.recorder.started(job());
+      await v.recorder.finished(job(), 'succeeded', { prNumber: 12, loop: { rounds: 0, reviews: 1, stage: 'changes-requested', verdict: 'changes-requested' } });
+      v.tick(STALL_LIMIT_MS);
+      await v.reconcile();
+      expect(v.github.branchHead).not.toHaveBeenCalled();
+      expect(await v.wf()).toMatchObject({ reason: 'stalled' });
+    });
   });
 
   it('changes nothing when a job started while it looked, does nothing with the kill switch on, and isolates a failing workflow', async () => {

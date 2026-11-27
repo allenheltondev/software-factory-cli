@@ -270,6 +270,30 @@ export function adoptOwnPushes(db: Db, repoId: number, now?: () => number): numb
 export const HEAD_LAG_GRACE_MS = 5 * 60_000;
 
 /**
+ * How long a reviewer job of the worker's own push waits for GitHub's pull request to show that
+ * push, while the branch's git ref is at it (#199). Past this the job stops waiting: it is
+ * canceled, and a please-act comment on the pull request says GitHub has not caught up. Measured
+ * from the push.
+ */
+export const HEAD_LAG_LIMIT_MS = 30 * 60_000;
+
+/**
+ * The head on record when it is the worker's own revision push that replaced `sha` (whenever it
+ * was pushed), else null: a read of the PR that names `sha` may then only be GitHub lagging behind
+ * that push (#197), and the branch's git ref decides (src/poller/head-lag.ts).
+ */
+export function ownPushOnRecord(db: Db, repoId: number, prNumber: number, sha: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT head_sha FROM revision_prs p WHERE repo_id = ? AND pr_number = ? AND head_sha IS NOT NULL AND head_sha != ? AND EXISTS (
+         SELECT 1 FROM revisions v WHERE v.repo_id = p.repo_id AND v.pr_number = p.pr_number AND v.head_sha = p.head_sha AND v.base_sha = ? AND v.pushed_at IS NOT NULL
+       )`,
+    )
+    .get(repoId, prNumber, sha, sha) as { head_sha: string } | undefined;
+  return row?.head_sha ?? null;
+}
+
+/**
  * When the worker's own revision push moved the PR from `olderSha` to `headSha`: its pushed_at,
  * or null when no revision of the worker made that move.
  */

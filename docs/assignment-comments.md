@@ -99,13 +99,16 @@ to do and, when hosted, the console link:
   and set of keys (`<!-- updraft-refused: missing_key v3 ANTHROPIC_API_KEY -->`);
 - a workflow the reconciler or automatic recovery blocked for a person (`publication_uncertain`,
   `recovery_exhausted`, a lost job that needs a manual retry, `ci_event_missed`, `ci_stuck`,
-  `stalled`, `sign_in_expired`, a refused recovery): its message and next action, with the
+  `stalled`, `lag_stuck`, `sign_in_expired`, a refused recovery): its message and next action, with the
   workflow's console link, on the pull request when the workflow has one, else on the issue.
   Once per workflow run and reason (`<!-- updraft-blocked: 99-i7 g2 publication_uncertain -->`).
   Posting it never changes what recovery decided;
 - the CI step stopping for a person (the budget is used up, the failure isn't code, CI repair is
   off) or a fixed head that passed when merging is up to a person ([ci-fix.md](ci-fix.md));
 - a merge auto-merge left to a person;
+- a reviewer job that stopped waiting for GitHub's pull request to show Updraft's own push, 30
+  minutes after it (`lag_stuck`, [review-loop.md](review-loop.md)): once per pushed head
+  (`<!-- updraft-lag-stuck: <sha> -->`);
 - the revision limit, and a revision that could not be pushed ([revisions.md](revisions.md)); the
   revision's own reply states the same merge policy as the PR body;
 - the review itself (including a verdict held back as `needs-verification`), its inline findings,

@@ -210,6 +210,19 @@ export const CI_WAIT_LIMIT_MS = 24 * 60 * 60 * 1000;
 /** A loop stage that waits for an event (a review, a push) is looked at after this, and blocked after STALL_LIMIT_MS. */
 export const STALL_CHECK_MS = 2 * 60 * 60 * 1000;
 export const STALL_LIMIT_MS = 6 * 60 * 60 * 1000;
+/**
+ * Loop stages in which the pull request waits on a review of its head: a check suite may be the
+ * only delivery for it (recorder.ts loopWaitsOnHead, #197), and GitHub's pull request may lag
+ * behind the App's own push of that head.
+ */
+export const LOOP_WAITS_ON_HEAD = ['awaiting-review', 'reviewing', 'revising'] as const;
+/**
+ * How long a workflow waits in one of those stages while GitHub's pull request still shows another
+ * commit than its branch (the App's push never reached the pull request): then it is blocked as
+ * `lag_stuck`, with a please-act comment (reconcile.ts, #199). Such a wait is looked at this long
+ * after it began, instead of after STALL_CHECK_MS.
+ */
+export const HEAD_LAG_LIMIT_MS = 30 * 60 * 1000;
 
 const ISSUE_EVENTS = new Set(['issues']);
 
@@ -423,7 +436,8 @@ function settle(w: Workflow, outcome: string, stage: LoopStage | undefined, at: 
       return finished('done');
     default:
       // awaiting-review, reviewing, changes-requested, revising, fixing-ci: the next job comes from a GitHub event.
-      return waiting(stage, 'awaiting_event', 'Waiting for the next step of the review loop to start.', STALL_CHECK_MS);
+      // A wait on the head's review is looked at sooner: GitHub's pull request may never show the App's push (#199).
+      return waiting(stage, 'awaiting_event', 'Waiting for the next step of the review loop to start.', (LOOP_WAITS_ON_HEAD as readonly string[]).includes(stage) ? HEAD_LAG_LIMIT_MS : STALL_CHECK_MS);
   }
 }
 

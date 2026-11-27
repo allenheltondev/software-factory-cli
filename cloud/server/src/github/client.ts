@@ -139,6 +139,12 @@ export interface GitHubApi {
    */
   matchingBranches?(installationToken: string, repository: string, prefix: string, limit: number): Promise<string[]>;
   /**
+   * The commit a branch points at (GET /repos/{owner}/{repo}/git/ref/heads/{branch}), or null when
+   * there is no such branch. The ref moves with a push itself, where a pull request's head can lag
+   * behind it: for the workflow reconciler (#199).
+   */
+  branchHead?(installationToken: string, repository: string, branch: string): Promise<string | null>;
+  /**
    * Pull requests in any state (open, closed, merged) created at or after `since` (ISO) whose head
    * branch starts with `prefix`, newest first (GET /repos/{owner}/{repo}/pulls?state=all&sort=created).
    * `complete` is false when the listing was cut short before reaching `since`: then a match may be missing.
@@ -345,6 +351,16 @@ export function createGitHubApi(fetchImpl: typeof fetch = (...a) => fetch(...a))
         if (events.length < 100) break;
       }
       return newest;
+    },
+
+    async branchHead(token, repository, branch) {
+      const [owner = '', repo = ''] = repository.split('/');
+      const ref = branch.split('/').map(encodeURIComponent).join('/');
+      const res = await call(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/git/ref/heads/${ref}`, token);
+      if (res.status === 404) return null;
+      const out = await json<Json>(res, 'GET /repos/git/ref');
+      const object = (out.object ?? {}) as Json;
+      return out.ref === `refs/heads/${branch}` && typeof object.sha === 'string' ? object.sha : null;
     },
 
     async matchingBranches(token, repository, prefix, limit) {

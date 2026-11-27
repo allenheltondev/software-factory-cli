@@ -1220,14 +1220,15 @@ describe('the launcher', () => {
       expect(JSON.parse(events['tenants/55/events/pr-suite/event.json']!)).toMatchObject({ check_suite: { head_sha: pushed }, sender: { login: 'updraft[bot]' } });
     });
 
-    it('with ciFix off, a check suite starts a job only while the pull request\'s loop waits on its head (#197), from its workflow record', async () => {
+    it('with ciFix off, a check suite starts a job only while the pull request\'s loop waits on its head (#197) and no job of it is running or queued (#199), from its workflow record', async () => {
       // The rules of this block: review and revise on, ciFix off.
       const suite = (deliveryId: string) => prEvent({ action: 'completed', pull_request: undefined, review: undefined, sender: { login: 'updraft[bot]' },
         check_suite: { head_branch: 'updraft/issue-12-abc', head_sha: 'e'.repeat(40), pull_requests: [{ number: 40, head: { ref: 'updraft/issue-12-abc' } }] } }, deliveryId, 'check_suite');
       const asked: Array<[number, number, number]> = [];
       let stage = 'merging';
       let status = 'waiting';
-      const records = { workflowOfPullRequest: async () => '9-i12', getWorkflow: async () => ({ status, stage }) } as unknown as Parameters<typeof createWorkflowRecorder>[0]['store'];
+      let pendingJobId: string | undefined;
+      const records = { workflowOfPullRequest: async () => '9-i12', getWorkflow: async () => ({ status, stage, ...(pendingJobId ? { pendingJobId } : {}) }) } as unknown as Parameters<typeof createWorkflowRecorder>[0]['store'];
       const recorder = createWorkflowRecorder({ store: records, log: () => {} });
       deps.workflows = { ...recorder, loopWaitsOnHead: async (...a: [number, number, number]) => (asked.push(a), recorder.loopWaitsOnHead(...a)) };
       const launch = createLauncher(deps);
@@ -1240,6 +1241,25 @@ describe('the launcher', () => {
       // A finished workflow waits on nothing.
       status = 'finished';
       expect(await launch(suite('s-2'))).toMatchObject({ disposition: 'not_dispatched', reason: 'loop_off' });
+      // #199: a job of the workflow running or queued carries the loop on: no microVM for the check suite.
+      for (const [st, sg, pending] of [['active', 'awaiting-review', undefined], ['active', 'reviewing-loop', undefined], ['waiting', 'awaiting-review', 'job_queued01'], ['waiting', 'queued', undefined]] as const) {
+        status = st;
+        stage = sg;
+        pendingJobId = pending;
+        expect(await recorder.loopWaitsOnHead(55, 9, 40)).toBe(false);
+      }
+      status = 'active';
+      stage = 'revising';
+      pendingJobId = undefined;
+      expect(await launch(suite('s-active'))).toMatchObject({ disposition: 'not_dispatched', reason: 'loop_off' });
+      status = 'waiting';
+      pendingJobId = 'job_queued01';
+      expect(await launch(suite('s-pending'))).toMatchObject({ disposition: 'not_dispatched', reason: 'loop_off' });
+      expect(runs).toEqual([]);
+      // The stuck shapes (#197): the last job ended and left the loop waiting on the head, or blocked on it.
+      pendingJobId = undefined;
+      status = 'blocked';
+      expect(await recorder.loopWaitsOnHead(55, 9, 40)).toBe(true);
       status = 'waiting';
       stage = 'revising';
       expect(await launch(suite('s-3'))).toMatchObject({ disposition: 'launched' });

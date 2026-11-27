@@ -14,8 +14,9 @@
 // there the existing pre-start checks run unchanged.
 import { createHash } from 'node:crypto';
 import { autoMergeMethod, ciSettings, reviewActive, reviseActive, suggestionsActive, type UpdraftConfig } from '../config/schema.js';
-import { getLoopPr, listResumableMerges } from '../db/pr-reviews.js';
+import { getLoopPr, listResumableMerges, reviewEventId, type LoopPr } from '../db/pr-reviews.js';
 import type { Db } from '../db/database.js';
+import { foreignWork } from '../worker/scope.js';
 import { getRevisionPr, listOpenRevisionPrsByHead } from '../db/revisions.js';
 import type { NewJob } from '../db/ingest.js';
 import type { GitHubApi, GitHubIssueEvent } from '../github/api.js';
@@ -270,7 +271,7 @@ async function checksChanged(deps: WebhookDeps, payload: Payload, event: Webhook
     const n = pullRequest;
     const blocked =
       (autoMergeMethod(deps.config, found.cfg) && listResumableMerges(deps.db, found.cfg.id, { requireSuggestions: suggestionsActive(deps.config, found.cfg) }).some((pr) => pr.prNumber === n)) ||
-      (reviewing && loopWaits(deps.db, found.cfg.id, n));
+      (reviewing && loopWaits(deps.db, found.cfg.id, n, (deps.now ?? Date.now)()));
     if (!blocked) {
       return nothing(
         'review-loop-off',
@@ -288,12 +289,35 @@ async function checksChanged(deps: WebhookDeps, payload: Payload, event: Webhook
  * requeueLostReview), or the head was found ready and is held by its suggestion revision (one
  * whose push the pull request does not show yet). The App's own push starts
  * no event, so without ciFix a check suite of that head may be the only delivery for it (#197).
+ *
+ * Not while a run that is still going (its hold, src/db/holds.ts) has the head's reviewer job or
+ * a revision of the pull request queued or running (#199): that run carries the loop on, and a
+ * delivery for it would find nothing new to do. What is left then are the stuck shapes: a review
+ * canceled as "moved", a suggestion revision that ended without its head being reviewed, or a job
+ * that a run which has ended left queued.
  */
-export function loopWaits(db: Db, repoId: number, prNumber: number): boolean {
+export function loopWaits(db: Db, repoId: number, prNumber: number, nowMs: number = Date.now()): boolean {
   const pr = getLoopPr(db, repoId, prNumber);
   if (!pr || pr.state !== 'open' || !pr.headSha) return false;
+  if (liveLoopJob(db, pr, pr.headSha, nowMs)) return false;
   if (pr.verdictSha === pr.headSha && pr.suggestSha === pr.headSha && pr.suggestState === 'fixing') return true;
   return !db.prepare("SELECT 1 AS x FROM pr_reviews WHERE repo_id = ? AND pr_number = ? AND head_sha = ? AND state = 'published' LIMIT 1").get(repoId, prNumber, pr.headSha);
+}
+
+/** A reviewer job of `headSha` or a revision job of the pull request is queued or running, and a run that is still going holds it. */
+function liveLoopJob(db: Db, pr: LoopPr, headSha: string, nowMs: number): boolean {
+  const review = reviewEventId(pr.prNumber, headSha);
+  const jobs = db
+    .prepare(
+      `SELECT id FROM jobs WHERE repo_id = ? AND status IN ('queued', 'running')
+         AND (event_id = ? OR event_id LIKE ? OR id IN (SELECT job_id FROM review_requests WHERE repo_id = ? AND pr_number = ? AND job_id IS NOT NULL)
+              OR id IN (?, ?))`,
+    )
+    .all(pr.repoId, review, `${review}:%`, pr.repoId, pr.prNumber, pr.ciFixJobId ?? null, pr.suggestJobId ?? null) as Array<{ id: string }>;
+  if (!jobs.length) return false;
+  // This run holds nothing yet: every live hold is another run's.
+  const live = foreignWork(db, '', nowMs);
+  return jobs.some((j) => live.covers(j.id));
 }
 
 async function issueLabeled(deps: WebhookDeps, payload: Payload, event: WebhookEventInfo): Promise<WebhookDecision> {
