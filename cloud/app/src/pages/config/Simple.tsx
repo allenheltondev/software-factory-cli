@@ -1,6 +1,6 @@
-import { useId, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
-import { Button, Card, CardBody, CardDescription, CardHeader, EmptyState, Input, Select, StatusBadge } from '@readysetcloud/ui';
+import { Button, Card, CardBody, CardDescription, CardHeader, EmptyState, Input, ProgressIndicator, Select, StatusBadge } from '@readysetcloud/ui';
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepository, ConsoleWorkflow } from '../../api/client';
 import { AGENT_GUIDES } from '../../lib/agentGuides';
 import { installationSettingsUrl } from '../../lib/diagnostics';
@@ -129,13 +129,20 @@ export function simpleBlockers(config: ConsoleConfig, view: ConfigView): string[
   return [...new Set(out)];
 }
 
+/** A provider's state as a compact badge: a word or two, never a sentence. */
 const CONNECTION: Record<Connection, { tone: 'success' | 'warning' | 'error' | 'neutral' | 'primary'; text: string }> = {
   connected: { tone: 'success', text: 'Connected' },
-  unverified: { tone: 'primary', text: 'Saved, checked on first use' },
+  unverified: { tone: 'primary', text: 'Saved' },
   failing: { tone: 'error', text: 'Last use failed' },
   missing: { tone: 'neutral', text: 'Not connected' },
-  unavailable: { tone: 'warning', text: 'Not available here' },
+  unavailable: { tone: 'warning', text: 'Not available' },
 };
+
+/** Whose API key each agent uses, in the words of the person paying for it. */
+const KEY_OWNER: Record<AgentAdapter, string> = { claude: 'Anthropic', codex: 'OpenAI', kiro: 'Kiro', vibe: 'Mistral' };
+
+/** The steps of the first setup, for the progress row and each step's number. */
+const STEP_NAMES = ['Connect agents', 'Choose your agent team', 'Choose where work starts'] as const;
 
 /**
  * The configuration as one page, in three steps: connect agents, choose who codes and who
@@ -171,26 +178,36 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
   const agentBox = (a: AgentAdapter, on: boolean, onToggle: (v: boolean) => void, name?: string) => {
     const c = connection(a);
     const ok = eligible(c);
+    // A chosen agent that cannot run says so on its tile, as its card does.
+    const note = !on || ok ? null : c === 'failing' ? 'Key failed: reconnect it' : c === 'missing' ? 'Not connected: connect it, or untick it' : 'Not available: untick it';
+    const tip = !ok && (
+      <InfoTip
+        label={`Why ${AGENT_LABEL[a]} cannot be used`}
+        text={
+          c === 'unavailable'
+            ? `Updraft Cloud no longer runs ${AGENT_LABEL[a]}.${on ? ' Untick it.' : ''}`
+            : on
+              ? `${AGENT_LABEL[a]}'s ${AGENT_GUIDES[a].credential} was removed. Connect it again, or untick ${AGENT_LABEL[a]}. Click to connect.`
+              : `Connect ${AGENT_LABEL[a]} with your ${AGENT_GUIDES[a].credential} to use it. Click to connect.`
+        }
+        hidden={connecting === a}
+        onClick={c !== 'unavailable' ? () => setConnecting(connecting === a ? null : a) : undefined}
+      />
+    );
     return (
-      <div className="flex items-center gap-2">
-        <Check checked={on} disabled={!ok && !on} onChange={onToggle}>
+      <div className={`flex min-h-11 flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md border px-3 py-1.5 transition-colors ${on ? 'border-primary-500 bg-primary-500/10' : 'border-border'}`}>
+        <Check checked={on} disabled={!ok && !on} onChange={onToggle} className="min-h-8 min-w-0 flex-1 cursor-pointer">
           <span className="font-medium">{name ?? AGENT_LABEL[a]}</span>
         </Check>
-        {!ok && (
-          <InfoTip
-            label={`Why ${AGENT_LABEL[a]} cannot be used`}
-            text={
-              c === 'unavailable'
-                ? `Updraft Cloud no longer runs ${AGENT_LABEL[a]}.${on ? ' Untick it.' : ''}`
-                : on
-                  ? `${AGENT_LABEL[a]}'s ${AGENT_GUIDES[a].credential} was removed. Connect it again, or untick ${AGENT_LABEL[a]}. Click to connect.`
-                  : `Connect ${AGENT_LABEL[a]} with your ${AGENT_GUIDES[a].credential} to use it. Click to connect.`
-            }
-            hidden={connecting === a}
-            onClick={c !== 'unavailable' ? () => setConnecting(connecting === a ? null : a) : undefined}
-          />
+        {/* With a note, the info icon goes on the note's line, leaving the name its row. */}
+        {note ? (
+          <span className="flex basis-full items-center justify-between gap-1 text-xs text-error">
+            {note}
+            {tip}
+          </span>
+        ) : (
+          tip
         )}
-        {c === 'failing' && on && <span className="text-xs text-error">its last run could not use the key: reconnect it</span>}
       </div>
     );
   };
@@ -209,7 +226,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
             {agentBox(a, list.includes(a), (v) => set(role, toggle(list, a, v)))}
           </div>
         ))}
-        <span className="text-xs text-muted-foreground">{(role === 'coding' ? t.inherits.coding : t.inherits.review) ? 'Same as the defaults' : 'Its own'}</span>
+        <span className="text-xs text-muted-foreground">{(role === 'coding' ? t.inherits.coding : t.inherits.review) ? 'Same as your team' : 'Its own'}</span>
       </fieldset>
     );
     return (
@@ -254,68 +271,80 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
       </p>
     );
   };
-  const step = (n: number, text: string) => (firstRun ? `${n} · ${text}` : text);
+  /** Which first-setup steps are complete: for the progress row and each step's number. */
+  const done = [
+    adapters.some(usable),
+    team.coding.length > 0 && team.coding.every(usable) && (!reviewing || (team.review.length > 0 && team.review.every(usable))),
+    Object.keys(config.repositories).length > 0 && config.allowedActors.length > 0 && groups.every((g) => g.label.trim()),
+  ];
+  const step = (n: number) => <StepTitle n={firstRun ? n : undefined} done={done[n - 1]}>{STEP_NAMES[n - 1]}</StepTitle>;
   const newLabelKey = labelKey(newLabel);
   const newLabelError = newLabel.trim() && groups.some((g) => g.key === newLabelKey) ? 'There is already a label with that name' : undefined;
 
   return (
-    <div className="flex flex-col gap-6" data-testid="simple-config">
+    <div className="flex flex-col gap-4 sm:gap-6" data-testid="simple-config">
+      {firstRun && (
+        <ProgressIndicator
+          aria-label="Setup progress"
+          data-testid="setup-progress"
+          className="!flex-row flex-wrap !gap-x-5 !gap-y-2 rounded-lg border border-border bg-surface px-4 py-3"
+          steps={STEP_NAMES.map((s, i) => ({ id: s, status: done[i] ? 'completed' : 'pending', label: <span className={done[i] ? 'text-foreground' : ''}>{s}{done[i] && <span className="sr-only"> (done)</span>}</span> }))}
+        />
+      )}
       <Card data-testid="connected-agents">
         <CardHeader>
-          <StepTitle>{step(1, 'Connect agents')}</StepTitle>
-          <CardDescription>Connect the coding agents you already pay for. Connecting one does not start using it: you choose who works in the next step.</CardDescription>
+          {step(1)}
+          <CardDescription>Connect the agents you already pay for. You choose who works in the next step.</CardDescription>
         </CardHeader>
         <CardBody className="grid gap-3 sm:grid-cols-2">
-          {adapters.map((a) => {
+          {adapters.map((a, i) => {
             const c = connection(a);
-            const guide = AGENT_GUIDES[a];
             const provider = PROVIDERS[KEY_FOR[a]];
+            const alone = adapters.length % 2 === 1 && i === adapters.length - 1;
             const badge = CONNECTION[c];
             const used = Object.values(config.pools).some((p) => p.agents.includes(a) && config.agents[a]?.enabled);
+            // One message: what is wrong first, else whose key it uses and whether the team uses it.
+            const summary =
+              c === 'unavailable'
+                ? 'Updraft Cloud no longer runs this agent. Settings that name it are kept.'
+                : c === 'failing'
+                  ? 'Its last run could not use the key. Reconnect it to keep it working.'
+                  : `Uses your ${KEY_OWNER[a]} API key.${c === 'missing' ? '' : used ? ' In your team.' : ' Not in any team yet.'}`;
+            // Emphasis follows urgency: a failing key's fix is the one primary action; an optional provider stays quiet.
+            const main = c === 'failing' ? 'primary' : 'secondary';
             return (
-              <section key={a} className="flex flex-col gap-2 rounded-lg border border-border p-3" data-testid={`provider-${a}`} aria-label={AGENT_LABEL[a]}>
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <h3 className="font-semibold">{AGENT_LABEL[a]}</h3>
-                  <StatusBadge tone={badge.tone}>{badge.text}</StatusBadge>
+              <section key={a} className={`flex min-w-0 flex-col gap-3 rounded-lg border border-border p-3 sm:p-4 ${alone ? 'sm:col-span-2' : ''}`} data-testid={`provider-${a}`} aria-label={AGENT_LABEL[a]}>
+                <div className="flex flex-col gap-1">
+                  <div className="flex min-h-8 items-center justify-between gap-2">
+                    <h3 className="min-w-0 font-semibold leading-snug">{AGENT_LABEL[a]}</h3>
+                    <span className="flex shrink-0 items-center gap-0.5">
+                      {c === 'unverified' && <InfoTip label={`About ${AGENT_LABEL[a]} keys`} text={`${provider?.company ?? AGENT_LABEL[a]} has no way to check a key ahead of time, so the first job that uses it is the check.`} />}
+                      <StatusBadge tone={badge.tone} className="whitespace-nowrap">
+                        {badge.text}
+                      </StatusBadge>
+                    </span>
+                  </div>
+                  <p className={`text-xs ${c === 'failing' ? 'text-error' : 'text-muted-foreground'}`}>{summary}</p>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  {c === 'unavailable'
-                    ? 'Updraft Cloud does not run this agent. Settings that name it are kept.'
-                    : `API key · runs bill your ${guide.billing}${provider?.checkedOnSave === false ? '; the key is checked when a job first uses it' : ''}.`}
-                  {used ? ' In use.' : c !== 'unavailable' && c !== 'missing' ? ' Not in any team yet.' : ''}
-                </p>
                 {a === 'claude' && c !== 'unavailable' && (
-                  <p className="text-xs text-muted-foreground">
-                    Workflows here run with the API key. A Claude subscription runs only on the separate signed-in worker:{' '}
-                    <Link className="auth-link" to={`/installations/${installationId}/claude`}>
-                      Claude subscription routing
-                    </Link>
-                    .
-                  </p>
+                  <AltPlan to={`/installations/${installationId}/claude`} name="Use your Claude subscription" />
                 )}
                 {a === 'codex' && c !== 'unavailable' && codex?.available && (
-                  <p className="text-xs text-muted-foreground" data-testid="codex-chatgpt">
-                    Codex can run on a ChatGPT plan instead of an API key
-                    {codex.status ? <> ({codex.status})</> : null}:{' '}
-                    <Link className="auth-link" to={`/installations/${installationId}/codex`}>
-                      Connect ChatGPT account →
-                    </Link>
-                  </p>
+                  <AltPlan to={`/installations/${installationId}/codex`} name={codex.status === 'Connected' ? 'Manage your ChatGPT plan' : 'Use your ChatGPT plan'} status={codex.status} testId="codex-chatgpt" />
                 )}
                 {c !== 'unavailable' && (
-                  <div className="flex flex-wrap items-center gap-3">
-                    {connecting !== a && (
-                      <Button variant={c === 'missing' ? 'primary' : 'ghost'} size="sm" type="button" onClick={() => setConnecting(a)}>
+                  <div className="mt-auto flex flex-wrap items-center gap-2">
+                    {connecting !== a ? (
+                      <Button variant={main} size="sm" type="button" onClick={() => setConnecting(a)}>
                         {c === 'missing' ? `Connect ${AGENT_LABEL[a]}` : c === 'failing' ? `Reconnect ${AGENT_LABEL[a]}` : `Replace ${AGENT_LABEL[a]} key`}
                       </Button>
-                    )}
-                    {connecting === a && (
-                      <Button variant="ghost" size="sm" type="button" onClick={() => setConnecting(null)}>
+                    ) : (
+                      <Button variant="secondary" size="sm" type="button" onClick={() => setConnecting(null)}>
                         Cancel
                       </Button>
                     )}
                     {c !== 'missing' && (
-                      <Link className="auth-link text-sm" to={`/installations/${installationId}/keys`}>
+                      <Link className="btn btn-ghost btn-sm border-transparent" to={`/installations/${installationId}/keys`}>
                         Manage
                       </Link>
                     )}
@@ -330,37 +359,41 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
 
       <Card data-testid="default-team">
         <CardHeader>
-          <StepTitle>{step(2, 'Choose your agent team')}</StepTitle>
-          <CardDescription>Every label and repository uses this team unless you give it its own. Updraft picks the model and effort.</CardDescription>
+          {step(2)}
+          <CardDescription>Every label and repository uses this team unless you give it its own. Updraft picks the model.</CardDescription>
         </CardHeader>
-        <CardBody className="grid gap-6 sm:grid-cols-2">
-          <fieldset className="flex min-w-0 flex-col gap-1" data-testid="coding-agents">
+        <CardBody className="grid gap-5 sm:grid-cols-2 sm:gap-6">
+          <fieldset className="flex min-w-0 flex-col gap-2" data-testid="coding-agents">
             <legend className="font-medium">Coding agents</legend>
-            <p className="mb-2 text-sm text-muted-foreground">They take turns picking up issues and writing the code.</p>
-            {adapters.map((a) => (
-              <div key={a} className="py-1.5" data-testid={`coding-${a}`}>
-                {agentBox(a, team.coding.includes(a), (v) => onChange(setDefaultCoding(config, toggle(team.coding, a, v), adapters)))}
-              </div>
-            ))}
+            <p className="-mt-1 text-sm text-muted-foreground">They take turns picking up issues and writing the code.</p>
+            <div className="grid grid-cols-2 gap-2">
+              {adapters.map((a) => (
+                <div key={a} className="min-w-0" data-testid={`coding-${a}`}>
+                  {agentBox(a, team.coding.includes(a), (v) => onChange(setDefaultCoding(config, toggle(team.coding, a, v), adapters)))}
+                </div>
+              ))}
+            </div>
             {affected('coding')}
           </fieldset>
-          <fieldset className="flex min-w-0 flex-col gap-1" data-testid="review-agents">
+          <fieldset className="flex min-w-0 flex-col gap-2" data-testid="review-agents">
             <legend className="font-medium">Review agents</legend>
-            <p className="mb-2 text-sm text-muted-foreground">Each pull request gets one of them, never the agent that wrote it unless you allow it. Tick none for no automated review.</p>
-            {adapters.map((a) => (
-              <div key={a} className="py-1.5" data-testid={`review-${a}`}>
-                {agentBox(a, team.review.includes(a), (v) => onChange(setDefaultReview(config, toggle(team.review, a, v), adapters)))}
-              </div>
-            ))}
+            <p className="-mt-1 text-sm text-muted-foreground">Each pull request gets one, never the agent that wrote it unless you allow it. Tick none to skip automated review.</p>
+            <div className="grid grid-cols-2 gap-2">
+              {adapters.map((a) => (
+                <div key={a} className="min-w-0" data-testid={`review-${a}`}>
+                  {agentBox(a, team.review.includes(a), (v) => onChange(setDefaultReview(config, toggle(team.review, a, v), adapters)))}
+                </div>
+              ))}
+            </div>
             {reviewing && affected('review')}
           </fieldset>
         </CardBody>
-        <CardBody className="flex flex-col gap-2 border-t border-border bg-muted/30" data-testid="review-policy">
+        <CardBody className="flex flex-col gap-3 border-t border-border bg-muted/30" data-testid="review-policy">
           {!reviewing && <p className="text-sm text-muted-foreground">No automated review: pull requests wait for a person. Tick a review agent to turn review on.</p>}
           {reviewing && (
             <>
               <div>
-                <Button variant="ghost" size="sm" type="button" onClick={() => onChange(setDefaultReview(config, [], adapters))}>
+                <Button variant="secondary" size="sm" type="button" onClick={() => onChange(setDefaultReview(config, [], adapters))}>
                   No automated review
                 </Button>
               </div>
@@ -385,14 +418,14 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
 
       <Card data-testid="labels">
         <CardHeader>
-          <StepTitle>{step(3, 'Choose where work starts')}</StepTitle>
-          <CardDescription>When one of these people adds a label to an issue, a coding agent picks it up and opens a pull request.</CardDescription>
+          {step(3)}
+          <CardDescription>When one of these people labels an issue, a coding agent picks it up and opens a pull request.</CardDescription>
         </CardHeader>
         <CardBody className="flex flex-col gap-4">
           <ParsedText
             key={`actors-${generation}`}
             label="Who can add a label"
-            hint="GitHub logins, separated by commas or spaces"
+            hint={config.allowedActors.length === 0 ? `No one yet: add your GitHub login${view.githubLogin ? ` (${view.githubLogin})` : ''} to start` : 'GitHub logins, separated by commas or spaces'}
             value={config.allowedActors}
             parse={parseLogins}
             format={(v) => v.join(', ')}
@@ -405,29 +438,33 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
               const custom = !t.inherits.coding || (reviewing && !t.inherits.review);
               return (
                 <section key={`${g.primary}-${generation}`} className="flex flex-col gap-3 py-3" data-testid={`label-${g.primary}`} aria-label={`Label ${g.label}`}>
-                  <div className="grid gap-3 sm:grid-cols-[1fr_16rem_auto] sm:items-end">
-                    <LabelInput group={g} groups={groups} error={issuesAt(errors, `workflows.${g.primary}.label`)} onChange={(l) => onChange(renameLabel(config, g, l))} />
+                  <div className="grid grid-cols-[minmax(0,1fr)_auto] items-end gap-x-2 gap-y-3 sm:grid-cols-[1fr_16rem_auto] sm:gap-x-3">
+                    <div className="min-w-0">
+                      <LabelInput group={g} groups={groups} error={issuesAt(errors, `workflows.${g.primary}.label`)} onChange={(l) => onChange(renameLabel(config, g, l))} />
+                    </div>
+                    <div className="col-span-2 min-w-0 sm:col-span-1">
                     <Select
                       label={`Agents for ${quote(g.label)}`}
                       value={custom ? 'custom' : 'default'}
                       onChange={(e) => onChange(e.target.value === 'custom' ? customize(config, g.primary, adapters) : resetToDefaults(config, g.primary))}
                     >
-                      <option value="default">Use installation defaults</option>
-                      <option value="custom">Customize</option>
+                      <option value="default">Same as your team</option>
+                      <option value="custom">Its own agents</option>
                     </Select>
-                    <Button variant="ghost" size="sm" type="button" className="justify-self-start sm:mb-1" disabled={groups.length < 2} title={groups.length < 2 ? 'At least one label starts work' : undefined} onClick={() => onChange(removeLabel(config, g))}>
+                    </div>
+                    <Button variant="ghost" size="sm" type="button" className="col-start-2 row-start-1 border-transparent sm:col-start-3 sm:mb-1" disabled={groups.length < 2} title={groups.length < 2 ? 'At least one label starts work' : undefined} onClick={() => onChange(removeLabel(config, g))}>
                       Remove label
                     </Button>
                   </div>
                   <p className="text-sm text-muted-foreground" data-testid={`label-${g.primary}-team`}>
                     Coding: {t.coding.map((a) => label(config, a)).join(', ') || 'none'} · Review: {reviewing ? t.review.map((a) => label(config, a)).join(', ') || 'none' : 'none'}
-                    {custom ? ' · its own agents' : ' · installation defaults'}
+                    {custom ? ' · its own agents' : ' · your team'}
                   </p>
                   {custom && (
                     <>
                       {overrideLists(g.primary, `label-${g.primary}`)}
                       <div>
-                        <Button variant="ghost" size="sm" type="button" onClick={() => onChange(resetToDefaults(config, g.primary))}>
+                        <Button variant="secondary" size="sm" type="button" onClick={() => onChange(resetToDefaults(config, g.primary))}>
                           Reset to defaults
                         </Button>
                       </div>
@@ -438,7 +475,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
             })}
           </div>
           <form
-            className="flex flex-wrap items-end gap-2"
+            className="flex flex-col gap-1"
             onSubmit={(e) => {
               e.preventDefault();
               if (!newLabel.trim() || newLabelError) return;
@@ -446,12 +483,15 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
               setNewLabel('');
             }}
           >
-            <div className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
-              <Input label="Add a label" placeholder="art" hint="It starts work in every repository below, with the installation defaults until you customize it" value={newLabel} error={newLabelError} onChange={(e) => setNewLabel(e.target.value)} />
+            <div className="flex items-end gap-2">
+              <div className="min-w-0 flex-1">
+                <Input label="Add a label" placeholder="art" value={newLabel} error={newLabelError} onChange={(e) => setNewLabel(e.target.value)} />
+              </div>
+              <Button variant="secondary" type="submit" disabled={!newLabel.trim() || !!newLabelError}>
+                Add label
+              </Button>
             </div>
-            <Button variant="secondary" type="submit" disabled={!newLabel.trim() || !!newLabelError}>
-              Add label
-            </Button>
+            <p className="text-xs text-muted-foreground">It starts work in every repository below, with your team until you customize it.</p>
           </form>
         </CardBody>
 
@@ -459,7 +499,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
           <h3 className="font-medium">Repositories</h3>
           <p className="text-sm text-muted-foreground">
             Checks run after the agent; if they fail, nothing is published.{' '}
-            <a className="auth-link" href={installationSettingsUrl(view.tenant)} target="_blank" rel="noreferrer">
+            <a className="auth-link flex min-h-11 w-fit items-center sm:inline sm:min-h-0" href={installationSettingsUrl(view.tenant)} target="_blank" rel="noreferrer">
               Give the App more repositories ↗
             </a>
           </p>
@@ -525,14 +565,16 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                                 </span>
                               )}
                               {wf && (
-                                <button
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
                                   type="button"
-                                  className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+                                  className="border-transparent px-2 text-xs"
                                   aria-label={exception ? `Use the agents of ${quote(g.label)} in ${name}` : `Customize agents for ${quote(g.label)} in ${name}`}
                                   onClick={() => onChange(exception ? resetRepo(config, name, g) : customizeRepo(config, name, g, adapters))}
                                 >
                                   {exception ? 'Reset to the label’s agents' : 'Customize here'}
-                                </button>
+                                </Button>
                               )}
                             </div>
                             {exception && overrideLists(wf, `repo-${name}-${g.primary}`)}
@@ -601,7 +643,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
 
       <details className="rounded-lg border border-border p-4" open={errors.some((e) => /\.(prompt|timeoutMinutes|maxRevisions|model|effort)/.test(e.path)) || undefined} data-testid="advanced">
         <summary className="cursor-pointer text-sm font-medium">
-          Advanced <span className="font-normal text-muted-foreground">· models and effort, prompts, revision rounds, time limits, named pools</span>
+          Advanced <span className="font-normal text-muted-foreground">· models and effort, prompts, revision rounds, time limits</span>
         </summary>
         <div className="mt-4 flex flex-col gap-6">
           <section className="flex flex-col gap-3" aria-label="Models">
@@ -729,50 +771,68 @@ function LabelInput({ group, groups, error, onChange }: { group: LabelGroup; gro
 /**
  * What runs where: for every repository and label, who codes and who reviews, and whether that
  * is the installation's team, the label's own or the repository's own. Shown for any
- * configuration, including those the main page cannot edit.
+ * configuration, including those the main page cannot edit. A table from 640px up; on a phone
+ * each row stacks into a short card, each value with its column's name.
  */
 export function EffectiveConfig({ config, children }: { config: ConsoleConfig; children?: ReactNode }) {
   const rows = effective(config);
-  const source = { default: 'Installation defaults', label: 'The label’s own agents', repository: 'This repository only' } as const;
+  const source = { default: 'Your team', label: 'The label’s own agents', repository: 'This repository only' } as const;
+  const first = labelGroups(config)[0]?.label;
+  /**
+   * A cell's column name: on a phone, where the header row is not shown, it is real text (seen for
+   * Coding and Review, read by a screen reader for all four); from 640px up the header says it.
+   */
+  const name = (text: string, seen = true) => <span className={`${seen ? 'mr-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground max-sm:inline' : 'sr-only'} sm:hidden`}>{text}{seen ? '' : ': '}</span>;
   return (
     <Card data-testid="effective-config">
       <CardHeader>
         <StepTitle>What will run</StepTitle>
-        <CardDescription>The effective configuration of this draft: who codes and who reviews, for each repository and label.</CardDescription>
+        <CardDescription>Who codes and who reviews, for each repository and label in this draft.</CardDescription>
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
         {rows.length === 0 ? (
-          <p className="text-sm text-muted-foreground">Nothing yet: turn on a repository.</p>
+          <p className="rounded-md border border-dashed border-border px-4 py-5 text-center text-sm text-muted-foreground" data-testid="effective-empty">
+            Nothing runs yet. Turn on a repository, then label an issue {first ? <code className="text-foreground">{first}</code> : 'with your label'} to start.
+          </p>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead className="text-xs uppercase tracking-wide text-muted-foreground">
-                <tr>
-                  <th scope="col" className="py-2 pr-3">Repository</th>
-                  <th scope="col" className="py-2 pr-3">Label</th>
-                  <th scope="col" className="py-2 pr-3">Coding</th>
-                  <th scope="col" className="py-2 pr-3">Review</th>
-                  <th scope="col" className="py-2">From</th>
+          <table role="table" className="w-full text-left text-sm max-sm:block">
+            <thead role="rowgroup" className="text-xs uppercase tracking-wide text-muted-foreground max-sm:sr-only">
+              <tr role="row">
+                <th role="columnheader" scope="col" className="py-2 pr-3">Repository</th>
+                <th role="columnheader" scope="col" className="py-2 pr-3">Label</th>
+                <th role="columnheader" scope="col" className="py-2 pr-3">Coding</th>
+                <th role="columnheader" scope="col" className="py-2 pr-3">Review</th>
+                <th role="columnheader" scope="col" className="py-2">From</th>
+              </tr>
+            </thead>
+            <tbody role="rowgroup" className="divide-y divide-border max-sm:block">
+              {rows.map((r) => (
+                <tr role="row" key={`${r.repository}:${r.workflow}`} className="max-sm:grid max-sm:grid-cols-[auto_minmax(0,1fr)] max-sm:gap-x-2 max-sm:gap-y-1 max-sm:py-3" data-testid={`effective-${r.repository}-${r.label}`}>
+                  <td role="cell" className="py-2 pr-3 max-sm:p-0 max-sm:font-medium">
+                    {name('Repository', false)}
+                    {r.repository}
+                    {r.paused && <span className="font-normal text-muted-foreground"> (paused)</span>}
+                  </td>
+                  <td role="cell" className="py-2 pr-3 max-sm:p-0">
+                    {name('Label', false)}
+                    <code>{r.label}</code>
+                  </td>
+                  <td role="cell" className="py-2 pr-3 max-sm:col-span-2 max-sm:p-0">
+                    {name('Coding')}
+                    {r.coding.join(', ') || '—'}
+                  </td>
+                  <td role="cell" className="py-2 pr-3 max-sm:col-span-2 max-sm:p-0">
+                    {name('Review')}
+                    {r.review.join(', ') || 'No automated review'}
+                  </td>
+                  <td role="cell" className="py-2 text-muted-foreground max-sm:col-span-2 max-sm:p-0 max-sm:text-xs">
+                    {name('From', false)}
+                    {source[r.source]}
+                  </td>
                 </tr>
-              </thead>
-              <tbody className="divide-y divide-border">
-                {rows.map((r) => (
-                  <tr key={`${r.repository}:${r.workflow}`} data-testid={`effective-${r.repository}-${r.label}`}>
-                    <td className="py-2 pr-3">
-                      {r.repository}
-                      {r.paused && <span className="text-muted-foreground"> (paused)</span>}
-                    </td>
-                    <td className="py-2 pr-3">
-                      <code>{r.label}</code>
-                    </td>
-                    <td className="py-2 pr-3">{r.coding.join(', ') || '—'}</td>
-                    <td className="py-2 pr-3">{r.review.join(', ') || 'No automated review'}</td>
-                    <td className="py-2 text-muted-foreground">{source[r.source]}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </table>
         )}
         {children}
       </CardBody>
@@ -782,18 +842,95 @@ export function EffectiveConfig({ config, children }: { config: ConsoleConfig; c
 
 /**
  * A section title one level below the page's heading (the kit's CardTitle is always an h3), so
- * the steps are the page's second-level headings and a screen reader's outline follows them.
+ * the steps are the page's second-level headings and a screen reader's outline follows them. In
+ * the first setup each step has its number in a circle, a tick once it is done; the number is
+ * also in the heading's text ("1 · Connect agents"), for a screen reader.
  */
-function StepTitle({ children }: { children: ReactNode }) {
-  return <h2 className="card-title">{children}</h2>;
+function StepTitle({ children, n, done }: { children: ReactNode; n?: number; done?: boolean }) {
+  if (n === undefined) return <h2 className="card-title">{children}</h2>;
+  return (
+    <h2 className="card-title flex items-center gap-2">
+      <span
+        aria-hidden="true"
+        data-n={done ? '✓' : n}
+        className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold before:content-[attr(data-n)] ${done ? 'bg-success-600 text-white' : 'bg-primary-600 text-white'}`}
+      />
+      <span>
+        <span className="sr-only">{n} ·</span> {children}
+      </span>
+    </h2>
+  );
 }
 
-/** An info icon with a tooltip, shown on hover and on focus (so a tap shows it too); clicking it may act. */
+/** Another way to pay for an agent (a subscription instead of an API key): one row, a link and its status. */
+function AltPlan({ to, name, status, testId }: { to: string; name: string; status?: string; testId?: string }) {
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-dashed border-border pr-3 text-sm" data-testid={testId}>
+      <Link className="group flex min-h-11 min-w-0 flex-1 flex-col justify-center rounded-md px-3 py-1.5 hover:bg-muted/60" to={to}>
+        <span className="auth-link group-hover:underline">{name} →</span>
+        <span className="text-xs text-muted-foreground">Instead of an API key</span>
+      </Link>
+      {status && (
+        <StatusBadge tone={status === 'Connected' ? 'success' : 'warning'} className="shrink-0 whitespace-nowrap">
+          {status}
+        </StatusBadge>
+      )}
+    </div>
+  );
+}
+
+/** The tooltip's widest (15rem) and how close it may come to either edge of the window. */
+const TIP_WIDTH = 240;
+const TIP_MARGIN = 8;
+
+/**
+ * Where a tooltip goes, for an icon at `left`..`right` in a window `viewport` wide: as wide as
+ * min(15rem, 100vw - 1rem), starting at the icon, and moved along so that it stays at least 8px
+ * inside both edges. `left` is its offset from the icon's left edge (the tip's containing box).
+ */
+export function tipPlacement(icon: { left: number }, viewport: number): { left: number; width: number } {
+  const width = Math.min(TIP_WIDTH, viewport - 2 * TIP_MARGIN);
+  const start = Math.min(Math.max(icon.left, TIP_MARGIN), viewport - TIP_MARGIN - width);
+  return { left: start - icon.left, width };
+}
+
+/**
+ * An info icon with a tooltip, shown on hover and on focus (so a tap shows it too); clicking it may
+ * act. The tip takes no room until it shows, so it never widens a phone's page, and it is placed
+ * from the icon's position, when it opens and whenever the window changes while it is open, so it
+ * always stays on screen.
+ */
 function InfoTip({ label, text, onClick, hidden }: { label: string; text: string; onClick?: () => void; hidden?: boolean }) {
   const id = useId();
+  const anchor = useRef<HTMLSpanElement>(null);
+  const [open, setOpen] = useState(false);
+  const [place, setPlace] = useState<{ left: number; width: number } | null>(null);
+  const measure = useCallback(() => {
+    if (anchor.current) setPlace(tipPlacement(anchor.current.getBoundingClientRect(), window.innerWidth));
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    window.addEventListener('resize', measure);
+    window.addEventListener('orientationchange', measure);
+    return () => {
+      window.removeEventListener('resize', measure);
+      window.removeEventListener('orientationchange', measure);
+    };
+  }, [open, measure]);
+  const show = () => {
+    measure();
+    setOpen(true);
+  };
   return (
-    <span className="group relative inline-flex">
-      <button type="button" aria-label={label} aria-describedby={id} onClick={onClick} className="inline-flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500">
+    <span
+      ref={anchor}
+      className="group relative inline-flex shrink-0"
+      onMouseEnter={show}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={show}
+      onBlur={() => setOpen(false)}
+    >
+      <button type="button" aria-label={label} aria-describedby={id} onClick={onClick} className="inline-flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500">
         <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className="h-4 w-4">
           <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.25v3.25a.75.75 0 0 0 1.5 0V9.75A.75.75 0 0 0 10 9H9Z" clipRule="evenodd" />
         </svg>
@@ -801,7 +938,8 @@ function InfoTip({ label, text, onClick, hidden }: { label: string; text: string
       <span
         role="tooltip"
         id={id}
-        className={`pointer-events-none absolute bottom-full left-0 z-20 mb-2 w-64 rounded-md ${hidden ? 'hidden' : ''} bg-foreground px-3 py-2 text-xs leading-snug text-background opacity-0 shadow-lg transition-opacity group-hover:opacity-100 group-focus-within:opacity-100`}
+        style={place ? { left: place.left, width: place.width } : undefined}
+        className={`pointer-events-none absolute bottom-full left-0 z-20 mb-2 w-[min(15rem,calc(100vw-1rem))] rounded-md hidden bg-foreground px-3 py-2 text-xs font-normal leading-snug text-background shadow-lg ${hidden ? '' : 'group-hover:block group-focus-within:block'}`}
       >
         {text}
       </span>

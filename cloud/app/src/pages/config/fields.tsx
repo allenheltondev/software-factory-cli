@@ -45,9 +45,9 @@ export function PromptField({ label, value, onChange, onReset, error, packaged }
   );
 }
 
-export function Check({ checked, onChange, disabled, children, testId }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; children: ReactNode; testId?: string }) {
+export function Check({ checked, onChange, disabled, children, testId, className = '' }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; children: ReactNode; testId?: string; className?: string }) {
   return (
-    <label className={`flex items-center gap-2 text-sm ${disabled ? 'opacity-60' : ''}`}>
+    <label className={`flex items-center gap-2 text-sm ${disabled ? 'opacity-60' : ''} ${className}`}>
       <input type="checkbox" className="h-4 w-4 shrink-0" checked={checked} disabled={disabled} data-testid={testId} onChange={(e) => onChange(e.target.checked)} />
       <span>{children}</span>
     </label>

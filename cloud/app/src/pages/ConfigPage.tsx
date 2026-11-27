@@ -133,7 +133,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
         <Link className="auth-link" to={valid ? `/installations/${installationId}` : '/'}>
           ← Installation
         </Link>
-        {load.state === 'loading' && <Skeleton className="h-24" />}
+        {load.state === 'loading' && <ConfigSkeleton />}
         {load.state === 'error' && (
           <Alert variant="error" data-testid="config-error">
             {load.message}
@@ -191,7 +191,7 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
       setErrors([]);
       setWarnings(out.warnings);
       if (yaml !== null) setYaml(out.yaml);
-      setNotice(`Published version ${out.version}. New jobs start with it; running jobs keep the version they started with.`);
+      setNotice(`Published version ${out.version}. New jobs use it; running jobs finish on the version they started with.`);
       return out.version;
     } catch (err) {
       if (err instanceof ConfigInvalidError) {
@@ -219,6 +219,10 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
   const simple = mode === 'simple' && custom.length === 0;
   const blockers = simple ? simpleBlockers(config, view) : [];
   const changes = dirty && saved ? describeChanges(JSON.parse(saved) as ConsoleConfig, config) : [];
+  /** Published, and nothing changed since: the button says so instead of looking broken. */
+  const unchanged = !dirty && activeVersion !== null;
+  /** After a publish: the label that starts work, as the next thing to try. */
+  const nextLabel = labelGroups(config)[0]?.label;
 
   return (
     <div className="flex flex-col gap-6" data-testid="config-page">
@@ -242,7 +246,8 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
           </p>
         </div>
         <span className="flex flex-wrap gap-4">
-          <Link className="auth-link" to={`/installations/${installationId}/claude`}>Claude subscription routing</Link>
+          {/* On the simple page the Claude card has this link, beside the key it replaces. */}
+          {!simple && <Link className="auth-link" to={`/installations/${installationId}/claude`}>Claude subscription routing</Link>}
           {!simple && isSimple(config) && (
             <button type="button" className="auth-link" onClick={() => setMode('simple')}>
               Simple view
@@ -333,24 +338,37 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
             </pre>
           )}
 
-          <div className="sticky bottom-0 z-10 -mx-4 flex flex-col gap-3 border-t border-border bg-background/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur" data-testid="publish-bar">
+          <div className="sticky bottom-0 z-10 -mx-4 flex flex-col gap-3 border-t border-border bg-background/95 px-4 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))] backdrop-blur sm:py-3" data-testid="publish-bar">
             {notice && (
-              <Alert variant="success" data-testid="config-published">
-                {notice}
-                {firstPublish && (
-                  <span className="mt-1 block" data-testid="first-publish">
-                    Try it: add the label <code>{firstPublish.label}</code> to an issue in{' '}
-                    {firstPublish.repositories.map((r, i) => (
-                      <span key={r}>
-                        {i > 0 && ', '}
-                        <a className="auth-link font-semibold" href={`https://github.com/${r}/issues`} target="_blank" rel="noreferrer">
-                          {r} ↗
-                        </a>
-                      </span>
-                    ))}
-                    .
+              <Alert variant="success" data-testid="config-published" className="animate-slide-up">
+                <span className="flex items-start gap-3">
+                  <span aria-hidden="true" className="mt-0.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-success-600 text-sm font-bold text-white">
+                    ✓
                   </span>
-                )}
+                  <span className="flex min-w-0 flex-col gap-1">
+                    <span className="font-semibold">{firstPublish ? 'You’re live. ' : ''}{notice}</span>
+                    {firstPublish ? (
+                      <span data-testid="first-publish">
+                        Try it: add the label <code>{firstPublish.label}</code> to an issue in{' '}
+                        {firstPublish.repositories.map((r, i) => (
+                          <span key={r}>
+                            {i > 0 && ', '}
+                            <a className="auth-link font-semibold" href={`https://github.com/${r}/issues`} target="_blank" rel="noreferrer">
+                              {r} ↗
+                            </a>
+                          </span>
+                        ))}
+                        . A coding agent picks it up and opens a pull request.
+                      </span>
+                    ) : (
+                      nextLabel && (
+                        <span data-testid="publish-next">
+                          Next: label an issue <code>{nextLabel}</code> to start work.
+                        </span>
+                      )
+                    )}
+                  </span>
+                </span>
               </Alert>
             )}
 
@@ -396,25 +414,32 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
                 </ul>
               </Alert>
             )}
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <span className="min-w-0 text-sm">
+            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+              <span className="min-w-0 flex-1 basis-56 text-sm">
                 {/* What still blocks a publish says more than the state, so it takes its place. */}
                 {blockers.length > 0 ? (
-                  <span className="text-muted-foreground" data-testid="blockers">
-                    To publish: {blockers.join(' ')}
+                  <span className="flex items-start gap-2 text-muted-foreground" data-testid="blockers">
+                    <span aria-hidden="true" className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-warning-500" />
+                    <span>
+                      <span className="font-medium text-foreground">To publish:</span> {blockers.join(' ')}
+                    </span>
                   </span>
                 ) : (
-                  <span data-testid="draft-state" className={dirty && activeVersion !== null ? 'font-medium' : 'text-muted-foreground'}>
-                    {activeVersion === null ? 'Draft · no live version' : dirty ? `Unsaved changes · version ${activeVersion} is live` : `Version ${activeVersion} is active`}
+                  <span data-testid="draft-state" className="flex items-center gap-2">
+                    <span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${activeVersion === null || dirty ? 'bg-primary-500' : 'bg-success-500'}`} />
+                    <span className={dirty && activeVersion !== null ? 'font-medium' : 'text-muted-foreground'}>
+                      {activeVersion === null ? 'Ready to publish your first version' : dirty ? `Unsaved changes · version ${activeVersion} is live` : `Version ${activeVersion} is active`}
+                    </span>
                   </span>
                 )}
               </span>
-              <div className="flex shrink-0 justify-end gap-2">
-                <Button variant="ghost" size="sm" type="button" loading={busy === 'preview'} disabled={busy !== null} onClick={() => (yaml !== null ? setYaml(null) : void preview())}>
+              <div className="ml-auto flex shrink-0 items-center justify-end gap-1">
+                {/* Looking at the YAML is a side trip, so it is a quiet text button beside the one real action. */}
+                <Button variant="ghost" size="sm" type="button" className="border-transparent" loading={busy === 'preview'} disabled={busy !== null} onClick={() => (yaml !== null ? setYaml(null) : void preview())}>
                   {yaml !== null ? 'Hide config' : 'View config'}
                 </Button>
-                <Button type="button" loading={busy === 'publish'} disabled={busy !== null || readOnly || blockers.length > 0 || (!dirty && activeVersion !== null)} onClick={() => void publish()}>
-                  Publish
+                <Button type="button" variant={unchanged ? 'secondary' : 'primary'} loading={busy === 'publish'} disabled={busy !== null || readOnly || blockers.length > 0 || unchanged} onClick={() => void publish()}>
+                  {unchanged ? 'No changes' : 'Publish'}
                 </Button>
               </div>
             </div>
@@ -468,6 +493,33 @@ export function ConfigPage({ api = defaultApi }: { api?: ConfigApi }) {
           </div>
         </div>
       </Modal>
+    </div>
+  );
+}
+
+/**
+ * The page's shape while it loads: the header and the three steps, so nothing jumps when the
+ * configuration arrives.
+ */
+function ConfigSkeleton() {
+  return (
+    <div className="flex flex-col gap-4 sm:gap-6" data-testid="config-skeleton" role="status" aria-busy="true">
+      <span className="sr-only">Loading the configuration…</span>
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-4 w-64 max-w-full" />
+      </div>
+      {[2, 4, 3].map((rows, i) => (
+        <div key={i} className="card flex flex-col gap-4 p-4 sm:p-5">
+          <Skeleton className="h-5 w-40" />
+          <Skeleton className="h-4 w-full max-w-md" />
+          <div className="grid gap-3 sm:grid-cols-2">
+            {Array.from({ length: rows }, (_, j) => (
+              <Skeleton key={j} className="h-20" />
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

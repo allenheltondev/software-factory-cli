@@ -135,20 +135,31 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
   const onSaved = (view: AgentKeysView) => setLoad({ state: 'ok', view });
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 sm:gap-6">
       <Link className="auth-link" to={`/installations/${id}`}>
         ← Installation
       </Link>
       <h1 className="text-2xl font-semibold">Agent keys</h1>
-      <Link className="auth-link" to={'/installations/' + id + '/claude'} state={{ connectClaude: true }}>Connect Claude account →</Link>
-      {codex.available && (
-        <p className="flex flex-wrap items-center gap-2" data-testid="codex-chatgpt">
-          <Link className="auth-link" to={'/installations/' + id + '/codex'}>Connect ChatGPT account →</Link>
-          {codex.status && <StatusBadge tone={codex.status === 'Connected' ? 'success' : 'warning'}>{codex.status}</StatusBadge>}
-        </p>
-      )}
+      {/* Subscriptions instead of keys: one row each, the link and its status on one line. */}
+      <section className="flex flex-col divide-y divide-border rounded-lg border border-dashed border-border" aria-label="Use a subscription instead of a key">
+        <div className="flex min-h-11 items-center px-4">
+          <Link className="auth-link inline-flex min-h-11 items-center" to={'/installations/' + id + '/claude'} state={{ connectClaude: true }}>Connect Claude account →</Link>
+        </div>
+        {codex.available && (
+          // The label stays on one line; at narrow widths the badge drops below it.
+          <div className="flex min-h-11 flex-wrap items-center justify-between gap-x-3 px-4" data-testid="codex-chatgpt">
+            <Link className="auth-link inline-flex min-h-11 items-center whitespace-nowrap" to={'/installations/' + id + '/codex'}>Connect ChatGPT account →</Link>
+            {codex.status && <StatusBadge tone={codex.status === 'Connected' ? 'success' : 'warning'} className="-mt-1 mb-2.5 shrink-0 whitespace-nowrap xs:my-0">{codex.status}</StatusBadge>}
+          </div>
+        )}
+      </section>
 
-      {load.state === 'loading' && <Skeleton className="h-40" />}
+      {load.state === 'loading' && (
+        <div className="flex flex-col gap-4" data-testid="keys-skeleton">
+          <Skeleton className="h-36" />
+          <Skeleton className="h-36" />
+        </div>
+      )}
       {load.state === 'error' && (
         <Alert variant="error" data-testid="keys-error">
           {load.message}
@@ -270,14 +281,15 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
         </CardTitle>
       </CardHeader>
       <CardBody>
-        <div className="flex flex-col gap-4">
+        <div className="flex flex-col gap-3 sm:gap-4">
           {provider.guide && (
-            <p className="flex flex-wrap gap-x-4 gap-y-1 text-sm" data-testid={`key-guide-${k.name}`}>
-              <a className="auth-link" href={provider.guide.getKeyUrl} target="_blank" rel="noreferrer">
+            // Phones give links a 44px target; centring the text in it keeps the gap below them even.
+            <p className="-my-1.5 flex flex-wrap gap-x-4 gap-y-0 text-sm sm:my-0" data-testid={`key-guide-${k.name}`}>
+              <a className="auth-link inline-flex items-center" href={provider.guide.getKeyUrl} target="_blank" rel="noreferrer">
                 Get API key ↗
               </a>
               {provider.guide.guides.map((g, i) => (
-                <a key={g.href} className="auth-link" href={g.href} target="_blank" rel="noreferrer">
+                <a key={g.href} className="auth-link inline-flex items-center" href={g.href} target="_blank" rel="noreferrer">
                   {i === 0 ? 'Setup guide' : g.label} ↗
                 </a>
               ))}
@@ -370,8 +382,9 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
             </form>
           ) : (
             <div>
+              {/* A key whose last job failed: rotating it is the card's one urgent action. */}
               <Button
-                variant="secondary"
+                variant={k.lastUsed && !k.lastUsed.ok ? 'primary' : 'secondary'}
                 onClick={() => {
                   setSaved(false);
                   setEditing(true);
