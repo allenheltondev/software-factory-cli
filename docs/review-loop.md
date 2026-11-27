@@ -102,9 +102,43 @@ checked against the branch's git ref (`GET git/ref/heads/<branch>`), which moves
 itself:
 
 - the ref is at Updraft's push: GitHub has not caught up. The head on record stays the pushed
-  commit, and its reviewer job stays queued and is looked at again shortly (logged, not recorded
-  as an error) instead of being canceled;
+  commit (the poller does not take such a read for a move, however old the push is), and its
+  reviewer job is not canceled: it stays queued and is looked at again after the worker's next
+  poll (logged, not recorded as an error);
 - the ref is anywhere else (a person pushed the branch back, say): the move is believed at once.
+
+That wait has real bounds
+([#199](https://github.com/allenheltondev/software-factory-cli/issues/199)):
+
+- **At most 30 minutes after the push.** A reviewer job whose pull request still shows the
+  replaced commit 30 minutes after Updraft's push (with the ref at the push) stops waiting: it is
+  canceled with a reason that starts `lag_stuck`, and one please-act comment on the pull request
+  (marker `<!-- updraft-lag-stuck: <pushed sha> -->`, posted in quiet and verbose notifications
+  alike) says GitHub has not updated the pull request to the pushed commit, and to re-run the
+  review (`updraft retry <job>`, or the job's page on Updraft Cloud) once it shows the commit, or
+  push a commit to continue. `updraft status` then shows the pull request as `needs-human`, with
+  that reason. A push dated after the current time (a clock that ran ahead) is not waited for.
+  A failure to post the comment that may pass (a 5xx, a rate limit) leaves the job queued and is
+  tried again on the next pass; any other failure is named in the cancel reason.
+- **`updraft start`** looks at the job again after every poll, so it is the 30 minutes that bound
+  it there. The poller reads the ref for such a lagging read only while that matters: once the
+  push is more than 30 minutes old and no reviewer job for the pushed head is queued or running
+  (it stopped as `lag_stuck`), the read is still not believed, but the ref is no longer read on
+  every poll. A re-run of the review, or a new push, ends that.
+- **`updraft run-event`** (and so Updraft Cloud) waits only as long as its drain waits for a
+  queued job that cannot start: about 60 seconds. The run then ends `stalled`, and the job stays
+  queued in the state database. The next delivery for the pull request (a check suite, with or
+  without ciFix, below) takes it up again, with the same 30-minute bound from the push.
+- **On Updraft Cloud**, a workflow left awaiting a review, reviewing or revising is looked at by
+  the workflow reconciler 25 minutes after its wait began, and again at 30 minutes (it runs
+  every five minutes), instead of after two hours. If GitHub's pull request shows another commit
+  than its branch's git ref at both looks, with the branch at the same commit both times (two
+  looks at least five minutes apart within the wait, so a person's push that GitHub had not shown
+  yet at one look does not count), the workflow is blocked as `lag_stuck` (a `blocked` entry on its timeline) with the
+  please-act comment on the pull request ([assignment-comments.md](assignment-comments.md)):
+  GitHub has not updated the pull request to the pushed commit; re-run the last job from its page
+  once it shows the commit, or push a commit to the branch. A pull request that caught up is left
+  to the usual stall rule (blocked as `stalled` after six hours without a job).
 
 A client that cannot read the ref believes such a read only five minutes after the push (a push
 dated after the current time, a clock that ran ahead, is not waited for). Should a reviewer job
@@ -113,11 +147,16 @@ most three times), so a head Updraft pushed is not left without a review.
 
 Updraft's own push starts no event (Updraft Cloud does not start a job for a `synchronize` the
 App sent: the run that pushed handles what follows). When that run could not review the head, a
-check suite of the pull request carries the loop on: with ciFix on, as for any check suite; with
-ciFix off, a check suite is looked at while the pull request's loop waits on its head (no review
-of the head was posted, or its suggestion revision holds it). On Updraft Cloud that is read from
-the pull request's workflow record (stage awaiting review, reviewing or revising, not finished);
-any other check suite with ciFix off still starts nothing.
+check suite of the pull request carries the loop on: with ciFix on, as for any check suite. With
+ciFix off, a check suite is looked at only for a stuck shape: the pull request's loop waits on its
+head (no review of the head was posted, or its suggestion revision holds it), and no run that is
+still going has the head's reviewer job or a revision of the pull request queued or running (its
+hold in the state database, [shared-state.md](shared-state.md)): a review canceled as "moved", a
+suggestion revision that ended without its head being reviewed, or a job a run that has ended
+left queued. On Updraft Cloud that is read from the pull request's workflow record: stage
+awaiting review, reviewing or revising, not finished, and no job of the workflow running or
+queued (so no microVM is launched for a check suite while the job that will review the head is
+on its way). Any other check suite with ciFix off still starts nothing.
 
 Turning `review` on for a repository that already has open PRs opened by Updraft reviews
 their current heads.

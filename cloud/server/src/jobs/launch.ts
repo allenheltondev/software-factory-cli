@@ -450,7 +450,7 @@ export function createLauncher(deps: LaunchDeps) {
       };
       let d = decidePullRequestDispatch(config?.dispatch, event, req.appBot ? { appBot: req.appBot } : {});
       // A check suite with ciFix off: still a job when the pull request's loop waits on its head
-      // (#197). One read of its workflow, only then.
+      // (#197) and no job of its workflow is running or queued (#199). One read of its workflow, only then.
       if (!d.start && d.code === 'loop_off' && eventName === 'check_suite' && deps.workflows && typeof event.repositoryId === 'number' && typeof event.number === 'number' &&
         await Promise.resolve().then(() => deps.workflows!.loopWaitsOnHead(req.installationId, event.repositoryId as number, event.number as number)).catch(() => false)) {
         d = decidePullRequestDispatch(config?.dispatch, event, { ...(req.appBot ? { appBot: req.appBot } : {}), loopWaitsOnHead: true });

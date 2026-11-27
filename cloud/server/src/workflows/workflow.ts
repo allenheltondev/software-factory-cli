@@ -50,6 +50,11 @@ export interface Workflow {
   waitingSince?: string;
   /** Awaiting a sign-in for Codex's ChatGPT plan (#125). Absent: a Claude sign-in, as before. */
   signInProvider?: 'codex';
+  /**
+   * The branch commit a wait on the head's review last found GitHub's pull request not showing,
+   * and when (reconcile.ts, #199): lag_stuck is blocked only on a second look that finds the same.
+   */
+  headLag?: { branch: string; at: string };
   /** Pull requests of earlier runs (newest last, at most MAX_PAST_PULL_REQUESTS): their events are history of the run they belong to. */
   pastPullRequests?: { number: number; generation: number }[];
   createdAt: string;
@@ -210,6 +215,25 @@ export const CI_WAIT_LIMIT_MS = 24 * 60 * 60 * 1000;
 /** A loop stage that waits for an event (a review, a push) is looked at after this, and blocked after STALL_LIMIT_MS. */
 export const STALL_CHECK_MS = 2 * 60 * 60 * 1000;
 export const STALL_LIMIT_MS = 6 * 60 * 60 * 1000;
+/**
+ * Loop stages in which the pull request waits on a review of its head: a check suite may be the
+ * only delivery for it (recorder.ts loopWaitsOnHead, #197), and GitHub's pull request may lag
+ * behind the App's own push of that head.
+ */
+export const LOOP_WAITS_ON_HEAD = ['awaiting-review', 'reviewing', 'revising'] as const;
+/**
+ * How long a workflow waits in one of those stages while GitHub's pull request still shows another
+ * commit than its branch (the App's push never reached the pull request): then it is blocked as
+ * `lag_stuck`, with a please-act comment (reconcile.ts, #199). Such a wait is looked at
+ * HEAD_LAG_RECHECK_MS before this, instead of after STALL_CHECK_MS, and again at it.
+ */
+export const HEAD_LAG_LIMIT_MS = 30 * 60 * 1000;
+/**
+ * A mismatch first seen at or past HEAD_LAG_LIMIT_MS is looked at once more, this long after, and
+ * blocked only if the branch is still at the same commit GitHub's pull request does not show: a
+ * person's push that GitHub had not shown yet at that one look does not block the workflow (#199).
+ */
+export const HEAD_LAG_RECHECK_MS = 5 * 60 * 1000;
 
 const ISSUE_EVENTS = new Set(['issues']);
 
@@ -251,7 +275,7 @@ export function newWorkflow(job: Pick<Job, 'installationId' | 'repository' | 're
 }
 
 const clearWait = (w: Workflow): Workflow => {
-  const { reason: _r, message: _m, nextAction: _n, nextCheckAt: _c, waitingSince: _w, controlPause: _p, signInProvider: _s, ...rest } = w;
+  const { reason: _r, message: _m, nextAction: _n, nextCheckAt: _c, waitingSince: _w, controlPause: _p, signInProvider: _s, headLag: _h, ...rest } = w;
   return rest as Workflow;
 };
 
@@ -423,7 +447,10 @@ function settle(w: Workflow, outcome: string, stage: LoopStage | undefined, at: 
       return finished('done');
     default:
       // awaiting-review, reviewing, changes-requested, revising, fixing-ci: the next job comes from a GitHub event.
-      return waiting(stage, 'awaiting_event', 'Waiting for the next step of the review loop to start.', STALL_CHECK_MS);
+      // A wait on the head's review is looked at sooner: GitHub's pull request may never show the
+      // App's push (#199). First HEAD_LAG_RECHECK_MS before the cap, so the second look a block
+      // needs falls at the cap.
+      return waiting(stage, 'awaiting_event', 'Waiting for the next step of the review loop to start.', (LOOP_WAITS_ON_HEAD as readonly string[]).includes(stage) ? HEAD_LAG_LIMIT_MS - HEAD_LAG_RECHECK_MS : STALL_CHECK_MS);
   }
 }
 

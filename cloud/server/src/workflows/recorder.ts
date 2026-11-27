@@ -7,7 +7,7 @@
 import type { Job, JobFinishDetail, Store, WorkflowPause } from '../store/store.js';
 import type { WorkflowStore } from './store.js';
 import { actorOf, endedWait, keepPaused, overlayOf, pauseControlOf, pausedWorkflow, pauseNoticedMessage, resumedWorkflow, stillPausedMessage, waitFrom, type PauseRef } from './timeline.js';
-import { newWorkflow, onJobFinished, onJobQueued, onJobStarted, onJobWaiting, onQueueCovered, onQueueEnded, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
+import { LOOP_WAITS_ON_HEAD, newWorkflow, onJobFinished, onJobQueued, onJobStarted, onJobWaiting, onQueueCovered, onQueueEnded, workflowIdFor, type Workflow, type WorkflowEvent } from './workflow.js';
 
 type JobRef = Pick<Job, 'jobId' | 'installationId' | 'repository' | 'repositoryId' | 'issue' | 'pullRequest' | 'eventName' | 'deliveryId'> & Partial<Pick<Job, 'expiresAt' | 'native'>>;
 
@@ -121,11 +121,15 @@ export function createWorkflowRecorder(o: {
      * the last job left it awaiting a review, reviewing, or revising (a suggestion revision whose
      * push the pull request does not show yet). Then a check suite of the pull request is worth a
      * job even with ciFix off: the App's own push starts none, and it may be the only delivery.
+     *
+     * Not while a job of the workflow is running or queued (#199): that job carries the loop on,
+     * and another one would launch a microVM only to find nothing new to do.
      */
     async loopWaitsOnHead(installationId: number, repositoryId: number, pullRequest: number): Promise<boolean> {
       const id = await o.store.workflowOfPullRequest(installationId, repositoryId, pullRequest);
       const w = id ? await o.store.getWorkflow(installationId, id) : null;
-      return !!w && w.status !== 'finished' && (LOOP_WAITS_ON_HEAD as readonly string[]).includes(w.stage);
+      if (!w || w.status === 'finished' || w.status === 'active' || w.pendingJobId || w.stage === 'queued') return false;
+      return (LOOP_WAITS_ON_HEAD as readonly string[]).includes(w.stage);
     },
     /** A job was launched (jobs/launch.ts). */
     started: (job: JobRef) =>
@@ -312,4 +316,4 @@ export function createWorkflowRecorder(o: {
 export type WorkflowRecorder = ReturnType<typeof createWorkflowRecorder>;
 
 /** Loop stages in which the pull request waits on a review of its head (loopWaitsOnHead). */
-export const LOOP_WAITS_ON_HEAD = ['awaiting-review', 'reviewing', 'revising'] as const;
+export { LOOP_WAITS_ON_HEAD };

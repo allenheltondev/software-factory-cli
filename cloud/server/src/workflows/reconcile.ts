@@ -16,6 +16,9 @@
  *   the latest job's worker was lost          with recovery configured, an implementation that
  *                                             published nothing is retried once (recovery.ts);
  *                                             otherwise it stays blocked, saying why
+ *   waiting on a review of the head, while   blocked as lag_stuck after HEAD_LAG_LIMIT_MS: the
+ *     GitHub's pull request shows another      App's push never reached the pull request (#199)
+ *     commit than its branch
  *   waiting for the next loop event           blocked after STALL_LIMIT_MS: no job has run
  *
  * It decides from GitHub's own answers (the pull request's state and head, the head's check runs
@@ -36,14 +39,14 @@ import { pauseControlOf, pausedWorkflow, pauseNoticedMessage, resumedWorkflow } 
 import { createRecovery, type RecoveryDeps } from './recovery.js';
 import type { BlockNotifier } from '../jobs/notices.js';
 import type { WorkflowStore } from './store.js';
-import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
+import { CI_RECHECK_MS, CI_WAIT_LIMIT_MS, HEAD_LAG_LIMIT_MS, HEAD_LAG_RECHECK_MS, LOOP_WAITS_ON_HEAD, onJobFinished, PR_POLL_MS, SIGN_IN_LIMIT_MS, STALL_LIMIT_MS, type Workflow, type WorkflowEvent } from './workflow.js';
 
 export interface WorkflowReconcilerDeps {
   store: WorkflowStore;
   controls: Pick<Store, 'getWorkflowPause'>;
   /** The jobs' own records, for a workflow whose job's finish was never recorded on it. */
   jobs?: Pick<Store, 'getJob' | 'getJobSummary'>;
-  github: Pick<GitHubApi, 'createInstallationToken' | 'pullRequestHead' | 'commitChecks' | 'issueState' | 'matchingBranches' | 'pullRequestsByHeadPrefix'>;
+  github: Pick<GitHubApi, 'createInstallationToken' | 'pullRequestHead' | 'commitChecks' | 'issueState' | 'matchingBranches' | 'pullRequestsByHeadPrefix' | 'branchHead'>;
   /**
    * Fenced automatic recovery (recovery.ts): the launcher and the console retry it may start work
    * through. Absent: report only, as before. It also needs `jobs`.
@@ -84,6 +87,7 @@ export interface ReconcileReport {
 }
 
 const short = (sha: string) => sha.slice(0, 12);
+const samePrefix = (a: string, b: string) => a.startsWith(b) || b.startsWith(a);
 /** A PAUSE record's command descriptor (PR #168), when it has a well-formed one. */
 const withControl = (raw: unknown) => {
   const control = pauseControlOf(raw);
@@ -210,9 +214,11 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     }
     const settings = await deps.loadSettings();
     if (!settings) throw new Error('the App settings are unavailable');
+    const waitsOnHead = (LOOP_WAITS_ON_HEAD as readonly string[]).includes(w.stage);
     const { token } = await deps.github.createInstallationToken(appJwt(settings.appId, settings.privateKey, at), w.installationId, {
       repositoryIds: [w.repositoryId],
-      permissions: { pull_requests: 'read', checks: 'read', statuses: 'read' },
+      // The branch's git ref, only where it is read (a wait on a review of the head, #199).
+      permissions: { pull_requests: 'read', checks: 'read', statuses: 'read', ...(waitsOnHead && deps.github.branchHead ? { contents: 'read' as const } : {}) },
     });
     const pr = await deps.github.pullRequestHead(token, w.repository, w.pullRequest);
     if (pr.state !== 'open') {
@@ -231,6 +237,29 @@ export function createWorkflowReconciler(deps: WorkflowReconcilerDeps) {
     if (w.stage === 'ready-to-merge' || w.stage === 'needs-human') return void (await later(PR_POLL_MS));
 
     if (w.stage !== 'waiting-for-ci') {
+      // Waiting on a review of the head while GitHub's pull request still shows another commit
+      // than its branch: the App's push never reached the pull request, and the job that pushed
+      // could not review it (#199). Blocked once that has lasted HEAD_LAG_LIMIT_MS, never silent;
+      // and only when two looks at least HEAD_LAG_RECHECK_MS apart in this wait found the branch
+      // at the same commit, so a push GitHub had not shown yet at one look does not block it.
+      if (waitsOnHead && deps.github.branchHead && (pr.headRepoId == null || pr.headRepoId === w.repositoryId) && pr.headRef) {
+        const branch = await deps.github.branchHead(token, w.repository, pr.headRef);
+        if (branch && !samePrefix(branch, pr.headSha)) {
+          const seenAt = w.headLag?.branch === branch ? Date.parse(w.headLag.at) : NaN;
+          const seen = seenAt >= Date.parse(w.waitingSince ?? w.updatedAt) ? seenAt : undefined;
+          const lookAgain = (ms: number) =>
+            change(w, (cur) => ({ workflow: { ...cur, headLag: seen !== undefined && cur.headLag ? cur.headLag : { branch, at: iso(at) }, nextCheckAt: iso(at + ms), updatedAt: iso(at) } }));
+          if (waited < HEAD_LAG_LIMIT_MS) return void (await lookAgain(Math.max(HEAD_LAG_LIMIT_MS - waited, HEAD_LAG_RECHECK_MS)));
+          if (seen === undefined || at - seen < HEAD_LAG_RECHECK_MS) return void (await lookAgain(seen === undefined ? HEAD_LAG_RECHECK_MS : HEAD_LAG_RECHECK_MS - (at - seen)));
+          const minutes = Math.round(HEAD_LAG_LIMIT_MS / 60_000);
+          return block(
+            'lag_stuck',
+            `GitHub has not updated pull request #${w.pullRequest} to the pushed commit ${short(branch)}: its branch is at it, but the pull request still shows ${short(pr.headSha)} after ${minutes} minutes, so the commit was not reviewed.`,
+            'Re-run the last job from its page once the pull request shows the commit, or push a commit to the branch, to continue.',
+            `lag-stuck:${w.pullRequest}:${branch}`,
+          );
+        }
+      }
       if (waited < STALL_LIMIT_MS) return void (await later(STALL_LIMIT_MS - waited));
       const hours = Math.round(STALL_LIMIT_MS / 3_600_000);
       return block(
