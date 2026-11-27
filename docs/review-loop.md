@@ -57,6 +57,13 @@ It follows that branch protection which requires an approving review is not sati
 Updraft's reviewer. On such a branch a person still has to approve, and auto-merge is refused
 by GitHub until they have.
 
+The one exception: with `publishAs: user` ([Publishing as a person](github-app.md#publishing-as-a-person)),
+a person's account opens the pull request and the GitHub App reviews it, so the reviewer can
+submit a formal APPROVE or REQUEST_CHANGES pinned to the reviewed commit, or a comment that says
+why not. The verdict is still the worker's own record and is what acts; whether GitHub counts
+the App's approval toward a required review is up to GitHub's rules, and Updraft never claims it
+replaces a person's or a code owner's approval.
+
 ## Stages
 
 `updraft status` shows each watched PR under "Pull requests (review loop)" with its stage:

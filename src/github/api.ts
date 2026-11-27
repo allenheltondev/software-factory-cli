@@ -431,10 +431,21 @@ export interface GitHubApi {
   /** Every submitted review of one pull request, oldest first (REST, paginated internally). */
   listPullRequestReviews(repo: RepoRef, pullNumber: number): Promise<PullRequestReviewSummary[]>;
   /**
-   * Write: submit a COMMENT review on a pull request. Never an approval or a change request: the
-   * account that opened a pull request may not submit those on it. `commitId` pins it to a commit.
+   * Write: submit a review on a pull request. COMMENT unless `event` says otherwise: the account
+   * that opened a pull request may not approve or request changes on it, so APPROVE and
+   * REQUEST_CHANGES are only for a reviewer that is not the publisher (src/publish/review-form.ts),
+   * and need `commitId`, which pins the review to that commit.
    */
-  createPullRequestReview(repo: RepoRef, pullNumber: number, input: { body: string; commitId?: string; comments?: ReviewCommentInput[] }): Promise<PullRequestReviewSummary>;
+  createPullRequestReview(
+    repo: RepoRef,
+    pullNumber: number,
+    input: { body: string; commitId?: string; comments?: ReviewCommentInput[]; event?: 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES' },
+  ): Promise<PullRequestReviewSummary>;
+  /**
+   * Write: dismiss a review the worker itself submitted (an approval of a commit that is no longer
+   * the head). Optional: without it an outdated approval is left for GitHub's own rules.
+   */
+  dismissPullRequestReview?(repo: RepoRef, pullNumber: number, reviewId: number, message: string): Promise<void>;
   // Review threads (docs/review-loop.md, "Findings as threads"). Optional: without them the
   // review is posted as one comment with every finding in its body, and nothing is replied to.
   /** The files of a pull request's diff, with their patches (paginated internally; GitHub lists at most 3000). */

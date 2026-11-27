@@ -38,6 +38,7 @@ import {
   type ReviewFinding,
 } from '../db/review-findings.js';
 import { GitHubError, type GitHubApi, type PullRequestReviewComment, type ReviewCommentInput } from '../github/api.js';
+import { reviewFormSentence, type ReviewForm } from './review-form.js';
 import { sameLogin } from '../github/identity.js';
 import type { RepoRef, ReviewVerdict, RevisionFinding } from '../types.js';
 import { anchorFinding, type CommentableLines } from './anchors.js';
@@ -171,6 +172,8 @@ export function renderStructuredReview(o: {
   maxBody: number;
   /** What ran the review (run-details.ts selectionLine): fixed words and inline code only. */
   selection?: string;
+  /** How it is submitted on GitHub (review-form.ts). Default: the worker's comment review. */
+  form?: ReviewForm;
 }): string {
   const lines: string[] = [
     `**${ROLE.review} · Round ${o.round} · reviewed ${code(short(o.headSha))}**`,
@@ -210,7 +213,9 @@ export function renderStructuredReview(o: {
   }
   if (o.structured.omitted) lines.push(`Updraft: ${o.structured.omitted} more finding(s) or check(s) were beyond what one review carries; the reviewer's prose above may mention them.`, '');
   lines.push(
-    `Agent ${inline(o.agent)}, run ${code(o.runId)}. Posted as a comment review: the account that opened a pull request cannot approve or request changes on it, so the verdict is recorded by the worker.`,
+    o.form && !(o.form.event === 'COMMENT' && o.form.why === null)
+      ? `Agent ${inline(o.agent)}, run ${code(o.runId)}. ${reviewFormSentence(o.form)}`
+      : `Agent ${inline(o.agent)}, run ${code(o.runId)}. Posted as a comment review: the account that opened a pull request cannot approve or request changes on it, so the verdict is recorded by the worker.`,
     '',
     o.next,
   );

@@ -1729,3 +1729,87 @@ describe('acceptance criteria', () => {
     expect(s.gh.reviews[0]!.body).not.toContain('Acceptance criteria');
   });
 });
+
+describe('reviews of a pull request a person published (publishAs user)', () => {
+  /** The pull request was opened and pushed as alice; this worker (the App) reviews it. */
+  const asPerson = (o: Options = {}) => {
+    const s = setup(o);
+    s.db.prepare("UPDATE publications SET publisher_kind = 'user', publisher_login = 'alice', publisher_id = 7").run();
+    s.gh.pullAuthor = 'alice';
+    return s;
+  };
+
+  it('approves the reviewed commit formally, pinned to it, and says what that approval does not stand in for', async () => {
+    const s = asPerson();
+    const { result } = await s.round('ready-to-merge');
+    expect(result).toMatchObject({ status: 'published', review: { verdict: 'ready-to-merge', outcome: expect.any(String) } });
+    expect(s.gh.writes[0]).toBe(`review #${PR} APPROVE at ${H1}`);
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toContain('submitted as a GitHub approval of exactly this commit by `updraft-bot`');
+    expect(body).toContain('never in place of a review a person or code owner must give');
+  });
+
+  it('requests changes formally and queues exactly one revision, which the App\'s own review on GitHub does not queue again', async () => {
+    const s = asPerson({ workflow: { allowedActors: ['allen', 'updraft-bot'] } });
+    const { runId, result } = await s.round('changes-requested');
+    expect(result).toMatchObject({ review: { outcome: 'revision-queued' } });
+    expect(s.gh.writes).toEqual([`review #${PR} REQUEST_CHANGES at ${H1}`]);
+    // GitHub lists the App's change request among the pull request's reviews; even with the bot
+    // in the allowlist, the poller does not take it for a request of its own.
+    const own = s.gh.humanReview('updraft-bot', 'CHANGES_REQUESTED', s.gh.reviews[0]!.body);
+    s.tick();
+    const polled = await pollOnce({ db: s.db, api: s.api, config: s.config, log: silentLogger, now: s.now });
+    expect(polled.repos[0]).toMatchObject({ revisionsQueued: 0 });
+    expect(getReviewRequest(s.db, REPO_ID, own.id)).toMatchObject({ state: 'ignored', reason: expect.stringMatching(/own change request/) });
+    expect(typesOf(s.db).filter((t) => t === 'pull_request.changes_requested')).toHaveLength(1);
+    // ...while a marker in someone else's review is no proof of anything: a person's request still counts.
+    s.gh.humanReview('allen', 'CHANGES_REQUESTED', `Please also do this. <!-- updraft-review: ${runId} -->`);
+    s.tick();
+    expect((await pollOnce({ db: s.db, api: s.api, config: s.config, log: silentLogger, now: s.now })).repos[0]).toMatchObject({ revisionsQueued: expect.any(Number) });
+    expect(s.db.prepare("SELECT count(*) AS n FROM review_requests WHERE reviewer = 'allen'").get()).toEqual({ n: 1 });
+  });
+
+  it('posts an explained comment, never a claimed approval, when GitHub refuses the formal review', async () => {
+    const s = asPerson();
+    s.gh.refuseFormal = true;
+    const { result } = await s.round('ready-to-merge');
+    expect(result).toMatchObject({ status: 'published' });
+    expect(s.gh.writes.filter((w) => w.startsWith('review'))).toEqual([`review #${PR} COMMENT at ${H1}`]);
+    const body = s.gh.reviews[0]!.body;
+    expect(body).toMatch(/posted as a comment, not as a GitHub approval, because GitHub refused it as one/);
+    expect(body).not.toContain('submitted as a GitHub approval');
+  });
+
+  it('only ever approves the current head: a verdict for an older commit is a comment', async () => {
+    const s = asPerson();
+    const [job] = s.schedule();
+    const runId = s.reviewed(job!, 'ready-to-merge');
+    s.push(H2);
+    await postReview(s.deps, runId);
+    expect(s.gh.writes).toEqual([`review #${PR} COMMENT at ${H1}`]);
+    expect(s.gh.reviews[0]!.body).toMatch(/no longer at the reviewed commit/);
+  });
+
+  it('dismisses its own earlier approval once a newer head is not approved', async () => {
+    const s = asPerson();
+    await s.round('ready-to-merge');
+    expect(s.gh.reviews[0]!.state).toBe('APPROVED');
+    s.push(H2);
+    observeHead(s.db, REPO_ID, PR, H2, new Date(s.tick()).toISOString());
+    await s.round('changes-requested');
+    expect(s.gh.writes.filter((w) => /^(review|dismiss)/.test(w))).toEqual([
+      `review #${PR} APPROVE at ${H1}`,
+      `review #${PR} REQUEST_CHANGES at ${H2}`,
+      expect.stringMatching(new RegExp(`^dismiss review ${s.gh.reviews[0]!.id} on #${PR}`)),
+    ]);
+    // A person's approval is never touched.
+    expect(s.gh.reviews.filter((r) => r.state === 'DISMISSED').map((r) => r.user)).toEqual(['updraft-bot']);
+  });
+
+  it('a legacy pull request the worker opened keeps the plain comment review', async () => {
+    const s = setup();
+    await s.round('ready-to-merge');
+    expect(s.gh.writes[0]).toBe(`review #${PR} COMMENT at ${H1}`);
+    expect(s.gh.reviews[0]!.body).toContain('It is posted as a comment because the account that opened a pull request cannot approve or request changes on it');
+  });
+});

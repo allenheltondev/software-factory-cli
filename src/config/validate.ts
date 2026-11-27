@@ -140,6 +140,10 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
     }
   }
 
+  if (config.github?.publisher && !Object.values(config.repositories).some((r) => r.publishAs === 'user')) {
+    warnings.push({ path: 'github.publisher', message: 'no repository sets publishAs: user, so nothing is published as this account' });
+  }
+
   const repoIds = new Map<number, string>();
   for (const [repoName, repo] of Object.entries(config.repositories)) {
     const dup = repoIds.get(repo.id);
@@ -165,6 +169,23 @@ export function validateConfig(raw: unknown, opts: { platform?: NodeJS.Platform 
           message: 'only applies to actions with output local-branch, and no workflow of this repo runs one',
         });
       }
+    }
+
+    if (repo.publishAs === 'user') {
+      const at = `repositories.${repoName}.publishAs`;
+      if (!config.github?.app) {
+        errors.push({
+          path: at,
+          message:
+            'publishing as a person is for a worker that otherwise acts as a GitHub App (github.app); without one the worker already publishes as your gh account, so remove publishAs',
+        });
+      } else if (!config.github.publisher) {
+        errors.push({
+          path: at,
+          message: 'names no one: set github.publisher.login to the GitHub account that agreed to publish this repository\'s pull requests (docs/github-app.md, "Publishing as a person")',
+        });
+      }
+      if (publishMode(repo) === 'none') warnings.push({ path: at, message: 'has no effect without publish' });
     }
 
     if (repo.commentOnFailure && config.execution.mode !== 'live') {

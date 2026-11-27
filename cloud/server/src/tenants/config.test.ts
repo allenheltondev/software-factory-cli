@@ -94,7 +94,7 @@ describe('compileTenantConfig', () => {
       submission({
         repositories: { 'acme/web': { ...extra, workflows: [{ trigger: { event: 'issue.labeled', label: 'ready' }, action: 'implement-issue', pool: 'general' }] } },
       });
-    for (const [key, value] of [['checkoutPath', '/etc'], ['id', 1], ['remote', 'evil'], ['dependencies', { repositories: ['acme/lib'] }]] as const) {
+    for (const [key, value] of [['checkoutPath', '/etc'], ['id', 1], ['remote', 'evil'], ['dependencies', { repositories: ['acme/lib'] }], ['publishAs', 'user']] as const) {
       expect(errorsOf(repo({ [key]: value }))).toEqual([expect.objectContaining({ path: `repositories.acme/web.${key}` })]);
     }
     expect(errorsOf(repo({ publish: 'none' }))).toEqual([expect.objectContaining({ path: 'repositories.acme/web.publish' })]);

@@ -67,6 +67,7 @@ import {
   type StalledPublication,
 } from './run-event-abandoned.js';
 import { readOwnPullRequest, restorePublication } from './run-event-restore.js';
+import { checkPublisherForJob } from '../publish/publisher-role.js';
 import { adoptReviewRequests } from './run-event-shared-state.js';
 import { installSignalHandlers } from './start.js';
 
@@ -664,6 +665,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
   let holding = false;
   try {
     const credentials: GitHubCredentials = ctx.createCredentials(config, { log: log.child({ component: 'github' }) });
+    const userPublisher = ctx.createUserPublisher?.(config, { log: log.child({ component: 'publisher' }) }) ?? null;
     const api = await ctx.createApi({ log: log.child({ component: 'github' }), credentials });
 
     // 1. What the event is, and whether the poller's rules queue anything for it. Those rules
@@ -713,6 +715,8 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
     /** A scope for this event that leaves alone what other runs hold (checkpoints make their work in flight visible here). */
     const newScope = (openDb: Db): GuardedScope => withoutForeignWork(createEventScope(openDb), foreignWork(openDb, holder, ctx.now()));
     const loopsOn = reviseActive(config, repoCfg) || reviewActive(config, repoCfg);
+    /** With publishAs user, a pull request the person of github.publisher opened can be Updraft's too (run-event-restore.ts). */
+    const ownPublisher = repoCfg.publishAs === 'user' ? (config.github?.publisher ?? null) : null;
     const publishing = publishMode(repoCfg) !== 'none';
     const issueJobs = decision.dispatch === true ? decision.jobs : [];
     /** Event jobs the state database already has. */
@@ -739,7 +743,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
         syncRevisionPrs(stateDb(), repo.id);
         if (getRevisionPr(stateDb(), repo.id, existing.prNumber)) return false; // on record: nothing was lost
       }
-      const answer = await readOwnPullRequest(api, repo, existing.prNumber);
+      const answer = await readOwnPullRequest(api, repo, existing.prNumber, ownPublisher);
       if (answer.kind === 'gone' || answer.kind === 'closed') return false;
       let missing: string | null = null;
       if (answer.kind === 'not-ours') missing = answer.why;
@@ -774,7 +778,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       // request uploads its state long after the pull request exists, and an event that arrives
       // in between must not be answered "nothing to do" and forgotten.
       const notOnRecord = async (): Promise<number> => {
-        const answer = await readOwnPullRequest(api, repo, n);
+        const answer = await readOwnPullRequest(api, repo, n, ownPublisher);
         if (answer.kind !== 'ours') {
           const why = answer.kind === 'not-ours' ? `GitHub says ${answer.why}` : answer.kind === 'closed' ? 'it is closed or merged' : 'GitHub has no such pull request';
           return nothing('pull-request-not-watched', `pull request #${n} of ${repo.fullName} is not one Updraft opened, as far as this state database knows, and ${why}; nothing acts on it`);
@@ -1143,6 +1147,7 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
       log: log.child({ component }),
       token: (repoFullName) => credentials.token(repoFullName, { fresh: true }),
       workerKind: credentials.kind,
+      ...(userPublisher ? { publisher: userPublisher } : {}),
       env: ctx.env,
       scope: eventScope,
       claimReviews: true,
@@ -1174,7 +1179,11 @@ async function runEvent(ctx: CommandContext, opts: RunEventOptions, deps: RunEve
           checkDispatchable: async (job) => {
             // Another machine may have revised for this review already, from a state this run never saw: GitHub knows.
             const elsewhere = await revisionAnsweredElsewhere(api, job);
-            return elsewhere ? { ok: false, reason: elsewhere } : checkJobDispatchable({ api, config, db: openDb }, job);
+            if (elsewhere) return { ok: false, reason: elsewhere };
+            const check = await checkJobDispatchable({ api, config, db: openDb }, job);
+            // Throws while the publisher can't publish: the job stays queued, with the reason recorded.
+            if (check.ok) await checkPublisherForJob(publishDeps('publisher'), job);
+            return check;
           },
           signal: controller.signal,
           executor: createExecutor(config, {

@@ -9,6 +9,24 @@ import { fakeAdapter } from '../../test/fake-adapter.js';
 const example = () => parse(readFileSync(new URL('../../examples/config.yaml', import.meta.url), 'utf8'));
 
 describe('validateConfig', () => {
+  it('publishAs user needs a GitHub App and an explicitly named publisher; the default needs neither', () => {
+    const repoOf = (c: { repositories: Record<string, Record<string, unknown>> }) => Object.values(c.repositories)[0]!;
+    const plain = example();
+    expect(validateConfig(plain).ok).toBe(true);
+    const errorsOf = (mutate: (c: ReturnType<typeof example>) => void) => {
+      const c = example();
+      mutate(c);
+      const r = validateConfig(c);
+      return r.ok ? [] : r.errors;
+    };
+    const name = Object.keys(example().repositories)[0];
+    expect(errorsOf((c) => { repoOf(c).publishAs = 'user'; })).toContainEqual({ path: `repositories.${name}.publishAs`, message: expect.stringMatching(/github\.app/) });
+    expect(errorsOf((c) => { repoOf(c).publishAs = 'user'; c.github = { app: { appId: 1, privateKeyPath: './k.pem' } }; })).toContainEqual({ path: `repositories.${name}.publishAs`, message: expect.stringMatching(/github\.publisher\.login/) });
+    expect(errorsOf((c) => { repoOf(c).publishAs = 'user'; c.github = { app: { appId: 1, privateKeyPath: './k.pem' }, publisher: { login: 'alice', id: 7 } }; })).toEqual([]);
+    // Never a bot as the person.
+    expect(errorsOf((c) => { c.github = { app: { appId: 1, privateKeyPath: './k.pem' }, publisher: { login: 'updraft[bot]' } }; }).map((e) => e.path)).toContain('github.publisher.login');
+  });
+
   it('native subscription auth requires a host-native Claude adapter', () => {
     const cfg = example();
     cfg.agents.claude = { enabled: true, authentication: 'native-claude' };

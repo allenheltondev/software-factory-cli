@@ -232,13 +232,29 @@ export class FakeLoopGitHub {
     this.maybeFail('listPullRequestReviews');
     return [...this.reviews];
   }
-  async createPullRequestReview(_repo: RepoRef, pull: number, input: { body: string; commitId?: string; comments?: ReviewCommentInput[] }): Promise<PullRequestReviewSummary> {
+  /** GitHub refuses APPROVE and REQUEST_CHANGES (the account may not, or a rule says no). */
+  refuseFormal = false;
+  async dismissPullRequestReview(_repo: RepoRef, pull: number, reviewId: number, message: string): Promise<void> {
+    const r = this.reviews.find((x) => x.id === reviewId);
+    if (!r) throw new GitHubError('review not found', 404);
+    r.state = 'DISMISSED';
+    this.writes.push(`dismiss review ${reviewId} on #${pull}: ${message}`);
+  }
+  async createPullRequestReview(
+    _repo: RepoRef,
+    pull: number,
+    input: { body: string; commitId?: string; comments?: ReviewCommentInput[]; event?: 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES' },
+  ): Promise<PullRequestReviewSummary> {
     this.maybeFail('createPullRequestReview');
+    const event = input.event ?? 'COMMENT';
+    if (event !== 'COMMENT' && !input.commitId) throw new Error('a formal review needs its commit');
+    if (event !== 'COMMENT' && this.refuseFormal) throw new GitHubError('POST /pulls/reviews failed: 422 Unprocessable Entity: Can not approve your own pull request', 422);
     if (this.refuseCommitId && input.commitId) throw new GitHubError('POST /pulls/reviews failed: 422 Unprocessable Entity: commit_id is not part of the pull request', 422);
     if (this.refuseInline && input.comments?.length) throw new GitHubError('POST /pulls/reviews failed: 422 Unprocessable Entity: Line could not be resolved', 422);
-    this.writes.push(`review #${pull} COMMENT at ${input.commitId ?? '(no commit)'}${input.comments?.length ? ` with ${input.comments.length} inline` : ''}`);
+    this.writes.push(`review #${pull} ${event} at ${input.commitId ?? '(no commit)'}${input.comments?.length ? ` with ${input.comments.length} inline` : ''}`);
     const id = this.nextId++;
-    const r: PullRequestReviewSummary = { id, state: 'COMMENTED', user: this.login, body: input.body, htmlUrl: `https://github.com/${this.fullName}/pull/${pull}#pullrequestreview-${id}`, submittedAt: this.updatedAt, commitId: input.commitId ?? null };
+    const state = event === 'APPROVE' ? 'APPROVED' : event === 'REQUEST_CHANGES' ? 'CHANGES_REQUESTED' : 'COMMENTED';
+    const r: PullRequestReviewSummary = { id, state, user: this.login, body: input.body, htmlUrl: `https://github.com/${this.fullName}/pull/${pull}#pullrequestreview-${id}`, submittedAt: this.updatedAt, commitId: input.commitId ?? null };
     this.reviews.push(r);
     for (const c of input.comments ?? []) {
       const cid = this.nextId++;

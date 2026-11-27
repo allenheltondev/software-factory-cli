@@ -1,4 +1,5 @@
 // The revision push and reply, against real git (test/git-fixtures.ts) and an in-memory GitHub.
+import { createUserPublisher } from '../github/publisher.js';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1063,6 +1064,82 @@ describe('updraft publish RUN_ID on a revision run', { timeout: 120_000 }, () =>
       expect(api.comments).toHaveLength(1);
     } finally {
       rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  });
+});
+
+// The git wrapper below is a POSIX shell script.
+describe.skipIf(process.platform === 'win32')('reviseRun of a pull request a person published (publishAs user)', { timeout: 120_000 }, () => {
+  const USER_TOKEN = 'gho_personUserToken0123456789';
+  const HTTPS = `https://github.com/${FULL}.git`;
+
+  /** The person's side of GitHub: who they are, the repository they can push to, and their comments. */
+  class PersonApi extends FakeCommentsApi {
+    who = { login: 'alice', id: 7 };
+    override async getWorkerIdentity(): Promise<{ kind: 'user'; login: string; id: number }> {
+      return { kind: 'user', ...this.who };
+    }
+    async getRepo(fullName: string) {
+      return { id: REPO_ID, fullName, permissions: { admin: false, push: true, pull: true } };
+    }
+  }
+
+  /** Real git; the clone's remote reports an SSH URL, and the HTTPS URL is served by the fixture's bare remote. */
+  function httpsGit(p: Published): { runGit: RunGit; calls: Array<{ args: readonly string[]; env: NodeJS.ProcessEnv | undefined }> } {
+    const calls: Array<{ args: readonly string[]; env: NodeJS.ProcessEnv | undefined }> = [];
+    return {
+      calls,
+      runGit: async (args, opts: GitOptions) => {
+        calls.push({ args: [...args], env: opts.env });
+        if (args[0] === 'remote' && args[1] === 'get-url') return { stdout: `git@github.com:${FULL}.git\n`, stderr: '' };
+        return runGit(args.map((a) => (a === HTTPS ? p.f.remoteDir : a)), opts);
+      },
+    };
+  }
+
+  async function asPerson() {
+    const p = await published();
+    p.db.prepare("UPDATE publications SET publisher_kind = 'user', publisher_login = 'alice', publisher_id = 7 WHERE run_id = ?").run(p.originalRunId);
+    const s = await revised(p, { commits: 1 });
+    const app = new FakeCommentsApi();
+    const person = new PersonApi();
+    const appTokens: string[] = [];
+    const publisher = createUserPublisher({ expected: { login: 'alice' }, readToken: async () => USER_TOKEN, apiFor: async () => person.api });
+    const git = httpsGit(s);
+    // git run outside runGit (the remote's default branch) reaches the same bare remote.
+    const wrapper = join(s.f.root, 'git-https-to-local.sh');
+    writeFileSync(wrapper, `#!/bin/sh\nfor a; do shift; if [ "$a" = "${HTTPS}" ]; then set -- "$@" "${s.f.remoteDir}"; else set -- "$@" "$a"; fi; done\nexec git "$@"\n`, { mode: 0o755 });
+    const d = deps(s, app, { runGit: git.runGit, git: wrapper, workerKind: 'app', token: async (r) => (appTokens.push(r), TOKEN), publisher });
+    return { s, app, person, appTokens, git, d };
+  }
+
+  it('pushes the revision as the person and replies as them; the App is not asked for a token or a comment', async () => {
+    const { s, app, person, appTokens, git, d } = await asPerson();
+    const r = await reviseRun(d, s.runId);
+    expect(r.status).toBe('published');
+    expect(remoteSha(s)).toBe(s.localSha);
+    expect(appTokens).toEqual([]);
+    expect(app.calls).toEqual([]);
+    expect(person.comments).toHaveLength(1);
+    const push = git.calls.find((c) => c.args[0] === 'push')!;
+    expect(push.args).toContain(HTTPS);
+    const header = Object.entries(push.env ?? {}).find(([, v]) => typeof v === 'string' && v.startsWith('AUTHORIZATION: basic '))!;
+    expect(Buffer.from(header[1]!.slice('AUTHORIZATION: basic '.length), 'base64').toString()).toBe(`x-access-token:${USER_TOKEN}`);
+    const log = readFileSync(s.logPath, 'utf8');
+    expect(log).toContain('pushing as alice (github.publisher, account 7), the publisher of pull request #100');
+    expect(log).not.toContain(USER_TOKEN);
+  });
+
+  it('stops, pushing nothing, when the sign-in is now another account or the publisher is gone: never as the App instead', async () => {
+    for (const change of ['account', 'unconfigured'] as const) {
+      const { s, person, appTokens, git, d } = await asPerson();
+      if (change === 'account') person.who = { login: 'mallory', id: 66 };
+      const r = await reviseRun(change === 'unconfigured' ? { ...d, publisher: undefined } : d, s.runId);
+      expect(r).toMatchObject({ status: 'failed', retryable: false });
+      expect(remoteSha(s)).toBe(s.baseSha);
+      expect(git.calls.some((c) => c.args[0] === 'push')).toBe(false);
+      expect(appTokens).toEqual([]);
+      expect(person.comments).toEqual([]);
     }
   });
 });

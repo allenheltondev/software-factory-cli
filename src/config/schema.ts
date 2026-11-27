@@ -295,6 +295,15 @@ export const repositorySchema = z.strictObject({
    */
   publish: z.enum(PUBLISH_MODES).optional(),
   /**
+   * With publish and github.app: whose GitHub identity opens this repository's pull requests and
+   * pushes their branches (the first push, revisions and CI fixes) and writes the coding agent's
+   * replies. `app` (the default): the App, as before. `user`: the person named in
+   * github.publisher, through their own `gh` sign-in, while reviews, notices and merges stay the
+   * App's (docs/github-app.md, "Publishing as a person"). A pull request keeps the publisher it was
+   * opened with: changing this applies to new pull requests only.
+   */
+  publishAs: z.enum(['app', 'user']).optional(),
+  /**
    * Live mode: when a run leaves its job failed, comment on the issue as the active gh account
    * (run id, agent, duration, reason, how to retry; never agent output). Default false.
    */
@@ -447,6 +456,20 @@ export const githubAppSchema = z.strictObject({
 });
 
 /**
+ * The person who consents to Updraft publishing as them (docs/github-app.md, "Publishing as a
+ * person"): repositories with publishAs user open pull requests and push with this account's own
+ * `gh` sign-in. Named here explicitly, never taken from the issue's author, the label's actor or
+ * the installation's owner; the token's account is checked against it before every use, and a
+ * mismatch stops the publication instead of switching to another identity.
+ */
+export const githubPublisherSchema = z.strictObject({
+  /** The GitHub login the `gh` sign-in must belong to. Compared case-insensitively. */
+  login: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/, 'a GitHub login (not a bot)'),
+  /** The account's numeric id, which survives a rename; checked too when set. */
+  id: z.number().int().positive().optional(),
+});
+
+/**
  * Subscription capacity groups (docs/capacity-and-escalation.md). A group is a user-declared set
  * of agent profiles that share one authenticated CLI account (`agents.<name>.capacityGroup`).
  */
@@ -485,7 +508,7 @@ export const configSchema = z.strictObject({
     })
     .default({ mode: 'log-only' }),
   /** How the worker authenticates to GitHub. Absent: as the person's `gh` account. */
-  github: z.strictObject({ app: githubAppSchema.optional() }).optional(),
+  github: z.strictObject({ app: githubAppSchema.optional(), publisher: githubPublisherSchema.optional() }).optional(),
   dispatch: z
     .strictObject({
       /** GitHub logins allowed to dispatch work by applying a trigger label. */

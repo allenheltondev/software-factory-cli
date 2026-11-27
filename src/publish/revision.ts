@@ -42,6 +42,8 @@ import {
 import { assertValidBranchName, GitError, redactRemoteUrl, remoteDefaultBranch, runGit as defaultRunGit, type GitOptions } from '../git/git.js';
 import { isJobBranchName, jobBranchName, withCheckoutLock } from '../git/worktree.js';
 import { GitHubError, type GitHubApi, type GitHubIssueComment } from '../github/api.js';
+import { getPublication } from '../db/publications.js';
+import { codingRole } from './publisher-role.js';
 import { isWorkerLogin } from '../github/credentials.js';
 import { revisionOf, type Job, type RepoRef, type Revision, type RevisionRequest, type Run, type RunSummary } from '../types.js';
 import { findRepoConfig } from '../worker/executor.js';
@@ -511,14 +513,19 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
    * why nothing was pushed). `claim` names the commit the comment says the branch is moved to;
    * the marker for it is what other runs read (findRevisionClaims).
    */
+  /**
+   * Who writes the coding agent's comments (publisher-role.ts): the pull request's publisher once
+   * step 1 has checked it, the worker until then (a refusal before that is Updraft's own notice).
+   */
+  let codingApi: GitHubApi = deps.api;
   const comment = async (body: () => string, claim?: { headSha: string }): Promise<void> => {
     if (claiming) {
       hold();
       const marker = revisionMarker(runId);
       const text = claim ? `${body()}\n${revisionClaimMarker(request.review.id, baseSha, claim.headSha)}` : body();
-      const id = rev.commentId ?? (await deps.api.listIssueComments(repoRef, prNumber)).find((c) => c.body.includes(marker))?.id ?? null;
+      const id = rev.commentId ?? (await codingApi.listIssueComments(repoRef, prNumber)).find((c) => c.body.includes(marker))?.id ?? null;
       hold(); // the lookup may have outlived the lease
-      const written = id !== null ? await deps.api.updateIssueComment(repoRef, id, text) : await deps.api.createIssueComment(repoRef, prNumber, text);
+      const written = id !== null ? await codingApi.updateIssueComment(repoRef, id, text) : await codingApi.createIssueComment(repoRef, prNumber, text);
       hold({ commentId: written.id, commentUrl: written.htmlUrl });
       await runLog([`${id !== null ? 'updated the comment' : 'commented'} on pull request #${prNumber}: ${written.htmlUrl}`]);
       return;
@@ -526,11 +533,11 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     if (rev.commentId) return;
     hold();
     const marker = revisionMarker(runId);
-    const found = (await deps.api.listIssueComments(repoRef, prNumber)).find((c) => c.body.includes(marker));
+    const found = (await codingApi.listIssueComments(repoRef, prNumber)).find((c) => c.body.includes(marker));
     let posted: GitHubIssueComment | undefined = found;
     if (!posted) {
       hold(); // the lookup may have outlived the lease
-      posted = await deps.api.createIssueComment(repoRef, prNumber, body());
+      posted = await codingApi.createIssueComment(repoRef, prNumber, body());
     }
     hold({ commentId: posted.id, commentUrl: posted.htmlUrl });
     await runLog([found ? `comment already on pull request #${prNumber}: ${posted.htmlUrl}` : `commented on pull request #${prNumber}: ${posted.htmlUrl}`]);
@@ -561,9 +568,17 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       return { status: 'skipped', reason, revision: done };
     }
 
+    // 1b. Who pushes: the publisher the pull request was opened with, checked again now. Never
+    // another identity in its place (publisher-role.ts).
+    const source = getPublication(deps.db, watched.sourceRunId);
+    const role = await codingRole(deps, { repo: repoRef, config: repo, recorded: source?.publisher ?? null, started: true });
+    if (role.record?.kind === 'user') await runLog([`pushing as ${role.record.login} (github.publisher, account ${role.record.id}), the publisher of pull request #${prNumber}, checked just now`]);
+    codingApi = role.api;
+    const pushDeps = { ...deps, token: role.token, workerKind: role.workerKind, httpsPush: role.httpsPush };
+
     // 2. The clone's remote and the run's commit.
     const { remote, pushUrl, net, localSha, commitCount, descends } = await withCheckoutLock(checkoutPath, async () => {
-      const target = await openPushTarget(deps, { checkoutPath, repoFullName, remote: repo.remote, scratchDir, signal, onToken: (t) => (token = t) });
+      const target = await openPushTarget(pushDeps, { checkoutPath, repoFullName, remote: repo.remote, scratchDir, signal, onToken: (t) => (token = t) });
       await assertValidBranchName(prBranch, local);
       const sha = (await run1(['rev-parse', '--verify', '--quiet', `refs/heads/${localBranch}^{commit}`], local).catch(() => null))?.stdout.trim();
       if (!sha) throw new PublishRefusal(`the revision branch ${localBranch} no longer exists in ${checkoutPath}`);
@@ -598,7 +613,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       if (!claiming && !refClaiming) return null;
       hold();
       const claims = claiming
-        ? await findRevisionClaims(deps.api, repoRef, prNumber, request.review.id)
+        ? await findRevisionClaims(codingApi, repoRef, prNumber, request.review.id)
         : await findRefClaims(run1, pushUrl, net, request.review.id, repoFullName, prNumber);
       for (const c of claims) {
         if (c.runId === runId) continue;
@@ -710,14 +725,15 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
     if (request.findings?.length) {
       hold();
       const answered = await answerFindings(
-        { db: deps.db, api: deps.api, now, guard: () => hold(), repoFullName, runId },
+        { db: deps.db, api: codingApi, now, guard: () => hold(), repoFullName, runId },
         {
           repo: repoRef,
           prNumber,
           runId,
           sha: localSha,
           prUrl: request.pullRequest.url,
-          login: await workerLogin(deps.api),
+          // The coding agent's replies are the publisher's: its own earlier ones are found by that login.
+          login: role.record?.kind === 'user' ? role.record.login : await workerLogin(deps.api),
           findings: request.findings,
           resolutions: run.summary.resolutions ?? [],
         },
@@ -793,7 +809,7 @@ export async function reviseRun(deps: PublishDeps, runId: string, opts: { signal
       // The push was announced and is not going to happen: the announcement must not stand.
       try {
         const reason = 'the push did not go through, and the worker will not try it again by itself';
-        await deps.api.updateIssueComment(repoRef, rev.commentId, renderNotPushedNotice({ runId, review: request.review, reason, localBranch: run.summary.branch, trigger: request.trigger }));
+        await codingApi.updateIssueComment(repoRef, rev.commentId, renderNotPushedNotice({ runId, review: request.review, reason, localBranch: run.summary.branch, trigger: request.trigger }));
       } catch (noteErr) {
         log.warn('could not take back the announcement of a push that failed', { error: message(noteErr) });
       }

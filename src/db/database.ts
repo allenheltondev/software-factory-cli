@@ -25,7 +25,10 @@ function loadSqlite(): typeof import('node:sqlite') {
   }
 }
 
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
+
+/** The schema version that records each publication's publisher (docs/github-app.md, "Publishing as a person"). */
+export const PUBLISHER_SCHEMA_VERSION = 23;
 
 /** The schema version that added the CI step's one re-run per head and the merge block's code (docs/ci-fix.md, "One re-run"). */
 export const RERUN_SCHEMA_VERSION = 22;
@@ -703,7 +706,22 @@ const MIGRATIONS: Record<number, Migration> = {
     for (const [name, decl] of RERUN_COLUMNS) if (!prs.has(name)) db.exec(`ALTER TABLE revision_prs ADD COLUMN ${name} ${decl}`);
     db.exec(`UPDATE revision_prs SET merge_code = ${mergeReasonCodeSql('merge_reason')} WHERE merge_state = 'blocked' AND merge_code IS NULL`);
   },
+  // Who published a run (docs/github-app.md, "Publishing as a person"): the worker's own identity
+  // or the consenting person of github.publisher, recorded before the first push so a pull
+  // request never changes publisher between its revisions. Login and account id only, never a
+  // credential. Each column only if missing.
+  23: (db) => {
+    const pubs = new Set((db.prepare('PRAGMA table_info(publications)').all() as { name: string }[]).map((c) => c.name));
+    for (const [name, decl] of PUBLISHER_COLUMNS) if (!pubs.has(name)) db.exec(`ALTER TABLE publications ADD COLUMN ${name} ${decl}`);
+  },
 };
+
+/** Migration 23's columns of publications. */
+const PUBLISHER_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ['publisher_kind', "TEXT CHECK (publisher_kind IN ('worker','user'))"],
+  ['publisher_login', 'TEXT'],
+  ['publisher_id', 'INTEGER'],
+];
 
 /** Migration 22's columns of revision_prs. */
 const RERUN_COLUMNS: ReadonlyArray<readonly [string, string]> = [
