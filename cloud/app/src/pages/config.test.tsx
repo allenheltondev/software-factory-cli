@@ -1033,6 +1033,30 @@ describe('the page and the compiled config agree (#193)', () => {
     expect(sentConfig(api, 1).agents.claude).toEqual({ adapter: 'claude', model: 'claude-opus-5-5', effort: 'high', enabled: true });
   });
 
+  it('offers Connect ChatGPT on the Codex card only where the deployment supports it, and Claude\'s link is unchanged', async () => {
+    const twoAgents = () => view({ config: clone(TWO_PROVIDERS.start), agents: ['claude', 'codex', 'kiro'], agentKeys: { KIRO_API_KEY: true } });
+    const base = { configured: true, enabled: true, worker: null };
+    const chatgpt = () => screen.queryByRole('link', { name: 'Connect ChatGPT account →' });
+    const available = fakeApi({ config: vi.fn().mockResolvedValue(twoAgents()), nativeClaude: async () => ({ ...base, codexAvailable: true }),
+      nativeCodex: async () => ({ ...base, worker: { status: 'auth-required', online: true, busy: false, lastHeartbeatAt: '2026-11-26T10:00:00Z', workerVersion: 'v1' } }) });
+    const first = configPage(available);
+    const codex = await screen.findByTestId('provider-codex');
+    const link = await within(codex).findByRole('link', { name: 'Connect ChatGPT account →' });
+    expect(link).toHaveAttribute('href', '/installations/55/codex');
+    expect(codex).toHaveTextContent('Codex can run on a ChatGPT plan instead of an API key');
+    await waitFor(() => expect(codex).toHaveTextContent('Needs sign-in'));
+    expect(within(screen.getByTestId('provider-claude')).getByRole('link', { name: 'Claude subscription routing' })).toHaveAttribute('href', '/installations/55/claude');
+    expect(within(screen.getByTestId('provider-claude')).queryByRole('link', { name: /ChatGPT/ })).toBeNull();
+    first.unmount();
+    for (const nativeClaude of [async () => ({ ...base, codexAvailable: false }), async () => base, async () => { throw new Error('down'); }]) {
+      const { unmount } = configPage(fakeApi({ config: vi.fn().mockResolvedValue(twoAgents()), nativeClaude }));
+      await screen.findByTestId('provider-codex');
+      await waitFor(() => expect(chatgpt()).toBeNull());
+      expect(within(screen.getByTestId('provider-claude')).getByRole('link', { name: 'Claude subscription routing' })).toHaveAttribute('href', '/installations/55/claude');
+      unmount();
+    }
+  });
+
   it('two providers: connect Claude Code and Codex, choose both to code and Kiro to review, and publish what the server compiles', async () => {
     const setAgentKey = vi
       .fn()

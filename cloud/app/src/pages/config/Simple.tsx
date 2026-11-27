@@ -4,6 +4,7 @@ import { Button, Card, CardBody, CardDescription, CardHeader, EmptyState, Input,
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepository, ConsoleWorkflow } from '../../api/client';
 import { AGENT_GUIDES } from '../../lib/agentGuides';
 import { installationSettingsUrl } from '../../lib/diagnostics';
+import type { CodexAccount } from '../../lib/codexAccount';
 import { PROVIDERS } from '../AgentKeysPage';
 import { AutoMerge, CiRepair, Suggestions } from './Editor';
 import { Check, FieldError, ParsedText, PromptField } from './fields';
@@ -65,6 +66,8 @@ export interface SimpleProps {
   errors: ConfigIssue[];
   installationId: number;
   keyApi: KeyApi;
+  /** Codex on a ChatGPT plan: offered only where the deployment supports it. */
+  codex?: CodexAccount;
   onKeys: (keys: Record<string, boolean>) => void;
   /** What the server knows of each key: set, and how its last use went. */
   keyStatus?: Record<string, KeyStatus>;
@@ -139,7 +142,7 @@ const CONNECTION: Record<Connection, { tone: 'success' | 'warning' | 'error' | '
  * reviews, and where work starts (labels, people, repositories), with exceptions per label or
  * repository in place. It writes the same settings as the full editor.
  */
-export function SimpleConfig({ config, onChange, view, errors, installationId, keyApi, onKeys, keyStatus = {}, onAskAutoMerge, onOpenFull, generation, firstRun }: SimpleProps) {
+export function SimpleConfig({ config, onChange, view, errors, installationId, keyApi, codex, onKeys, keyStatus = {}, onAskAutoMerge, onOpenFull, generation, firstRun }: SimpleProps) {
   const [settingsOpen, setSettingsOpen] = useState<string | null>(null);
   const [connecting, setConnecting] = useState<AgentAdapter | null>(null);
   const [manual, setManual] = useState<Set<string>>(new Set());
@@ -288,6 +291,15 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
                       Claude subscription routing
                     </Link>
                     .
+                  </p>
+                )}
+                {a === 'codex' && c !== 'unavailable' && codex?.available && (
+                  <p className="text-xs text-muted-foreground" data-testid="codex-chatgpt">
+                    Codex can run on a ChatGPT plan instead of an API key
+                    {codex.status ? <> ({codex.status})</> : null}:{' '}
+                    <Link className="auth-link" to={`/installations/${installationId}/codex`}>
+                      Connect ChatGPT account →
+                    </Link>
                   </p>
                 )}
                 {c !== 'unavailable' && (

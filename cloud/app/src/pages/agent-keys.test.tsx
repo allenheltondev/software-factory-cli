@@ -151,4 +151,34 @@ describe('AgentKeysPage', () => {
     expect(await screen.findByTestId('keys-save-error')).toHaveTextContent('rejected that key');
     expect(within(row).getByLabelText('OpenAI API key')).toHaveValue('sk-whatever-1234567890123456');
   });
+
+  describe('Connect ChatGPT account', () => {
+    const base = { configured: true, enabled: true, worker: null };
+    const link = () => screen.queryByRole('link', { name: 'Connect ChatGPT account →' });
+
+    it('links to the Codex page when the deployment can run Codex on a ChatGPT plan, and leaves Claude\'s link as it was', async () => {
+      show(fakeApi({ agentKeys: async () => view(), nativeClaude: async () => ({ ...base, codexAvailable: true }) }));
+      expect(await screen.findByRole('link', { name: 'Connect ChatGPT account →' })).toHaveAttribute('href', '/installations/55/codex');
+      expect(screen.getByRole('link', { name: 'Connect Claude account →' })).toHaveAttribute('href', '/installations/55/claude');
+    });
+
+    it('is hidden when Codex is not available, and when the read fails', async () => {
+      for (const nativeClaude of [async () => ({ ...base, codexAvailable: false }), async () => base, async () => { throw new Error('down'); }]) {
+        const { unmount } = show(fakeApi({ agentKeys: async () => view(), nativeClaude }));
+        await screen.findByTestId('agent-keys');
+        await waitFor(() => expect(link()).toBeNull());
+        expect(screen.getByRole('link', { name: 'Connect Claude account →' })).toBeInTheDocument();
+        unmount();
+      }
+    });
+
+    it('says Connected or Needs sign-in, as words only', async () => {
+      const worker = (status: 'connected' | 'auth-required') => ({ ...base, worker: { status, online: true, busy: false, lastHeartbeatAt: '2026-11-26T10:00:00Z', workerVersion: 'v1' } });
+      const { unmount } = show(fakeApi({ agentKeys: async () => view(), nativeClaude: async () => ({ ...base, codexAvailable: true }), nativeCodex: async () => worker('connected') }));
+      expect(await screen.findByText('Connected')).toBeInTheDocument();
+      unmount();
+      show(fakeApi({ agentKeys: async () => view(), nativeClaude: async () => ({ ...base, codexAvailable: true }), nativeCodex: async () => worker('auth-required') }));
+      expect(await screen.findByText('Needs sign-in')).toBeInTheDocument();
+    });
+  });
 });

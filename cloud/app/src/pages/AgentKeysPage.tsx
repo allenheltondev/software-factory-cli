@@ -3,10 +3,11 @@ import { Link, useParams } from 'react-router';
 import { Alert, Button, Card, CardBody, CardHeader, CardTitle, PasswordInput, Skeleton, StatusBadge } from '@readysetcloud/ui';
 import { api as defaultApi, type AgentKeysView, type AgentKeyView, type ApiClient } from '../api/client';
 import { relativeTime } from '../lib/time';
+import { useCodexAccount } from '../lib/codexAccount';
 import { AGENT_GUIDES, type AgentGuide } from '../lib/agentGuides';
 
 type Load = { state: 'loading' } | { state: 'ok'; view: AgentKeysView } | { state: 'error'; message: string };
-type Api = Pick<ApiClient, 'agentKeys' | 'setAgentKey'>;
+type Api = Pick<ApiClient, 'agentKeys' | 'setAgentKey'> & Partial<Pick<ApiClient, 'nativeClaude' | 'nativeCodex'>>;
 
 export interface Provider {
   agent: string;
@@ -125,6 +126,7 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
     };
   }, [api, installationId, valid]);
 
+  const codex = useCodexAccount(api, installationId, valid);
   const keys = load.state === 'ok' ? load.view.keys : [];
   const missingRequired = keys.filter((k) => k.required && !k.configured);
   // What to do first: the keys the configuration needs, then any key already set; the rest is optional.
@@ -139,6 +141,12 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
       </Link>
       <h1 className="text-2xl font-semibold">Agent keys</h1>
       <Link className="auth-link" to={'/installations/' + id + '/claude'} state={{ connectClaude: true }}>Connect Claude account →</Link>
+      {codex.available && (
+        <p className="flex flex-wrap items-center gap-2" data-testid="codex-chatgpt">
+          <Link className="auth-link" to={'/installations/' + id + '/codex'}>Connect ChatGPT account →</Link>
+          {codex.status && <StatusBadge tone={codex.status === 'Connected' ? 'success' : 'warning'}>{codex.status}</StatusBadge>}
+        </p>
+      )}
 
       {load.state === 'loading' && <Skeleton className="h-40" />}
       {load.state === 'error' && (
