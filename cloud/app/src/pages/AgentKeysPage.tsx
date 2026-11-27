@@ -146,9 +146,10 @@ export function AgentKeysPage({ api = defaultApi }: { api?: Api }) {
           <Link className="auth-link inline-flex min-h-11 items-center" to={'/installations/' + id + '/claude'} state={{ connectClaude: true }}>Connect Claude account →</Link>
         </div>
         {codex.available && (
-          <div className="flex min-h-11 items-center justify-between gap-3 px-4" data-testid="codex-chatgpt">
-            <Link className="auth-link inline-flex min-h-11 min-w-0 items-center" to={'/installations/' + id + '/codex'}>Connect ChatGPT account →</Link>
-            {codex.status && <StatusBadge tone={codex.status === 'Connected' ? 'success' : 'warning'} className="shrink-0 whitespace-nowrap">{codex.status}</StatusBadge>}
+          // The label stays on one line; at narrow widths the badge drops below it.
+          <div className="flex min-h-11 flex-wrap items-center justify-between gap-x-3 px-4" data-testid="codex-chatgpt">
+            <Link className="auth-link inline-flex min-h-11 items-center whitespace-nowrap" to={'/installations/' + id + '/codex'}>Connect ChatGPT account →</Link>
+            {codex.status && <StatusBadge tone={codex.status === 'Connected' ? 'success' : 'warning'} className="-mt-1 mb-2.5 shrink-0 whitespace-nowrap xs:my-0">{codex.status}</StatusBadge>}
           </div>
         )}
       </section>
@@ -280,14 +281,15 @@ function KeyCard({ keyView: k, installationId, api, onSaved }: { keyView: AgentK
         </CardTitle>
       </CardHeader>
       <CardBody>
-        <div className="flex flex-col gap-4">
+        <div className="flex flex-col gap-3 sm:gap-4">
           {provider.guide && (
-            <p className="flex flex-wrap gap-x-4 gap-y-0 text-sm" data-testid={`key-guide-${k.name}`}>
-              <a className="auth-link" href={provider.guide.getKeyUrl} target="_blank" rel="noreferrer">
+            // Phones give links a 44px target; centring the text in it keeps the gap below them even.
+            <p className="-my-1.5 flex flex-wrap gap-x-4 gap-y-0 text-sm sm:my-0" data-testid={`key-guide-${k.name}`}>
+              <a className="auth-link inline-flex items-center" href={provider.guide.getKeyUrl} target="_blank" rel="noreferrer">
                 Get API key ↗
               </a>
               {provider.guide.guides.map((g, i) => (
-                <a key={g.href} className="auth-link" href={g.href} target="_blank" rel="noreferrer">
+                <a key={g.href} className="auth-link inline-flex items-center" href={g.href} target="_blank" rel="noreferrer">
                   {i === 0 ? 'Setup guide' : g.label} ↗
                 </a>
               ))}

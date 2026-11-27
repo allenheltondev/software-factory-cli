@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from 'react';
+import { useId, useState, type ReactNode, type SyntheticEvent } from 'react';
 import { Link } from 'react-router';
 import { Button, Card, CardBody, CardDescription, CardHeader, EmptyState, Input, ProgressIndicator, Select, StatusBadge } from '@readysetcloud/ui';
 import type { AgentAdapter, ConfigIssue, ConfigView, ConsoleConfig, ConsoleRepository, ConsoleWorkflow } from '../../api/client';
@@ -197,7 +197,10 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
             onClick={c !== 'unavailable' ? () => setConnecting(connecting === a ? null : a) : undefined}
           />
         )}
+        {/* A chosen agent that cannot run says so on its tile, as its card does. */}
         {c === 'failing' && on && <span className="basis-full pb-1 text-xs text-error">Key failed: reconnect it</span>}
+        {c === 'missing' && on && <span className="basis-full pb-1 text-xs text-error">Not connected: connect it, or untick it</span>}
+        {c === 'unavailable' && on && <span className="basis-full pb-1 text-xs text-error">Not available: untick it</span>}
       </div>
     );
   };
@@ -287,9 +290,10 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
           <CardDescription>Connect the agents you already pay for. You choose who works in the next step.</CardDescription>
         </CardHeader>
         <CardBody className="grid gap-3 sm:grid-cols-2">
-          {adapters.map((a) => {
+          {adapters.map((a, i) => {
             const c = connection(a);
             const provider = PROVIDERS[KEY_FOR[a]];
+            const alone = adapters.length % 2 === 1 && i === adapters.length - 1;
             const badge = CONNECTION[c];
             const used = Object.values(config.pools).some((p) => p.agents.includes(a) && config.agents[a]?.enabled);
             // One message: what is wrong first, else whose key it uses and whether the team uses it.
@@ -302,7 +306,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
             // Emphasis follows urgency: a failing key's fix is the one primary action; an optional provider stays quiet.
             const main = c === 'failing' ? 'primary' : 'secondary';
             return (
-              <section key={a} className="flex min-w-0 flex-col gap-3 rounded-lg border border-border p-3 sm:p-4" data-testid={`provider-${a}`} aria-label={AGENT_LABEL[a]}>
+              <section key={a} className={`flex min-w-0 flex-col gap-3 rounded-lg border border-border p-3 sm:p-4 ${alone ? 'sm:col-span-2' : ''}`} data-testid={`provider-${a}`} aria-label={AGENT_LABEL[a]}>
                 <div className="flex flex-col gap-1">
                   <div className="flex min-h-8 items-center justify-between gap-2">
                     <h3 className="min-w-0 font-semibold leading-snug">{AGENT_LABEL[a]}</h3>
@@ -488,7 +492,7 @@ export function SimpleConfig({ config, onChange, view, errors, installationId, k
           <h3 className="font-medium">Repositories</h3>
           <p className="text-sm text-muted-foreground">
             Checks run after the agent; if they fail, nothing is published.{' '}
-            <a className="auth-link inline-flex min-h-11 items-center" href={installationSettingsUrl(view.tenant)} target="_blank" rel="noreferrer">
+            <a className="auth-link flex min-h-11 w-fit items-center sm:inline sm:min-h-0" href={installationSettingsUrl(view.tenant)} target="_blank" rel="noreferrer">
               Give the App more repositories ↗
             </a>
           </p>
@@ -767,8 +771,11 @@ export function EffectiveConfig({ config, children }: { config: ConsoleConfig; c
   const rows = effective(config);
   const source = { default: 'Your team', label: 'The label’s own agents', repository: 'This repository only' } as const;
   const first = labelGroups(config)[0]?.label;
-  /** A cell's column name, shown before it only where the header row is not (CSS, so it is not in the text twice). */
-  const named = 'max-sm:col-span-2 max-sm:p-0 max-sm:before:mr-1.5 max-sm:before:text-xs max-sm:before:font-medium max-sm:before:uppercase max-sm:before:tracking-wide max-sm:before:text-muted-foreground';
+  /**
+   * A cell's column name: on a phone, where the header row is not shown, it is real text (seen for
+   * Coding and Review, read by a screen reader for all four); from 640px up the header says it.
+   */
+  const name = (text: string, seen = true) => <span className={`${seen ? 'mr-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground max-sm:inline' : 'sr-only'} sm:hidden`}>{text}{seen ? '' : ': '}</span>;
   return (
     <Card data-testid="effective-config">
       <CardHeader>
@@ -781,29 +788,40 @@ export function EffectiveConfig({ config, children }: { config: ConsoleConfig; c
             Nothing runs yet. Turn on a repository, then label an issue {first ? <code className="text-foreground">{first}</code> : 'with your label'} to start.
           </p>
         ) : (
-          <table className="w-full text-left text-sm max-sm:block">
-            <thead className="text-xs uppercase tracking-wide text-muted-foreground max-sm:sr-only">
-              <tr>
-                <th scope="col" className="py-2 pr-3">Repository</th>
-                <th scope="col" className="py-2 pr-3">Label</th>
-                <th scope="col" className="py-2 pr-3">Coding</th>
-                <th scope="col" className="py-2 pr-3">Review</th>
-                <th scope="col" className="py-2">From</th>
+          <table role="table" className="w-full text-left text-sm max-sm:block">
+            <thead role="rowgroup" className="text-xs uppercase tracking-wide text-muted-foreground max-sm:sr-only">
+              <tr role="row">
+                <th role="columnheader" scope="col" className="py-2 pr-3">Repository</th>
+                <th role="columnheader" scope="col" className="py-2 pr-3">Label</th>
+                <th role="columnheader" scope="col" className="py-2 pr-3">Coding</th>
+                <th role="columnheader" scope="col" className="py-2 pr-3">Review</th>
+                <th role="columnheader" scope="col" className="py-2">From</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-border max-sm:block">
+            <tbody role="rowgroup" className="divide-y divide-border max-sm:block">
               {rows.map((r) => (
-                <tr key={`${r.repository}:${r.workflow}`} className="max-sm:grid max-sm:grid-cols-[auto_minmax(0,1fr)] max-sm:gap-x-2 max-sm:gap-y-1 max-sm:py-3" data-testid={`effective-${r.repository}-${r.label}`}>
-                  <td className="py-2 pr-3 max-sm:p-0 max-sm:font-medium">
+                <tr role="row" key={`${r.repository}:${r.workflow}`} className="max-sm:grid max-sm:grid-cols-[auto_minmax(0,1fr)] max-sm:gap-x-2 max-sm:gap-y-1 max-sm:py-3" data-testid={`effective-${r.repository}-${r.label}`}>
+                  <td role="cell" className="py-2 pr-3 max-sm:p-0 max-sm:font-medium">
+                    {name('Repository', false)}
                     {r.repository}
                     {r.paused && <span className="font-normal text-muted-foreground"> (paused)</span>}
                   </td>
-                  <td className="py-2 pr-3 max-sm:p-0">
+                  <td role="cell" className="py-2 pr-3 max-sm:p-0">
+                    {name('Label', false)}
                     <code>{r.label}</code>
                   </td>
-                  <td className={`py-2 pr-3 ${named} max-sm:before:content-['Coding']`}>{r.coding.join(', ') || '—'}</td>
-                  <td className={`py-2 pr-3 ${named} max-sm:before:content-['Review']`}>{r.review.join(', ') || 'No automated review'}</td>
-                  <td className="py-2 text-muted-foreground max-sm:col-span-2 max-sm:p-0 max-sm:text-xs">{source[r.source]}</td>
+                  <td role="cell" className="py-2 pr-3 max-sm:col-span-2 max-sm:p-0">
+                    {name('Coding')}
+                    {r.coding.join(', ') || '—'}
+                  </td>
+                  <td role="cell" className="py-2 pr-3 max-sm:col-span-2 max-sm:p-0">
+                    {name('Review')}
+                    {r.review.join(', ') || 'No automated review'}
+                  </td>
+                  <td role="cell" className="py-2 text-muted-foreground max-sm:col-span-2 max-sm:p-0 max-sm:text-xs">
+                    {name('From', false)}
+                    {source[r.source]}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -856,12 +874,20 @@ function AltPlan({ to, name, status, testId }: { to: string; name: string; statu
 
 /**
  * An info icon with a tooltip, shown on hover and on focus (so a tap shows it too); clicking it may
- * act. The tip takes no room until it shows, so it never widens a phone's page.
+ * act. The tip takes no room until it shows, so it never widens a phone's page, and by default it
+ * opens towards whichever side keeps it on screen.
  */
-function InfoTip({ label, text, onClick, hidden, align = 'left' }: { label: string; text: string; onClick?: () => void; hidden?: boolean; align?: 'left' | 'right' }) {
+function InfoTip({ label, text, onClick, hidden, align = 'auto' }: { label: string; text: string; onClick?: () => void; hidden?: boolean; align?: 'auto' | 'left' | 'right' }) {
   const id = useId();
+  const [side, setSide] = useState<'left' | 'right'>(align === 'right' ? 'right' : 'left');
+  /** Where the icon is now: a tip that would run past the right edge opens leftwards instead. */
+  const place = (e: SyntheticEvent<HTMLElement>) => {
+    if (align !== 'auto') return;
+    const box = e.currentTarget.getBoundingClientRect();
+    setSide(box.left + TIP_WIDTH > window.innerWidth - 8 ? 'right' : 'left');
+  };
   return (
-    <span className="group relative inline-flex">
+    <span className="group relative inline-flex" onMouseEnter={place} onFocus={place}>
       <button type="button" aria-label={label} aria-describedby={id} onClick={onClick} className="inline-flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500">
         <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" className="h-4 w-4">
           <path fillRule="evenodd" d="M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Zm-7-4a1 1 0 1 1-2 0 1 1 0 0 1 2 0ZM9 9a.75.75 0 0 0 0 1.5h.25v3.25a.75.75 0 0 0 1.5 0V9.75A.75.75 0 0 0 10 9H9Z" clipRule="evenodd" />
@@ -870,10 +896,14 @@ function InfoTip({ label, text, onClick, hidden, align = 'left' }: { label: stri
       <span
         role="tooltip"
         id={id}
-        className={`pointer-events-none absolute bottom-full z-20 mb-2 w-60 max-w-[calc(100vw-3rem)] rounded-md ${align === 'right' ? 'right-0' : '-left-2'} hidden bg-foreground px-3 py-2 text-xs leading-snug text-background shadow-lg ${hidden ? '' : 'group-hover:block group-focus-within:block'}`}
+        data-side={side}
+        className={`pointer-events-none absolute bottom-full z-20 mb-2 w-60 max-w-[calc(100vw-3rem)] rounded-md ${side === 'right' ? 'right-0' : 'left-0'} hidden bg-foreground px-3 py-2 text-xs leading-snug text-background shadow-lg ${hidden ? '' : 'group-hover:block group-focus-within:block'}`}
       >
         {text}
       </span>
     </span>
   );
 }
+
+/** The tooltip's width (w-60), for choosing its side. */
+const TIP_WIDTH = 240;

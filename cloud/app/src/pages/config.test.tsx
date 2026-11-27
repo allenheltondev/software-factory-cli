@@ -521,7 +521,8 @@ describe('connected agents, teams and exceptions (#193)', () => {
     const apiRow = screen.getByTestId('repo-acme/api');
     await userEvent.click(within(apiRow).getByRole('button', { name: 'Customize agents for "updraft" in acme/api' }));
     await userEvent.click(within(apiRow).getByTestId('repo-acme/api-implement-coding-codex').querySelector('input')!);
-    expect(screen.getByTestId('effective-acme/api-updraft')).toHaveTextContent('Claude CodeClaude Code, CodexThis repository only');
+    const cells = within(screen.getByTestId('effective-acme/api-updraft')).getAllByRole('cell');
+    expect(cells.map((c) => c.textContent)).toEqual(['Repository: acme/api', 'Label: updraft', 'CodingClaude Code', 'ReviewClaude Code, Codex', 'From: This repository only']);
 
     // The default team says what it changes, and what it does not.
     expect(screen.getByTestId('affects-coding')).toHaveTextContent('Used by "updraft" in acme/web.');
@@ -1410,4 +1411,53 @@ describe('feedback and emphasis on the configuration page', () => {
     expect(within(done).getByTestId('first-publish')).toHaveTextContent('A coding agent picks it up and opens a pull request.');
     expect(screen.queryByTestId('publish-next')).toBeNull();
   });
+
+  it('opens a tile\'s tooltip towards the side that keeps it on a phone\'s screen', async () => {
+    viewport(375);
+    try {
+      configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
+      const button = await within(await screen.findByTestId('coding-kiro')).findByRole('button', { name: 'Why Kiro cannot be used' });
+      const tip = document.getElementById(button.getAttribute('aria-describedby')!)!;
+      const at = (left: number) => vi.spyOn(button.parentElement!, 'getBoundingClientRect').mockReturnValue({ left, right: left + 32, top: 0, bottom: 32, width: 32, height: 32, x: left, y: 0, toJSON: () => ({}) } as DOMRect);
+      // A right-column tile: a 240px tip from x=300 would end near x=540, so it opens leftwards.
+      at(300);
+      await userEvent.hover(button);
+      expect(tip).toHaveAttribute('data-side', 'right');
+      expect(tip).toHaveClass('right-0');
+      await userEvent.unhover(button);
+      // A left-column tile has room to its right.
+      at(40);
+      await userEvent.hover(button);
+      expect(tip).toHaveAttribute('data-side', 'left');
+      expect(tip).toHaveClass('left-0');
+    } finally {
+      viewport(1024);
+    }
+  });
+
+  it('a chosen agent that is not connected says so on its tile, as its card does', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
+    const tile = await screen.findByTestId('coding-kiro');
+    expect(within(tile).getByRole('checkbox', { name: 'Kiro' })).toBeChecked();
+    expect(tile).toHaveTextContent('Not connected: connect it, or untick it');
+    expect(screen.getByTestId('provider-kiro')).toHaveTextContent('Not connected');
+    expect(screen.getByTestId('coding-claude')).not.toHaveTextContent('Not connected');
+  });
+
+  it('keeps What will run a table for screen readers, with each cell naming its column when the rows stack', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(published()) }));
+    const card = await screen.findByTestId('effective-config');
+    expect(within(card).getByRole('table')).toBeInTheDocument();
+    expect(within(card).getAllByRole('columnheader').map((h) => h.textContent)).toEqual(['Repository', 'Label', 'Coding', 'Review', 'From']);
+    const row = within(card).getByTestId('effective-acme/web-updraft');
+    expect(row).toHaveAttribute('role', 'row');
+    expect(within(row).getAllByRole('cell').map((c) => c.textContent)).toEqual(['Repository: acme/web', 'Label: updraft', 'CodingClaude Code, Codex', 'ReviewClaude Code, Codex', 'From: Your team']);
+  });
+
+  it('lets an odd last provider span the row, so the grid leaves no empty slot', async () => {
+    configPage(fakeApi({ config: vi.fn().mockResolvedValue(firstRun()) }));
+    expect(await screen.findByTestId('provider-kiro')).toHaveClass('sm:col-span-2');
+    expect(screen.getByTestId('provider-claude')).not.toHaveClass('sm:col-span-2');
+  });
 });
+
